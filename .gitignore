@@ -1,0 +1,18 @@
+# Data files
+data/
+*.qptiff
+*.tiff
+*.tif
+*.npy
+*.zarr
+
+# Python artifacts
+__pycache__/
+venv/
+.env
+
+# Large results
+results/registration_maps/
+
+# Private configuration
+config.py
