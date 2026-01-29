@@ -6,7 +6,7 @@ import config
 import math
 import zarr
 
-# --- 1. ROTATION LOGIC (UNCHANGED) ---
+# --- 1. ROTATION LOGIC---
 
 def rotate_image_and_points(image, points, angle_degrees):
     """ Rotates image and (cx, cy) points around the center. """
@@ -30,7 +30,7 @@ def rotate_image_and_points(image, points, angle_degrees):
     return rotated_img, new_points
 
 def get_row_based_rotation(candidates):
-    """Robust angle detection."""
+    """Angle detection."""
     if len(candidates) < 2: return 0.0
     
     angles = []
@@ -50,39 +50,67 @@ def get_row_based_rotation(candidates):
     if not angles: return 0.0
     return np.median(angles)
 
-# --- 2. MAIN PIPELINE (GROUP BY CORE) ---
+# --- 2. MAIN PIPELINE ---
 
 def crop_and_group_by_core():
-    # 1. Output to DATASPACE
+    # Output to DATASPACE
     output_base = os.path.join(config.DATASPACE, "TMA_Cores_Grouped")
     os.makedirs(output_base, exist_ok=True)
     
-    print(f"--- Starting Cropping (All Slices -> Grouped by Core) ---")
-    print(f"Output: {output_base}\n")
+    print("=" * 70)
+    print("  TMA CORE EXTRACTION - OME-TIFF FORMAT WITH CHANNEL NAMES")
+    print("=" * 70)
+    print(f"Output directory: {output_base}")
+    print(f"Total slides to process: {len(config.TMA_FILES)}\n")
 
     PIXEL_SIZE_UM = 0.4961
     CHANNEL_NAMES = ['DAPI', 'CD31', 'GAP43', 'NFP', 'CD3', 'CD163', 'CK', 'AF']
 
-    # 2. Loop through ALL slices
+    # Statistics
+    total_cores_extracted = 0
+    successful_slides = 0
+    failed_slides = []
+
+    # Process all slides
     for i, file_path in enumerate(config.TMA_FILES):
         tma_name = os.path.basename(os.path.dirname(os.path.dirname(file_path)))
         
-        print(f"[{i+1}/{len(config.TMA_FILES)}] Processing Slide: {tma_name}...")
+        print(f"\n{'─' * 70}")
+        print(f"[{i+1}/{len(config.TMA_FILES)}] Processing: {tma_name}")
+        print(f"{'─' * 70}")
         
         if not os.path.exists(file_path): 
-            print(f"   -> File not found: {file_path}")
+            print(f"File not found: {file_path}")
+            failed_slides.append((tma_name, "File not found"))
             continue
 
+        # --- PARAMETERS ---
         params = {
             "CLAHE_LIMIT": 3.0, "CLAHE_GRID": (10, 10),
             "OPEN_SIZE": 25, 
-            "THRESH_FACTOR": 0.70,   
-            "MIN_AREA": 1000,
+            "THRESH_FACTOR": 0.87,
+            "MIN_AREA": 3500,
             "PADDING": 1.25,
-            "MAX_CORES": 30,
-            "SORT_METHOD": "CANNY_EDGES",
+            "MAX_CORES": 35,
+            "SORT_METHOD": "AREA",
             "KILL_BORDER": False
         }
+
+        # TMA-specific adjustments
+        if "TMA_3" in tma_name: 
+            params["OPEN_SIZE"] = 35
+        elif "TMA_13" in tma_name:
+            params["THRESH_FACTOR"] = 0.70
+            params["MIN_AREA"] = 1000
+            params["SORT_METHOD"] = "CANNY_EDGES"
+            params["MAX_CORES"] = 30
+        elif "TMA_15" in tma_name:
+            params["KILL_BORDER"] = True
+            params["MIN_AREA"] = 5000
+            params["MAX_CORES"] = 30
+
+        OPEN_KERNEL = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (params["OPEN_SIZE"], params["OPEN_SIZE"]))
+        CLOSE_KERNEL = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
 
         try:
             with tifffile.TiffFile(file_path) as tif:
@@ -96,10 +124,7 @@ def crop_and_group_by_core():
                 scale_y = h_high / h_low
 
                 raw_stack = low_res.asarray()
-                if raw_stack.shape[0] < 20: 
-                    combined = np.sum(raw_stack, axis=0, dtype=np.float32)
-                else: 
-                    combined = np.sum(raw_stack, axis=2, dtype=np.float32)
+                combined = np.sum(raw_stack, axis=0, dtype=np.float32)
 
                 p99 = np.percentile(combined, 99)
                 if p99 < 1: p99 = combined.max()
@@ -111,8 +136,8 @@ def crop_and_group_by_core():
                 otsu_val, _ = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
                 _, thresh = cv2.threshold(blur, otsu_val * params["THRESH_FACTOR"], 255, cv2.THRESH_BINARY)
                 
-                closed = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15)), iterations=2)
-                final_mask = cv2.morphologyEx(closed, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (params["OPEN_SIZE"], params["OPEN_SIZE"])), iterations=2)
+                closed = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, CLOSE_KERNEL, iterations=2)
+                final_mask = cv2.morphologyEx(closed, cv2.MORPH_OPEN, OPEN_KERNEL, iterations=2)
                 contours, _ = cv2.findContours(final_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
                 if params["SORT_METHOD"] == "CANNY_EDGES": 
@@ -122,6 +147,7 @@ def crop_and_group_by_core():
 
                 candidates = []
                 img_h, img_w = norm.shape
+                
                 for cnt in contours:
                     area = cv2.contourArea(cnt)
                     if area < params["MIN_AREA"]: continue
@@ -134,6 +160,11 @@ def crop_and_group_by_core():
                         cx, cy = int(M["m10"] / M["m00"]), int(M["m01"] / M["m00"])
                     else: 
                         cx, cy = x + w/2, y + h/2
+
+                    if params["KILL_BORDER"]:
+                        mw, mh = img_w * 0.05, img_h * 0.05
+                        if (cx < mw) or (cx > img_w - mw) or (cy < mh) or (cy > img_h - mh): 
+                            continue 
                     
                     canny_score = 0
                     if canny_map is not None:
@@ -141,10 +172,12 @@ def crop_and_group_by_core():
                         cv2.drawContours(mask, [cnt], -1, 255, -1)
                         internal_edges = cv2.bitwise_and(canny_map, canny_map, mask=mask)
                         canny_score = cv2.countNonZero(internal_edges) / (area + 1e-5)
+                    
                     candidates.append({'cx': cx, 'cy': cy, 'w': w, 'h': h, 'area': area, 'canny': canny_score})
 
                 if not candidates: 
-                    print("   -> No candidates found.")
+                    print("  ✗ No candidates found")
+                    failed_slides.append((tma_name, "No candidates found"))
                     continue
 
                 # --- ROTATION CORRECTION ---
@@ -152,6 +185,9 @@ def crop_and_group_by_core():
                 
                 if abs(detected_angle) > 10:
                     detected_angle = 0
+                    print(f"  • Rotation: {detected_angle:.2f}° (clamped to 0 - safety)")
+                else:
+                    print(f"  • Rotation: {detected_angle:.2f}°")
                 
                 dummy_img = np.zeros((img_h, img_w, 3), dtype=np.uint8)
                 _, rotated_candidates = rotate_image_and_points(dummy_img, candidates, detected_angle)
@@ -164,9 +200,14 @@ def crop_and_group_by_core():
                 
                 selection = rotated_candidates[:params["MAX_CORES"]]
 
-                median_w = np.median([c['w'] for c in selection])
-                median_h = np.median([c['h'] for c in selection])
-                low_res_box_size = int(max(median_w, median_h) * params["PADDING"])
+                if selection:
+                    median_w = np.median([c['w'] for c in selection])
+                    median_h = np.median([c['h'] for c in selection])
+                    standard_size = int(max(median_w, median_h) * params["PADDING"])
+                else: 
+                    standard_size = 100
+                
+                low_res_box_size = standard_size
 
                 # --- ROW DETECTION ---
                 y_coords = np.array([c['cy'] for c in selection])
@@ -176,16 +217,18 @@ def crop_and_group_by_core():
                 gap_threshold = median_h * 0.5
                 
                 split_indices = np.where(diffs > gap_threshold)[0] + 1
-                row_groups_y = np.split(y_coords, split_indices)
+                row_groups = np.split(y_coords, split_indices)
                 
                 rows = []
-                for group_y in row_groups_y:
-                    if len(group_y) == 0: continue
-                    min_y, max_y = group_y.min(), group_y.max()
+                for group in row_groups:
+                    if len(group) == 0: continue
+                    min_y, max_y = group.min(), group.max()
                     current_row_cores = [c for c in selection if min_y <= c['cy'] <= max_y]
                     current_row_cores.sort(key=lambda k: k['cx'])
                     rows.append(current_row_cores)
                 
+                print(f"  • Detected: {len(rows)} rows, {len(selection)} cores total")
+
                 ordered_cores = []
                 for row in rows:
                     ordered_cores.extend(row)
@@ -200,14 +243,15 @@ def crop_and_group_by_core():
                 is_channel_first = True
                 if z.ndim == 3 and z.shape[0] > z.shape[2]: 
                     is_channel_first = False
-                
+
                 center = (img_w // 2, img_h // 2)
                 M_inv = cv2.getRotationMatrix2D(center, -detected_angle, 1.0)
+                
+                print(f"  • Extracting cores... ", end="", flush=True)
                 
                 for idx, core in enumerate(ordered_cores):
                     core_id = idx + 1
                     
-                    # 3. FOLDER STRUCTURE: .../TMA_Cores_Grouped/Core_01/
                     core_dir = os.path.join(output_base, f"Core_{core_id:02d}")
                     os.makedirs(core_dir, exist_ok=True)
                     
@@ -233,32 +277,28 @@ def crop_and_group_by_core():
                     crop = np.ascontiguousarray(crop, dtype=np.uint16)
                     c_dim, h_dim, w_dim = crop.shape
 
-                    # FILENAME: TMA_Name_CoreXX.tif (inside the Core_XX folder)
-                    out_name = f"{tma_name}_Core{core_id:02d}.tif"
+                    out_name = f"{tma_name}_Core{core_id:02d}.ome.tif"
                     out_full = os.path.join(core_dir, out_name)
                     
-                    # --- SAVING LOGIC (ImageJ Style) ---
+                    # --- OME-TIFF FORMAT WITH CHANNEL NAMES ---
+                    metadata = {
+                        'axes': 'CYX',
+                        'Channel': {'Name': CHANNEL_NAMES},
+                        'PhysicalSizeX': PIXEL_SIZE_UM,
+                        'PhysicalSizeXUnit': 'µm',
+                        'PhysicalSizeY': PIXEL_SIZE_UM,
+                        'PhysicalSizeYUnit': 'µm',
+                    }
+                    
                     tifffile.imwrite(
                         out_full,
                         crop,
-                        imagej=True,  
                         photometric='minisblack',
-                        resolution=(1.0 / PIXEL_SIZE_UM, 1.0 / PIXEL_SIZE_UM),
-                        metadata={
-                            'axes': 'CYX',         
-                            'unit': 'um',          
-                            'spacing': 0.0,
-                            'images': c_dim,
-                            'slices': 1,
-                            'frames': 1,
-                            'hyperstack': True,
-                            'mode': 'composite',
-                            'Labels': CHANNEL_NAMES 
-                        },
+                        metadata=metadata,
                         compression=None
                     )
                     
-                    # --- THUMBNAIL LOGIC ---
+                    # --- THUMBNAIL ---
                     thumb_raw = crop[0, :, :] 
                     p99_thumb = np.percentile(thumb_raw, 99)
                     if p99_thumb == 0: p99_thumb = thumb_raw.max() if thumb_raw.max() > 0 else 1
@@ -267,15 +307,45 @@ def crop_and_group_by_core():
                     new_w = int((w_dim / h_dim) * new_h)
                     thumb_resized = cv2.resize(thumb_norm, (new_w, new_h), interpolation=cv2.INTER_AREA)
                     
-                    # Save thumbnail in the SAME Core_XX folder
                     cv2.imwrite(os.path.join(core_dir, f"{tma_name}_Core{core_id:02d}_thumb.jpg"), thumb_resized)
                     
-                print(f"    -> Successfully grouped {len(ordered_cores)} cores into 'Core_XX' folders.\n")
+                    # Progress indicator
+                    if (core_id) % 5 == 0 or core_id == len(ordered_cores):
+                        print(f"{core_id}", end="", flush=True)
+                        if core_id != len(ordered_cores):
+                            print("...", end="", flush=True)
+                
+                print(f" ✓ Complete")
+                print(f"  ✓ Saved {len(ordered_cores)} cores to Core_XX/ folders")
+                
+                total_cores_extracted += len(ordered_cores)
+                successful_slides += 1
 
         except Exception as e:
-            print(f"ERROR {tma_name}: {e}")
+            print(f"  ✗ ERROR: {e}")
+            failed_slides.append((tma_name, str(e)))
             import traceback
             traceback.print_exc()
+
+    # --- FINAL SUMMARY ---
+    print("\n" + "=" * 70)
+    print("  EXTRACTION COMPLETE")
+    print("=" * 70)
+    print(f"Successful slides:    {successful_slides}/{len(config.TMA_FILES)}")
+    print(f"Total cores extracted: {total_cores_extracted}")
+    print(f"Output directory:      {output_base}")
+    
+    if failed_slides:
+        print(f"\nFailed slides ({len(failed_slides)}):")
+        for tma_name, reason in failed_slides:
+            print(f"  • {tma_name}: {reason}")
+    
+    print("\n" + "=" * 70)
+    print("Format: OME-TIFF with embedded channel names")
+    print("Channels: DAPI, CD31, GAP43, NFP, CD3, CD163, CK, AF")
+    print("Pixel size: 0.4961 µm")
+    print("\nNext: Import .ome.tif files into QuPath to verify channel names")
+    print("=" * 70 + "\n")
 
 if __name__ == "__main__":
     crop_and_group_by_core()
