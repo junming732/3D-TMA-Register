@@ -159,7 +159,7 @@ def crop_and_group_by_core():
                 
                 # === SPECIAL HANDLING FOR SLICE 3 ===
                 if (i + 1) == 3:
-                    print(f"  • Applying SPECIAL SLICE 3 LOGIC (Monster Splitter)...")
+                    print(f"   Applying SPECIAL SLICE 3 LOGIC (Monster Splitter)...")
                     SPLIT_KERNEL = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (50, 50))
                     
                     for cnt in contours:
