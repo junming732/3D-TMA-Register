@@ -8,7 +8,7 @@ data/
 
 # Python artifacts
 __pycache__/
-venv/
+venv*/
 .env
 
 # Large results
