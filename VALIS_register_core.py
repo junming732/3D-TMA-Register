@@ -11,17 +11,38 @@ Description:
     Visual QC Generation -> Image Warping -> JVM Cleanup.
 
 Key Features:
-    1. **Robust Alignment:** Executes VALIS automated registration.
+    1. **Robust Alignment:** Executes feature-based rigid registration (default: BRISK) to align 
+       serial tissue slices.
     2. **Automated QC:** Generates "Transparency Reports" (CSV metrics, Error Barplots, and 
-       Pairwise Overlay grids) allowing for rapid pass/fail assessment.
-    3. **State Management:** Enforces a "Fresh Run" policy by cleaning previous output directories.
-    4. **Dual Output:** Produces both individual registered OME-TIFFs and a fused volume stack.
+       Pairwise Overlay grids) allowing for rapid pass/fail assessment without opening images.
+    3. **State Management:** Enforces a "Fresh Run" policy by cleaning previous output directories 
+       to ensure metrics strictly reflect the current execution.
+    4. **Dual Output:** Produces both individual registered OME-TIFFs and a fused, multi-channel 
+       volume stack.
 
 Usage:
     python register_core.py --core_name <Core_ID>
 
-Configuration:
-    Requires 'config.py' with DATASPACE and OUTPUT_DIR paths.
+    Example:
+        python register_core.py --core_name Core11
+
+Arguments:
+    --core_name (str): The specific identifier for the core folder (e.g., "Core11"). 
+                       This name is appended to the base paths defined in config.py to locate data.
+
+Configuration (`config.py`):
+    Requires a local `config.py` module defining the global storage architecture:
+    - `DATASPACE` (or `RAW_DATA_DIR`): Parent path containing raw image folders.
+    - `OUTPUT_DIR`: Parent path where results will be generated.
+
+Output Structure:
+    <OUTPUT_DIR>/<Core_ID>/
+    ├── registered_slides/   # Individual aligned OME-TIFF images
+    ├── merged_stack/        # Single multi-channel OME-TIFF (Reconstructed Volume)
+    └── QC/                  # Quality Control Artifacts
+        ├── *_rigid_metrics.csv  # Raw numerical registration error (TRE)
+        ├── *_rigid_plot.png     # Visualization of error per slice (outlier detection)
+        └── *_overlays.png       # Grid of Red/Green pairwise overlays for visual verification
 """
 
 import os
@@ -33,7 +54,8 @@ import pandas as pd
 import matplotlib
 import matplotlib.pyplot as plt
 import seaborn as sns
-import cv2  # Required for resizing/overlay
+import cv2
+import tifffile  # Added for manual stacking
 from valis import registration
 
 # --- 1. Import Configuration ---
@@ -85,12 +107,11 @@ def save_qc_report(registrar, qc_dir, core_name):
 def generate_overlay_plots(registrar, qc_dir, core_name):
     """
     Generates the pairwise overlay (Red=Current, Green=Next) to visualize alignment.
-    FIXED: Uses slide_dict.values() instead of get_img_list.
+    This mimics the visualization cell from your notebook.
     """
     print("[INFO] Generating Pairwise Overlay plots...")
     
-    # Access slides directly from the dictionary values
-    # These are Slide objects. We access .image to get the numpy array.
+    # FIX: Use slide_dict.values() because .get_img_list() does not exist in Valis object
     slides = list(registrar.slide_dict.values())
     n_slides = len(slides)
     
@@ -101,25 +122,25 @@ def generate_overlay_plots(registrar, qc_dir, core_name):
     cols = 4
     rows = int(np.ceil((n_slides - 1) / cols))
     if rows == 0: rows = 1
-    
+
     fig, axes = plt.subplots(rows, cols, figsize=(20, 5 * rows))
     
-    # Handle single row case where axes is not 2D
+    # Ensure axes is always iterable
     if hasattr(axes, 'flatten'):
         axes_flat = axes.flatten()
     else:
         axes_flat = [axes] if rows == 1 and cols == 1 else np.array(axes).flatten()
 
     for idx in range(n_slides - 1):
-        # Get current and next slide objects
+        # Get current and next slide
         s_obj1 = slides[idx]
         s_obj2 = slides[idx + 1]
         
-        # Access the low-res numpy image used for registration
+        # Access the low-res images used for registration for speed
         img1 = s_obj1.image
         img2 = s_obj2.image
         
-        # Simple normalization (0-1)
+        # Simple normalization for display
         def norm(x):
             p99 = np.percentile(x, 99)
             return np.clip(x / p99, 0, 1) if p99 > 0 else x
@@ -127,22 +148,22 @@ def generate_overlay_plots(registrar, qc_dir, core_name):
         s1 = norm(img1)
         s2 = norm(img2)
 
-        # Resize s2 to match s1 if dimensions differ (safety check)
+        # Create Overlay: Red=img1, Green=img2
+        # Ensure dimensions match
         if s1.shape[:2] != s2.shape[:2]:
             h, w = s1.shape[:2]
             s2 = cv2.resize(s2, (w, h))
-
-        # Create Overlay: Red=img1, Green=img2
-        # Use single channel for overlay (assuming grayscale input)
+        
+        # Handle 3D (RGB) vs 2D (Grayscale)
         if len(s1.shape) == 3: s1 = np.mean(s1, axis=2)
         if len(s2.shape) == 3: s2 = np.mean(s2, axis=2)
-            
+
         overlay = np.dstack((s1, s2, np.zeros_like(s1)))
 
         if idx < len(axes_flat):
             ax = axes_flat[idx]
             ax.imshow(overlay)
-            ax.set_title(f"{s_obj1.name}\nvs Next", fontsize=8)
+            ax.set_title(f"{s_obj1.name} \nvs Next", fontsize=8)
             ax.axis('off')
 
     # Hide unused subplots
@@ -155,23 +176,52 @@ def generate_overlay_plots(registrar, qc_dir, core_name):
     plt.close()
     print(f"  -> Saved overlays to {overlay_path}")
 
+def create_ome_tiff_stack(src_dir, output_path):
+    """
+    Manually stacks individual TIFFs into a single OME-TIFF.
+    Replaces the deprecated 'stack=True' argument in warp_and_save_slides.
+    """
+    print(f"[INFO] Creating merged stack at: {output_path}")
+    
+    # Find all .tif/.tiff files
+    files = sorted([
+        os.path.join(src_dir, f) for f in os.listdir(src_dir) 
+        if f.lower().endswith(('.tif', '.tiff'))
+    ])
+    
+    if not files:
+        print("[WARN] No registered slides found to stack.")
+        return
+
+    try:
+        # Use tifffile to write a BigTIFF stack
+        with tifffile.TiffWriter(output_path, bigtiff=True) as tif:
+            for i, fpath in enumerate(files):
+                img = tifffile.imread(fpath)
+                tif.write(img, description=f"Slice_{i}", metadata={'axes': 'YX'})
+                
+        print(f"[SUCCESS] Merged stack created: {len(files)} slices.")
+        
+    except Exception as e:
+        print(f"[ERROR] Could not create merged stack: {e}")
+
 def main():
     args = parse_args()
     
     # --- 2. Construct Paths ---
-    # Edit these variable names to match your config.py EXACTLY
     DATA_BASE_PATH = os.path.join(config.DATASPACE, "TMA_Cores_Grouped_NEW")
     input_dir = os.path.join(DATA_BASE_PATH, args.core_name)
 
     WORK_OUTPUT = os.path.join(config.DATASPACE, "Registered")
     output_dir = os.path.join(WORK_OUTPUT, args.core_name)
     qc_dir = os.path.join(output_dir, "QC")
+    
+    # NEW: Define specific path for registered slides for use in stacking
+    reg_slides_dir = os.path.join(output_dir, "registered_slides")
 
     print(f"--- Processing {args.core_name} ---")
-    print(f"Input:  {input_dir}")
-    print(f"Output: {output_dir}")
-
-    # --- CRITICAL: Clean FIRST, then Create ---
+    
+    # --- CRITICAL FIX: Clean FIRST, then Create ---
     if os.path.exists(output_dir):
         print(f"[INFO] Cleaning old results in {output_dir} to force fresh metrics...")
         shutil.rmtree(output_dir)
@@ -195,7 +245,6 @@ def main():
 
         # --- 4. Registration ---
         print("[INFO] Starting Registration Pipeline...")
-        # FIXED: Removed arguments based on user constraint
         registrar.register() 
         
         # --- 5. Transparency / QC ---
@@ -210,17 +259,19 @@ def main():
         # --- 6. Warp & Save Individual Slides ---
         print("[INFO] Warping and saving individual OME-TIFFs...")
         registrar.warp_and_save_slides(
-            dst_dir=os.path.join(output_dir, "registered_slides"),
+            dst_dir=reg_slides_dir,
             crop="overlap" 
         )
 
-        # --- 7. Save Merged Stack (The 'Reconstructed File') ---
+        # --- 7. Create Merged Stack (FIXED) ---
+        # Replaced the crashing 'stack=True' call with manual stacking function
         print("[INFO] Creating merged stack...")
-        registrar.warp_and_save_slides(
-             dst_dir=os.path.join(output_dir, "merged_stack"),
-             crop="overlap",
-             stack=True 
-        )
+        merged_stack_path = os.path.join(output_dir, "merged_stack.ome.tif")
+        
+        # Create directory for merged stack if needed (or save in root of output)
+        os.makedirs(os.path.dirname(merged_stack_path), exist_ok=True)
+        
+        create_ome_tiff_stack(reg_slides_dir, merged_stack_path)
 
         print(f"[SUCCESS] Core {args.core_name} processed successfully.")
 
