@@ -1,3 +1,33 @@
+"""
+Core Alignment Visualization (GIF Generator)
+============================================
+
+This module provides a visual verification tool for 3D TMA registration. It compiles 
+sequential image slices of extracted cores into animated GIFs, allowing users to 
+rapidly assess the spatial alignment and stability of the tissue stack.
+
+The script iterates through processed core directories, naturally sorts the image 
+sequences (e.g., Slice_1 -> Slice_2 -> Slice_10), and generates a looped animation 
+with overlayed text labels.
+
+Key Features:
+-------------
+1. Natural Sorting: Ensures frames are ordered numerically (1, 2, 10) rather 
+   than lexicographically (1, 10, 2).
+2. Dynamic Standardization: Automatically resizes all subsequent frames to match 
+   the dimensions of the first slice, preventing GIF corruption from varying input sizes.
+3. Text Overlay: Burns the filename/slice ID into each frame for easy identification 
+   of specific problematic layers.
+4. Format Agnostic: Supports mixing .jpg, .png, and .tif inputs.
+
+Output:
+    - Saves GIFs to: `[BASE_DIR]/_GIF_Inspection/`
+    - Filename format: `[Core_Name]_alignment.gif`
+
+Usage:
+    Configure `BASE_DIR` in the script to point to your image dataset and run.
+"""
+
 import os
 import imageio.v3 as iio
 from natsort import natsorted
