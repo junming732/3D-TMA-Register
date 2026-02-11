@@ -8,4 +8,4 @@
 
 `VALIS_register_core.py`: An automated execution engine that wraps the VALIS library to handle the full registration lifecycle for histological Z-stacks, including rigid and non-rigid alignment, topology safety checks, and OME-TIFF output generation.
 
-`VALIS_batch_benchmark.py`: A standalone quality assurance tool designed to audit VALIS-registered datasets across multiple cohorts, using NMI, SSIM, and Dice metrics to generate a ranked performance leaderboard.
+`evaluate_batch.py`: A comprehensive validation suite designed to audit VALIS-registered datasets against strict Bioinformatics (2018) standards, utilizing TRE, Jaccard, NCC, and GLCM Smoothness metrics to generate detailed stability analytics and comparative quality rankings.

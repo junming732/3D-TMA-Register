@@ -156,7 +156,7 @@ def main():
     DATA_BASE_PATH = os.path.join(config.DATASPACE, "TMA_Cores_Grouped_NEW")
     input_dir = os.path.join(DATA_BASE_PATH, args.core_name)
 
-    WORK_OUTPUT = os.path.join(config.DATASPACE, "Registered")
+    WORK_OUTPUT = os.path.join(config.DATASPACE, "VALIS_Registered")
     output_dir = os.path.join(WORK_OUTPUT, args.core_name)
     qc_dir = os.path.join(output_dir, "QC")
     

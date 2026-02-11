@@ -1,8 +1,0 @@
-Loaded LightGlue model
-Loaded LightGlue model
---- Processing Core_01 ---
-[INFO] Starting Registration Pipeline...
-
-==== Converting images
-
-Converting images:   0%|          | 0/20 [00:00<?, ?image/s]Converting images:   5%|▌         | 1/20 [00:03<01:04,  3.41s/image]Converting images:  10%|█         | 2/20 [00:07<01:04,  3.60s/image]Converting images:  15%|█▌        | 3/20 [00:10<01:01,  3.64s/image]Converting images:  20%|██        | 4/20 [00:14<00:58,  3.64s/image]Converting images:  25%|██▌       | 5/20 [00:18<00:55,  3.68s/image]Converting images:  30%|███       | 6/20 [00:21<00:51,  3.65s/image]Converting images:  35%|███▌      | 7/20 [00:25<00:47,  3.68s/image]Converting images:  40%|████      | 8/20 [00:29<00:44,  3.69s/image]Converting images:  45%|████▌     | 9/20 [00:32<00:40,  3.67s/image]Converting images:  50%|█████     | 10/20 [00:36<00:36,  3.64s/image]Converting images:  55%|█████▌    | 11/20 [00:39<00:31,  3.52s/image]Converting images:  60%|██████    | 12/20 [00:43<00:28,  3.56s/image]Converting images:  65%|██████▌   | 13/20 [00:46<00:24,  3.55s/image]Converting images:  70%|███████   | 14/20 [00:50<00:21,  3.56s/image]

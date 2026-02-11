@@ -18,3 +18,4 @@ results/registration_maps/
 config.py
 
 archive
+*.log
