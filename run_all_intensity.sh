@@ -39,7 +39,7 @@ for i in $(seq $START $END); do
     
     # Run the Python script
     # Logs are saved to log/intensity/Core_01.log, etc.
-    python intensity_based.py --core_name "${CORE_NAME}" > "${LOG_DIR}/${CORE_NAME}.log" 2>&1
+    python intensity_based_DAPI.py --core_name "${CORE_NAME}" > "${LOG_DIR}/${CORE_NAME}.log" 2>&1
     
     # Check status
     if [ $? -eq 0 ]; then
