@@ -36,22 +36,17 @@ except ImportError:
 matplotlib.use('Agg')
 
 # --- Tuning ---
-# Set to 1 if your volume is already small, or 2/4 if it's huge (20k x 20k)
 DOWNSAMPLE = 4 
 
 def load_volume(filepath):
-    """Loads a 3D volume from .tiff, .nii, .mha, etc."""
+    """Loads a 3D volume from .tiff"""
     try:
-        if filepath.lower().endswith(('.tif', '.tiff', '.ome.tiff')):
-            # Tifffile handles multi-page tiffs efficiently
-            vol = tifffile.imread(filepath)
-            # Ensure shape is (Z, Y, X)
-            if vol.ndim == 2: return np.array([vol]) # Single slice
-            return vol
-        else:
-            # SimpleITK for medical formats (nii.gz, mha)
-            img = sitk.ReadImage(filepath)
-            return sitk.GetArrayFromImage(img)
+        # Tifffile handles multi-page tiffs efficiently
+        vol = tifffile.imread(filepath)
+        # Ensure shape is (Z, Y, X)
+        if vol.ndim == 2: return np.array([vol]) # Single slice
+        return vol
+        
     except Exception as e:
         print(f"[ERROR] Failed to load {filepath}: {e}")
         return None
@@ -60,6 +55,7 @@ def calc_jaccard(im1, im2):
     try:
         if im1.max() == 0 or im2.max() == 0: return 0
         try:
+            #TODO:  integrate theresholding with preprocessing
             t1 = threshold_otsu(im1)
             t2 = threshold_otsu(im2)
         except ValueError: return 0
@@ -73,6 +69,7 @@ def calc_jaccard(im1, im2):
 def calc_pixel_metrics(im1, im2):
     try:
         if im1.max() == 0: return np.nan, np.nan
+        #TODO:  integrate theresholding with preprocessing
         try: thresh = threshold_otsu(im1)
         except: return np.nan, np.nan
         
@@ -169,7 +166,7 @@ def plot_consistent_analytics(df_detailed, df_summary, output_dir):
     
     plt.xticks(rotation=45, ha="right")
     plt.tight_layout()
-    plt.savefig(os.path.join(output_dir, "Intensity_Analytics_Distributions.png"), dpi=150)
+    plt.savefig(os.path.join(output_dir, "Intensity_Analytics_Distributions_DAPI.png"), dpi=150)
     plt.close()
     
     # 2. Heatmap
@@ -183,7 +180,7 @@ def plot_consistent_analytics(df_detailed, df_summary, output_dir):
         plt.title("Registration Stability Heatmap (Jaccard Index)")
         plt.xlabel("Slice Pair Index")
         plt.tight_layout()
-        plt.savefig(os.path.join(output_dir, "Intensity_Analytics_Heatmap.png"), dpi=150)
+        plt.savefig(os.path.join(output_dir, "Intensity_Analytics_Heatmap_DAPI.png"), dpi=150)
         plt.close()
     except Exception as e:
         print(f"[WARN] Heatmap generation failed: {e}")
@@ -191,7 +188,7 @@ def plot_consistent_analytics(df_detailed, df_summary, output_dir):
 def main():
     # DIRECTLY TARGETING YOUR FOLDER STRUCTURE
     # /data3/junming/3D-TMA-Register/Intensity_Registered/
-    ROOT_DIR = os.path.join(config.DATASPACE, "Intensity_Registered")
+    ROOT_DIR = os.path.join(config.DATASPACE, "Intensity_Registered_DAPI")
     
     # Find specific files: Core_XX/Core_XX_CenterOut_Aligned_CK.ome.tif
     search_pattern = os.path.join(ROOT_DIR, "**", "*Aligned_CK.ome.tif")
@@ -232,8 +229,8 @@ def main():
 
     # Save
     out_dir = config.DATASPACE
-    df_detailed.to_csv(os.path.join(out_dir, "Intensity_EVAL_Detailed.csv"), index=False)
-    df_summary.to_csv(os.path.join(out_dir, "Intensity_EVAL_Summary.csv"), index=False)
+    df_detailed.to_csv(os.path.join(out_dir, "Intensity_DAPI_EVAL_Detailed.csv"), index=False)
+    df_summary.to_csv(os.path.join(out_dir, "Intensity_DAPI_EVAL_Summary.csv"), index=False)
     
     plot_consistent_analytics(df_detailed, df_summary, out_dir)
     
