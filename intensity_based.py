@@ -187,6 +187,7 @@ def main():
     valid_slices = [img for img in aligned_results if img is not None]
     if not valid_slices: return
     vol = np.array([sitk.GetArrayFromImage(img) for img in valid_slices])
+    #TODO: save a downsampled version for FIJI
     
     generate_qc_montage(vol, OUTPUT_FOLDER, channel_idx=6, channel_name="CK")
 
