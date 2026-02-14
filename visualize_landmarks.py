@@ -49,7 +49,7 @@ CK_INDEX = 6  # Index of Cytokeratin channel
 # Visualization Settings
 DOT_COLOR = (0, 255, 0)  # Green
 DOT_RADIUS = 4           # Visible size on 4x images
-FPS = 5                  # Frames Per Second for GIF
+FPS = 1                  # Frames Per Second for GIF
 
 def pad_image_to_size(img, target_h, target_w):
     """
