@@ -30,7 +30,7 @@ TARGET_CORE = args.core_name
 
 # --- CONFIGURATION ---
 DATA_BASE_PATH = os.path.join(config.DATASPACE, "TMA_Cores_Grouped_NEW")
-WORK_OUTPUT = os.path.join(config.DATASPACE, "Amoeba_Registered_rigid") 
+WORK_OUTPUT = os.path.join(config.DATASPACE, "Amoeba_Registered_rigid_geometry") 
 INPUT_FOLDER = os.path.join(DATA_BASE_PATH, TARGET_CORE)
 OUTPUT_FOLDER = os.path.join(WORK_OUTPUT, TARGET_CORE)
 
@@ -109,7 +109,7 @@ def register_slice_amoeba(fixed_full_image, moving_full_image):
     initial_tx = sitk.CenteredTransformInitializer(
         fixed_low, moving_low, 
         sitk.Euler2DTransform(), 
-        sitk.CenteredTransformInitializerFilter.MOMENTS
+        sitk.CenteredTransformInitializerFilter.GEOMETRY
     )
 
     # 4. Registration Setup

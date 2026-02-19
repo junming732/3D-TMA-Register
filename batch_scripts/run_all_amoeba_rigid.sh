@@ -9,7 +9,7 @@ END=30
 VENV_PATH="/home/junming/3D-TMA-Register/venv_312"
 
 # LOG DIRECTORY
-LOG_DIR="log/amoeba_rigid"
+LOG_DIR="log/amoeba_rigid_geometry"
 
 # 1. Activate environment
 source "${VENV_PATH}/bin/activate"
