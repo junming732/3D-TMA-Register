@@ -8,7 +8,7 @@ END=30
 VENV_PATH="/home/junming/3D-TMA-Register/venv_312"
 
 # Isolated log directory for raw visualization
-LOG_DIR="log/qc_raw"
+LOG_DIR="log/raw_align"
 CHANNEL_IDX=6
 
 # 1. Activate environment
@@ -39,7 +39,7 @@ for i in $(seq $START $END); do
     echo "[$(date)] Inspecting ${CORE_NAME}..."
     
     # Execute the Python script and redirect output to the designated log file
-    python registration/visualize_raw_alignment.py --core_name "${CORE_NAME}" --channel_idx ${CHANNEL_IDX} > "${LOG_DIR}/${CORE_NAME}.log" 2>&1
+    python analysis/visualize_raw_alignment.py --core_name "${CORE_NAME}" --channel_idx ${CHANNEL_IDX} > "${LOG_DIR}/${CORE_NAME}.log" 2>&1
     
     # Verify execution status
     if [ $? -eq 0 ]; then

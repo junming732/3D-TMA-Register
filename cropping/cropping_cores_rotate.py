@@ -379,7 +379,7 @@ def crop_and_group_by_core():
                                 single_channel, 
                                 M_rot, 
                                 (w, h), 
-                                flags=cv2.INTER_CUBIC, 
+                                flags=cv2.INTER_LINEAR, 
                                 borderMode=cv2.BORDER_CONSTANT, 
                                 borderValue=0
                             )
@@ -388,7 +388,7 @@ def crop_and_group_by_core():
                         # Reconstruct the C, H, W array
                         crop = np.stack(rotated_channels, axis=0)
 
-
+                    crop = np.clip(crop, 0, 65535)   
                     crop = np.ascontiguousarray(crop, dtype=np.uint16)
                     c_dim, h_dim, w_dim = crop.shape
 

@@ -100,8 +100,8 @@ def main():
     target_core = args.core_name
     channel_idx = args.channel_idx
     
-    data_base_path = os.path.join(config.DATASPACE, "TMA_Cores_Grouped_NEW")
-    work_output = os.path.join(config.DATASPACE, "QC_PreAlignment")
+    data_base_path = os.path.join(config.DATASPACE, "TMA_Cores_Grouped_Rotate")
+    work_output = os.path.join(config.DATASPACE, "Raw_PreAlignment")
     input_folder = os.path.join(data_base_path, target_core)
     output_folder = os.path.join(work_output, target_core)
 
