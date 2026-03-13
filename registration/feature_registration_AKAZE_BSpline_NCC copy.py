@@ -52,16 +52,11 @@ TARGET_CORE = args.core_name
 # --- PATHS ---
 DATA_BASE_PATH = os.path.join(config.DATASPACE, "TMA_Cores_Grouped_Rotate_Conformed")
 INPUT_FOLDER   = os.path.join(DATA_BASE_PATH, TARGET_CORE)
-WORK_OUTPUT    = os.path.join(config.DATASPACE, "Feature_AKAZE_BSpline_NCC_Zspace")
+WORK_OUTPUT    = os.path.join(config.DATASPACE, "Feature_AKAZE_BSpline_NCC")
 OUTPUT_FOLDER  = os.path.join(WORK_OUTPUT, TARGET_CORE)
 
 # --- CHANNEL ---
 CK_CHANNEL_IDX = 6
-CHANNEL_NAMES  = ['DAPI', 'CD31', 'GAP43', 'NFP', 'CD3', 'CD163', 'CK', 'AF']
-
-# --- OUTPUT PHYSICAL METADATA ---
-PIXEL_SIZE_XY_UM      = 0.4961
-SECTION_THICKNESS_UM  = 4.5    # physical Z spacing between serial sections (µm)
 
 # --- DETECTOR ---
 AKAZE_THRESHOLD = 0.0003   # lower than default (0.001) for weak CK signal
@@ -89,17 +84,12 @@ MAX_ROTATION_DEG    = 15.0  # hard rotation gate
 # Transform: B-spline FFD — C2-smooth deformation by construction.
 # BSPLINE_GRID_NODES — control points per axis.
 #   At 6080px, 8 nodes → ~760px spacing (tissue/gland cluster scale).
-#   Increase to 6 nodes (~1013px spacing) to reduce degrees of freedom and
-#   prevent over-fitting to local noise or damage artefacts.
-# BSPLINE_MAX_DISPLACEMENT_PX — hard cap on per-control-point displacement.
-#   Displacement fields exceeding this are clipped before remap is applied.
 # BSPLINE_ITERATIONS — LBFGSB optimizer steps per resolution level.
 # BSPLINE_SHRINK / BSPLINE_SIGMA — multi-resolution pyramid (coarse→fine).
-BSPLINE_GRID_NODES          = 6     # was 8 — coarser grid = less local deformation
-BSPLINE_ITERATIONS          = 75    # was 100 — fewer iterations = faster + less over-fit
-BSPLINE_SHRINK              = [4, 2, 1]
-BSPLINE_SIGMA               = [6, 3, 1]
-BSPLINE_MAX_DISPLACEMENT_PX = 50.0  # hard cap: displacement vectors beyond this are clipped
+BSPLINE_GRID_NODES = 8
+BSPLINE_ITERATIONS = 100
+BSPLINE_SHRINK     = [4, 2, 1]
+BSPLINE_SIGMA      = [6, 3, 1]
 
 # --- OUTPUT SANITY ---
 MIN_CK_NONZERO_FRAC = 0.01   # revert to affine-only if CK output is >99% black
@@ -325,18 +315,8 @@ def bspline_ncc(fixed_8bit: np.ndarray, moving_8bit: np.ndarray,
 
         disp_np      = sitk.GetArrayFromImage(disp_field)  # (H, W, 2)
         map_y, map_x = np.mgrid[0:h, 0:w].astype(np.float32)
-
-        # Clip displacement vectors exceeding the hard cap (regularization)
-        disp_magnitude = np.sqrt(disp_np[..., 0]**2 + disp_np[..., 1]**2)
-        excess         = disp_magnitude > BSPLINE_MAX_DISPLACEMENT_PX
-        if np.any(excess):
-            scale              = np.where(excess, BSPLINE_MAX_DISPLACEMENT_PX / (disp_magnitude + 1e-8), 1.0)
-            disp_np[..., 0]   *= scale
-            disp_np[..., 1]   *= scale
-            logger.info(f"[{slice_id}] Clipped {int(excess.sum())} displacement vectors > {BSPLINE_MAX_DISPLACEMENT_PX}px.")
-
-        remap_x = (map_x + disp_np[..., 0]).astype(np.float32)
-        remap_y = (map_y + disp_np[..., 1]).astype(np.float32)
+        remap_x      = (map_x + disp_np[..., 0]).astype(np.float32)
+        remap_y      = (map_y + disp_np[..., 1]).astype(np.float32)
 
         logger.info(
             f"[{slice_id}] B-spline NCC complete "
@@ -504,21 +484,9 @@ def main():
         logger.warning("Only one slice — writing identity output.")
         vol_in   = tifffile.imread(file_list[0])
         out_path = os.path.join(OUTPUT_FOLDER, f"{TARGET_CORE}_Feature_Aligned.ome.tif")
-        tifffile.imwrite(
-            out_path, vol_in[np.newaxis],
-            photometric='minisblack',
-            metadata={
-                'axes': 'ZCYX',
-                'Channel': {'Name': CHANNEL_NAMES},
-                'PhysicalSizeX': PIXEL_SIZE_XY_UM,
-                'PhysicalSizeXUnit': 'µm',
-                'PhysicalSizeY': PIXEL_SIZE_XY_UM,
-                'PhysicalSizeYUnit': 'µm',
-                'PhysicalSizeZ': SECTION_THICKNESS_UM,
-                'PhysicalSizeZUnit': 'µm',
-            },
-            compression='deflate', compressionargs={'level': 6},
-        )
+        tifffile.imwrite(out_path, vol_in[np.newaxis], photometric='minisblack',
+                         metadata={'axes': 'ZCYX'}, compression='deflate',
+                         compressionargs={'level': 6})
         sys.exit(0)
 
     center_idx  = n_slices // 2
@@ -629,21 +597,8 @@ def main():
 
     out_tiff = os.path.join(OUTPUT_FOLDER, f"{TARGET_CORE}_Feature_Aligned.ome.tif")
     logger.info(f"Writing registered volume to {out_tiff}")
-    tifffile.imwrite(
-        out_tiff, aligned_vol,
-        photometric='minisblack',
-        metadata={
-            'axes': 'ZCYX',
-            'Channel': {'Name': CHANNEL_NAMES},
-            'PhysicalSizeX': PIXEL_SIZE_XY_UM,
-            'PhysicalSizeXUnit': 'µm',
-            'PhysicalSizeY': PIXEL_SIZE_XY_UM,
-            'PhysicalSizeYUnit': 'µm',
-            'PhysicalSizeZ': SECTION_THICKNESS_UM,
-            'PhysicalSizeZUnit': 'µm',
-        },
-        compression='deflate', compressionargs={'level': 6},
-    )
+    tifffile.imwrite(out_tiff, aligned_vol, photometric='minisblack',
+                     metadata={'axes': 'ZCYX'}, compression='deflate', compressionargs={'level': 6})
     logger.info("Done.")
 
 
