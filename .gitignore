@@ -20,3 +20,4 @@ config.py
 archive
 *.log
 akaze_plots
+thesis_figs
