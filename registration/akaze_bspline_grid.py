@@ -47,7 +47,7 @@ TARGET_CORE = args.core_name
 # --- PATHS ---
 DATA_BASE_PATH    = os.path.join(config.DATASPACE, "TMA_Cores_Grouped_Rotate_Conformed")
 INPUT_FOLDER      = os.path.join(DATA_BASE_PATH, TARGET_CORE)
-WORK_OUTPUT       = os.path.join(config.DATASPACE, "Filter_AKAZE_BSpline_Adaptive")
+WORK_OUTPUT       = os.path.join(config.DATASPACE, "Filter_AKAZE_BSpline_Grid")
 OUTPUT_FOLDER     = os.path.join(WORK_OUTPUT, TARGET_CORE)
 SLICE_FILTER_YAML = os.path.join(config.DATASPACE, "slice_filter.yaml")
 
@@ -94,6 +94,50 @@ BSPLINE_GRID_ROWS       = 2
 BSPLINE_GRID_COLS       = 2
 BSPLINE_TILE_OVERLAP    = 0.25   # fraction of tile size on each edge
 
+# --- L1: TISSUE MASK CONFIGURATION ---
+#
+# When enabled, a binary mask of the tissue ROI is derived from the fixed CK
+# channel and passed to SimpleITK so the NCC metric only samples pixels that
+# contain real tissue signal.  Background pixels (zero-padded canvas outside
+# the core) are excluded entirely.
+#
+# Benefits:
+#   - Prevents background pixels from dominating the gradient, which causes
+#     B-spline control points anchored in featureless regions to drift and
+#     over-correct tissue areas (the small-core / ID13 problem).
+#   - Makes per-tile NCC values more meaningful — a tile that is mostly
+#     background no longer reports artificially weak NCC.
+#   - The whole-image acceptance NCC is also measured masked, so it is
+#     directly comparable to the masked tile NCCs.
+#
+# BSPLINE_MASK_OTSU          — use Otsu thresholding to separate tissue from
+#                              background.  Set False to use a simple > 0
+#                              threshold (sufficient when background is truly
+#                              zero after conformation).
+# BSPLINE_MASK_DILATE_PX     — morphological dilation radius (pixels) applied
+#                              to the mask before use.  Ensures the mask
+#                              slightly over-covers the tissue edge so boundary
+#                              pixels are not penalised.
+# BSPLINE_MIN_TISSUE_FRAC    — if the tissue mask covers less than this
+#                              fraction of the canvas, skip B-spline entirely
+#                              for this slice pair.  Protects very small or
+#                              edge-clipped cores where the optimizer has too
+#                              little signal to work with.
+BSPLINE_USE_TISSUE_MASK   = True
+BSPLINE_MASK_OTSU         = True
+BSPLINE_MASK_DILATE_PX    = 20
+BSPLINE_MIN_TISSUE_FRAC   = 0.05   # skip B-spline if tissue < 5% of canvas
+
+# --- L1: PER-TILE ACCEPTANCE CONFIGURATION ---
+#
+# When enabled, each tile measures its own NCC baseline (before B-spline) on
+# the same patch so the comparison is apples-to-apples.  Tiles whose B-spline
+# result does not improve their local NCC by at least BSPLINE_NCC_MIN_IMPROVEMENT
+# have their displacement zeroed out before blending.  This prevents a poorly-
+# constrained tile (e.g. mostly background) from corrupting adjacent well-
+# aligned regions through the Hanning blend.
+BSPLINE_PER_TILE_ACCEPT = True
+
 # --- CHANNEL ---
 CK_CHANNEL_IDX = 6
 CHANNEL_NAMES  = ['DAPI', 'CD31', 'GAP43', 'NFP', 'CD3', 'CD163', 'CK', 'AF']
@@ -136,7 +180,7 @@ MIN_CK_NONZERO_FRAC = 0.01
 # This adapts automatically to signal level: sparse-tissue cores with NCC ~ -0.55
 # after affine need the same relative gain as dense-tissue cores with NCC ~ -0.85.
 # Set to 0.0 to accept any improvement at all; raise to 0.10 to be stricter.
-BSPLINE_NCC_MIN_IMPROVEMENT = 0.01
+BSPLINE_NCC_MIN_IMPROVEMENT = 0.05
 
 if not os.path.exists(INPUT_FOLDER):
     logger.error(f"Input folder not found: {INPUT_FOLDER}")
@@ -303,11 +347,76 @@ def akaze_affine(fixed_8bit: np.ndarray, moving_8bit: np.ndarray, slice_id: str)
 
 # --- L1: SIMPLEITK NCC B-SPLINE ELASTIC REFINEMENT ---
 
+def build_tissue_mask(ck_log: np.ndarray) -> np.ndarray:
+    """
+    Derive a uint8 binary tissue mask from the log-normalised CK channel.
+
+    Returns a (H, W) uint8 array: 255 = tissue, 0 = background.
+
+    Strategy
+    --------
+    - If BSPLINE_MASK_OTSU is True: Otsu threshold on non-zero pixels only,
+      so the background class does not bias the threshold estimate.
+    - Otherwise: simple > 0 threshold (works when canvas background is truly
+      zero after conformation).
+    - A morphological dilation by BSPLINE_MASK_DILATE_PX is applied so the
+      mask slightly over-covers the tissue boundary.
+    """
+    img = ck_log.astype(np.uint8)
+    if BSPLINE_MASK_OTSU:
+        nonzero = img[img > 0]
+        if len(nonzero) == 0:
+            return np.zeros_like(img)
+        thresh, _ = cv2.threshold(
+            nonzero.reshape(-1, 1), 0, 255,
+            cv2.THRESH_BINARY + cv2.THRESH_OTSU,
+        )
+        mask = (img > thresh).astype(np.uint8) * 255
+    else:
+        mask = (img > 0).astype(np.uint8) * 255
+
+    if BSPLINE_MASK_DILATE_PX > 0:
+        r    = BSPLINE_MASK_DILATE_PX
+        kern = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * r + 1, 2 * r + 1))
+        mask = cv2.dilate(mask, kern)
+
+    return mask
+
+
+def _measure_ncc_masked(
+    fixed_f32: np.ndarray,
+    moving_f32: np.ndarray,
+    mask_uint8: np.ndarray,
+) -> float:
+    """
+    Measure NCC between two float32 patches restricted to mask pixels.
+    Uses 0-iteration LBFGSB so it only evaluates the metric, no optimisation.
+    Returns 0.0 on failure.
+    """
+    try:
+        sitk_f = sitk.GetImageFromArray(fixed_f32)
+        sitk_m = sitk.GetImageFromArray(moving_f32)
+        reg    = sitk.ImageRegistrationMethod()
+        reg.SetMetricAsCorrelation()
+        reg.SetMetricSamplingStrategy(reg.RANDOM)
+        reg.SetMetricSamplingPercentage(0.10)
+        reg.SetInterpolator(sitk.sitkLinear)
+        reg.SetOptimizerAsLBFGSB(numberOfIterations=0)
+        reg.SetInitialTransform(sitk.TranslationTransform(2), inPlace=False)
+        if mask_uint8 is not None and mask_uint8.max() > 0:
+            reg.SetMetricFixedMask(sitk.GetImageFromArray(mask_uint8))
+        reg.Execute(sitk_f, sitk_m)
+        return reg.GetMetricValue()
+    except Exception:
+        return 0.0
+
+
 def _run_bspline_on_patch(
     fixed_patch: np.ndarray,
     moving_patch: np.ndarray,
     slice_id: str,
     tile_label: str,
+    mask_patch: np.ndarray = None,
 ) -> tuple:
     """
     Run a single B-spline registration on a (fixed_patch, moving_patch) pair.
@@ -352,6 +461,9 @@ def _run_bspline_on_patch(
         reg.SetSmoothingSigmasPerLevel(BSPLINE_SMOOTHING_SIGMAS)
         reg.SmoothingSigmasAreSpecifiedInPhysicalUnitsOff()
 
+        if mask_patch is not None and mask_patch.max() > 0:
+            reg.SetMetricFixedMask(sitk.GetImageFromArray(mask_patch))
+
         final_tx  = reg.Execute(sitk_fixed, sitk_moving)
         ncc_value = reg.GetMetricValue()
         logger.info(
@@ -378,6 +490,7 @@ def apply_bspline_l1(
     moving_log_affine: np.ndarray,
     moving_affine_vol: np.ndarray,
     slice_id: str,
+    tissue_mask: np.ndarray = None,
 ) -> tuple:
     """
     Intensity-based elastic refinement using SimpleITK NCC B-spline FFD.
@@ -387,59 +500,67 @@ def apply_bspline_l1(
     registered independently and the displacement fields are blended back with
     a raised-cosine (Hanning) weight to eliminate seam artefacts.
 
+    When BSPLINE_USE_TISSUE_MASK is True, the tissue mask restricts NCC
+    sampling to real tissue pixels only — background is ignored.
+
+    When BSPLINE_PER_TILE_ACCEPT is True, each tile measures its own NCC
+    baseline before running B-spline.  Tiles that do not improve by at least
+    BSPLINE_NCC_MIN_IMPROVEMENT have their displacement zeroed before blending.
+
     Parameters
     ----------
     fixed_log          : uint8 log-normalised fixed CK channel (reference)
     moving_log_affine  : uint8 log-normalised moving CK channel, affine-prealigned
     moving_affine_vol  : float32 full multi-channel volume, affine-prealigned
     slice_id           : string identifier for logging
+    tissue_mask        : uint8 binary mask (255=tissue) or None
 
     Returns
     -------
-    (aligned_vol : np.ndarray uint16, ncc_value : float, success : bool)
-    ncc_value is the mean NCC across all accepted tiles (negative; more negative = better).
-    Returns (None, 0.0, False) on total failure.
+    (aligned_vol : np.ndarray uint16, ncc_value : float, success : bool, tile_stats : list)
     """
     try:
-        c, h, w = moving_affine_vol.shape
+        c, h, w    = moving_affine_vol.shape
         fixed_f32  = fixed_log.astype(np.float32)
         moving_f32 = moving_log_affine.astype(np.float32)
+        mask_f32   = tissue_mask if (BSPLINE_USE_TISSUE_MASK and tissue_mask is not None) else None
 
         # ------------------------------------------------------------------
         # Build the full displacement field (H, W, 2)
         # ------------------------------------------------------------------
         if not BSPLINE_USE_GRID_TILES or (BSPLINE_GRID_ROWS == 1 and BSPLINE_GRID_COLS == 1):
-            # ---- whole-image mode (original behaviour) ----
+            # ---- whole-image mode ----
             disp_np, ncc_value, ok = _run_bspline_on_patch(
-                fixed_f32, moving_f32, slice_id, "whole"
+                fixed_f32, moving_f32, slice_id, "whole",
+                mask_patch=mask_f32,
             )
             if not ok:
                 return None, 0.0, False, []
-            tile_stats = []   # no grid tiles to display
+            tile_stats = []
+            # ncc_value from _run_bspline_on_patch is already whole-image — no fix needed
         else:
             # ---- grid-tile mode ----
             rows = BSPLINE_GRID_ROWS
             cols = BSPLINE_GRID_COLS
-            ovlp = BSPLINE_TILE_OVERLAP   # fractional overlap on each side
+            ovlp = BSPLINE_TILE_OVERLAP
 
             tile_h = h / rows
             tile_w = w / cols
 
-            # Accumulator for weighted displacement fields
-            disp_acc    = np.zeros((h, w, 2), dtype=np.float64)
-            weight_acc  = np.zeros((h, w),    dtype=np.float64)
-            ncc_values  = []
-            tile_stats  = []   # list of dicts passed to the plot function
-            n_failed    = 0
+            disp_acc   = np.zeros((h, w, 2), dtype=np.float64)
+            weight_acc = np.zeros((h, w),    dtype=np.float64)
+            ncc_values = []
+            tile_stats = []
+            n_failed   = 0
 
             for ri in range(rows):
                 for ci in range(cols):
-                    # Tile extents with overlap (clamped to image bounds)
+                    # Tile extents with overlap
                     y0 = max(0, int(round(ri * tile_h - ovlp * tile_h)))
                     y1 = min(h, int(round((ri + 1) * tile_h + ovlp * tile_h)))
                     x0 = max(0, int(round(ci * tile_w - ovlp * tile_w)))
                     x1 = min(w, int(round((ci + 1) * tile_w + ovlp * tile_w)))
-                    # Core (non-overlapping) extent — used for the grid overlay rectangle
+                    # Core (non-overlapping) extent for the grid overlay rect
                     cy0 = int(round(ri * tile_h))
                     cy1 = min(h, int(round((ri + 1) * tile_h)))
                     cx0 = int(round(ci * tile_w))
@@ -447,33 +568,61 @@ def apply_bspline_l1(
                     ph, pw = y1 - y0, x1 - x0
                     label  = f"r{ri}c{ci}"
 
-                    fp = fixed_f32[y0:y1, x0:x1]
-                    mp = moving_f32[y0:y1, x0:x1]
+                    fp        = fixed_f32[y0:y1, x0:x1]
+                    mp        = moving_f32[y0:y1, x0:x1]
+                    mask_tile = mask_f32[y0:y1, x0:x1] if mask_f32 is not None else None
+
+                    # Per-tile NCC baseline (measured masked if mask available)
+                    ncc_tile_baseline = 0.0
+                    if BSPLINE_PER_TILE_ACCEPT:
+                        ncc_tile_baseline = _measure_ncc_masked(fp, mp, mask_tile)
 
                     disp_tile, ncc_t, ok_t = _run_bspline_on_patch(
-                        fp, mp, slice_id, label
+                        fp, mp, slice_id, label, mask_patch=mask_tile,
                     )
 
+                    accepted = False
                     if not ok_t or disp_tile is None:
                         n_failed += 1
                         logger.warning(
-                            f"[{slice_id}][{label}] Tile failed — using zero displacement."
+                            f"[{slice_id}][{label}] Tile failed — zeroing displacement."
                         )
                         disp_tile = np.zeros((ph, pw, 2), dtype=np.float64)
                         ncc_t     = float('nan')
+                    elif BSPLINE_PER_TILE_ACCEPT:
+                        if abs(ncc_tile_baseline) > 1e-9:
+                            tile_gain = (ncc_tile_baseline - ncc_t) / abs(ncc_tile_baseline)
+                        else:
+                            tile_gain = 0.0
+                        if tile_gain < BSPLINE_NCC_MIN_IMPROVEMENT:
+                            logger.info(
+                                f"[{slice_id}][{label}] Per-tile gain {tile_gain*100:.2f}% "
+                                f"< {BSPLINE_NCC_MIN_IMPROVEMENT*100:.0f}% — zeroing displacement."
+                            )
+                            disp_tile = np.zeros((ph, pw, 2), dtype=np.float64)
+                        else:
+                            accepted = True
+                            ncc_values.append(ncc_t)
+                            logger.info(
+                                f"[{slice_id}][{label}] Per-tile gain {tile_gain*100:.2f}% — accepted."
+                            )
                     else:
+                        accepted = True
                         ncc_values.append(ncc_t)
 
                     tile_stats.append(dict(
                         ri=ri, ci=ci, label=label,
-                        y0=cy0, y1=cy1, x0=cx0, x1=cx1,   # core (non-overlapping) rect
-                        ncc=ncc_t, ok=ok_t,
+                        y0=cy0, y1=cy1, x0=cx0, x1=cx1,
+                        ncc=ncc_t,
+                        ncc_baseline=ncc_tile_baseline,
+                        ok=ok_t,
+                        accepted=accepted,
                     ))
 
-                    # Raised-cosine (Hanning) blending weight for this tile
-                    win_y = np.hanning(ph).astype(np.float64)
-                    win_x = np.hanning(pw).astype(np.float64)
-                    win_2d = np.outer(win_y, win_x)   # (ph, pw)
+                    # Hanning blend — zeroed tiles contribute zero displacement
+                    win_y  = np.hanning(ph).astype(np.float64)
+                    win_x  = np.hanning(pw).astype(np.float64)
+                    win_2d = np.outer(win_y, win_x)
 
                     disp_acc[y0:y1, x0:x1, :] += disp_tile * win_2d[..., np.newaxis]
                     weight_acc[y0:y1, x0:x1]  += win_2d
@@ -482,19 +631,18 @@ def apply_bspline_l1(
                 logger.warning(f"[{slice_id}] All grid tiles failed — skipping elastic layer.")
                 return None, 0.0, False, []
 
-            # Normalise by accumulated weights (avoid division by zero at corners)
-            eps = 1e-9
+            eps       = 1e-9
             disp_np   = disp_acc / (weight_acc[..., np.newaxis] + eps)
-            ncc_value = float(np.mean(ncc_values)) if ncc_values else 0.0
+            mean_tile_ncc = float(np.mean(ncc_values)) if ncc_values else 0.0
+            n_accepted = sum(1 for t in tile_stats if t['accepted'])
             logger.info(
-                f"[{slice_id}] Grid B-spline: "
-                f"{rows}×{cols} tiles, {n_failed} failed, mean NCC={ncc_value:.6f}"
+                f"[{slice_id}] Grid B-spline: {rows}×{cols} tiles, "
+                f"{n_failed} failed, {n_accepted} accepted, mean tile NCC={mean_tile_ncc:.6f}"
             )
 
         # ------------------------------------------------------------------
         # Convert displacement field to cv2 remap coordinates and apply
         # ------------------------------------------------------------------
-        # SimpleITK GetArrayFromImage returns (H, W, 2) where [..., 0] = dx, [..., 1] = dy
         map_x = (np.arange(w, dtype=np.float32)[None, :] + disp_np[..., 0].astype(np.float32))
         map_y = (np.arange(h, dtype=np.float32)[:, None] + disp_np[..., 1].astype(np.float32))
 
@@ -509,7 +657,17 @@ def apply_bspline_l1(
             aligned_channels.append(ch_warped)
 
         aligned_vol = np.stack(aligned_channels, axis=0).astype(np.uint16)
-        logger.info(f"[{slice_id}] B-spline elastic refinement complete (NCC={ncc_value:.6f}).")
+
+        # Measure whole-image NCC on the warped CK channel — comparable to
+        # ncc_affine (also whole-image). Mean tile NCC is NOT comparable.
+        warped_ck_log = aligned_vol[CK_CHANNEL_IDX].astype(np.float32)
+        _, warped_log_u8 = prepare_ck(warped_ck_log)
+        ncc_value = _measure_ncc_masked(
+            fixed_log.astype(np.float32),
+            warped_log_u8.astype(np.float32),
+            mask_f32,
+        )
+        logger.info(f"[{slice_id}] B-spline elastic refinement complete (whole-image NCC={ncc_value:.6f}).")
         return aligned_vol, ncc_value, True, tile_stats
 
     except Exception as exc:
@@ -557,32 +715,39 @@ def register_slice(fixed_np, moving_np, slice_id=None):
     ncc_value     = 0.0
     ncc_affine    = 0.0   # NCC of affine-prealigned images (baseline for acceptance)
     tile_stats    = []
+    tissue_mask   = None
     if akaze_ok:
         moving_log_affine = cv2.warpAffine(
             moving_log, M_affine, (w, h),
             flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT,
         )
 
-        # Measure NCC on affine-prealigned images before B-spline so we have
-        # a per-slice baseline that reflects this tissue's actual signal level.
-        sitk_fixed_tmp  = sitk.GetImageFromArray(fixed_log.astype(np.float32))
-        sitk_moving_tmp = sitk.GetImageFromArray(moving_log_affine.astype(np.float32))
-        ncc_filter      = sitk.StatisticsImageFilter()
-        # Use SimpleITK's NCC via a quick single-resolution registration with 0 iterations
-        _reg_tmp = sitk.ImageRegistrationMethod()
-        _reg_tmp.SetMetricAsCorrelation()
-        _reg_tmp.SetMetricSamplingStrategy(_reg_tmp.RANDOM)
-        _reg_tmp.SetMetricSamplingPercentage(0.05)
-        _reg_tmp.SetInterpolator(sitk.sitkLinear)
-        _reg_tmp.SetOptimizerAsLBFGSB(numberOfIterations=0)
-        _reg_tmp.SetInitialTransform(sitk.TranslationTransform(2), inPlace=False)
-        _reg_tmp.Execute(sitk_fixed_tmp, sitk_moving_tmp)
-        ncc_affine = _reg_tmp.GetMetricValue()
-        logger.info(f"[{sid}] Affine NCC baseline: {ncc_affine:.4f}")
+        # Build tissue mask from the fixed CK log image
+        if BSPLINE_USE_TISSUE_MASK:
+            tissue_mask  = build_tissue_mask(fixed_log)
+            tissue_frac  = float(np.count_nonzero(tissue_mask)) / tissue_mask.size
+            logger.info(f"[{sid}] Tissue mask: {tissue_frac*100:.1f}% of canvas covered.")
+            if tissue_frac < BSPLINE_MIN_TISSUE_FRAC:
+                logger.warning(
+                    f"[{sid}] Tissue fraction {tissue_frac*100:.1f}% < "
+                    f"{BSPLINE_MIN_TISSUE_FRAC*100:.0f}% minimum — skipping B-spline."
+                )
+                aligned_np = moving_affine_vol.astype(np.uint16)
+                akaze_ok   = False   # suppress B-spline plot for this slice
 
-        aligned_np, ncc_value, elastic_ok, tile_stats = apply_bspline_l1(
-            fixed_log, moving_log_affine, moving_affine_vol, sid,
-        )
+        if akaze_ok:
+            # Measure NCC on affine-prealigned images (masked if available)
+            ncc_affine = _measure_ncc_masked(
+                fixed_log.astype(np.float32),
+                moving_log_affine.astype(np.float32),
+                tissue_mask,
+            )
+            logger.info(f"[{sid}] Affine NCC baseline (masked={BSPLINE_USE_TISSUE_MASK}): {ncc_affine:.4f}")
+
+            aligned_np, ncc_value, elastic_ok, tile_stats = apply_bspline_l1(
+                fixed_log, moving_log_affine, moving_affine_vol, sid,
+                tissue_mask=tissue_mask,
+            )
 
     # Output sanity & fallback
     if elastic_ok:
@@ -791,18 +956,32 @@ def save_bspline_plot(
             y0, y1, x0, x1 = t['y0'], t['y1'], t['x0'], t['x1']
             tw, th = x1 - x0, y1 - y0
 
-            # Colour: normalise NCC into [0,1] where 1 = best (most negative)
-            if t['ok'] and np.isfinite(t['ncc']) and (ncc_max - ncc_min) > 1e-6:
-                strength = (t['ncc'] - ncc_max) / (ncc_min - ncc_max)   # 0=worst,1=best
-            elif t['ok']:
-                strength = 0.5
+            # Colour coding:
+            #   green  = accepted, good NCC
+            #   orange = ran but rejected by per-tile acceptance
+            #   red    = failed outright
+            if not t['ok']:
+                r, g       = 1.0, 0.0
+                label_text = "FAIL"
+            elif not t.get('accepted', True):
+                r, g       = 0.9, 0.35   # orange
+                label_text = f"{t['ncc']:.3f}\n✗"
+            elif np.isfinite(t['ncc']) and (ncc_max - ncc_min) > 1e-6:
+                strength   = (t['ncc'] - ncc_max) / (ncc_min - ncc_max)
+                r, g       = 1.0 - strength, strength
+                label_text = f"{t['ncc']:.3f}"
             else:
-                strength = 0.0
+                r, g       = 0.5, 0.5
+                label_text = f"{t['ncc']:.3f}" if np.isfinite(t['ncc']) else "n/a"
 
-            # Green → yellow → red  (good → mediocre → failed)
-            r = 1.0 - strength
-            g = strength
-            rect_color = (r, g, 0.0, 0.35)   # RGBA semi-transparent fill
+            # Append per-tile gain if available
+            if BSPLINE_PER_TILE_ACCEPT and t['ok']:
+                base = t.get('ncc_baseline', float('nan'))
+                if np.isfinite(base) and abs(base) > 1e-9:
+                    gain        = (base - t['ncc']) / abs(base) * 100
+                    label_text += f"\n{gain:+.1f}%"
+
+            rect_color = (r, g, 0.0, 0.35)
 
             from matplotlib.patches import Rectangle
             rect = Rectangle(
@@ -812,9 +991,7 @@ def save_bspline_plot(
             )
             ax.add_patch(rect)
 
-            # NCC label centred in each tile
-            label_text = f"{t['ncc']:.3f}" if (t['ok'] and np.isfinite(t['ncc'])) else "FAIL"
-            font_size  = max(7, min(14, int(min(tw, th) / 8)))
+            font_size = max(7, min(14, int(min(tw, th) / 8)))
             ax.text(
                 x0 + tw / 2, y0 + th / 2,
                 f"{t['label']}\n{label_text}",
@@ -963,26 +1140,30 @@ def main():
 
     c, target_h, target_w = _center_arr.shape
     logger.info(f"Canonical full-res shape: C={c}, H={target_h}, W={target_w}")
-    logger.info(f"Loading and conforming {n_slices} slices.")
+    logger.info(f"Processing {n_slices} slices (on-demand disk reads — no full preload).")
 
-    raw_slices = []
-    slice_ids  = []
-    for f in file_list:
-        slice_ids.append(get_slice_number(f))
-        arr = tifffile.imread(f)
+    # Only collect slice IDs — do NOT load all slices into memory simultaneously.
+    # Loading all slices at once causes OOM (20 slices × 8ch × 6112² × uint16 ≈ 23GB).
+    slice_ids = [get_slice_number(f) for f in file_list]
+
+    def load_slice(idx):
+        """Load and conform a single slice from disk."""
+        arr = tifffile.imread(file_list[idx])
         if arr.ndim == 2:
             arr = arr[np.newaxis]
         elif arr.ndim == 3 and arr.shape[-1] < arr.shape[0]:
             arr = np.moveaxis(arr, -1, 0)
         if arr.shape[1] != target_h or arr.shape[2] != target_w:
-            logger.warning(f"Shape mismatch in {os.path.basename(f)} — conforming.")
+            logger.warning(f"Shape mismatch in {os.path.basename(file_list[idx])} — conforming.")
             arr = conform_slice(arr, target_h, target_w)
-        raw_slices.append(arr)
+        return arr
 
     aligned_vol             = np.zeros((n_slices, c, target_h, target_w), dtype=np.uint16)
     affine_vol              = np.zeros((n_slices, c, target_h, target_w), dtype=np.uint16)
-    aligned_vol[center_idx] = raw_slices[center_idx]
-    affine_vol[center_idx]  = raw_slices[center_idx]   # center is its own anchor
+    center_raw              = load_slice(center_idx)
+    aligned_vol[center_idx] = center_raw
+    affine_vol[center_idx]  = center_raw   # center is its own anchor
+    del center_raw
     anchor_id               = get_slice_number(file_list[center_idx])
     logger.info(f"Volume anchored at slice index {center_idx} (ID {anchor_id})")
 
@@ -995,7 +1176,7 @@ def main():
         for i in indices:
             real_id   = get_slice_number(file_list[i])
             fixed_np  = aligned_vol[i + fixed_offset]
-            moving_np = raw_slices[i]
+            moving_np = load_slice(i)   # read from disk, discard after use
             sid       = f"Z{i:03d}_ID{real_id:03d}"
 
             aligned_np, affine_np, mse, runtime, stats, success, M_final = register_slice(
@@ -1007,10 +1188,12 @@ def main():
                 affine_vol[i]  = affine_np
                 status_str     = "SUCCESS"
             else:
-                aligned_vol[i] = raw_slices[i]
-                affine_vol[i]  = raw_slices[i]   # fallback: raw = no affine either
+                aligned_vol[i] = moving_np
+                affine_vol[i]  = moving_np   # fallback: raw = no affine either
                 status_str     = "IDENTITY_FALLBACK_RAW"
                 logger.warning(f"Z{i:02d} (ID {real_id:03d}): {status_str} — writing raw slice.")
+
+            del moving_np   # free immediately
 
             logger.info(
                 f"Z{i:02d} (ID {real_id:03d}) | Det: {stats['detector']} | "
@@ -1066,53 +1249,55 @@ def main():
         f"Execution complete. SUCCESS: {n_ok} | IDENTITY_FALLBACK_RAW: {n_fallback}"
     )
 
-    # --- QC MONTAGES (generated before writing the volume) ---
-    # Three montages:
-    #   Raw         — unregistered input (baseline)
-    #   AKAZE_Affine — after AKAZE affine only (judges AKAZE contribution)
-    #   AKAZE+BSpline — final output after elastic refinement
-    logger.info("Generating QC montages...")
-    raw_vol = np.stack(raw_slices, axis=0)
-    generate_qc_montage(
-        raw_vol, OUTPUT_FOLDER,
-        slice_ids=slice_ids,
-        channel_idx=CK_CHANNEL_IDX,
-        channel_name="CK",
-        title_suffix="Raw",
-    )
-    generate_qc_montage(
-        affine_vol, OUTPUT_FOLDER,
-        slice_ids=slice_ids,
-        channel_idx=CK_CHANNEL_IDX,
-        channel_name="CK",
-        title_suffix="AKAZE_Affine",
-    )
-    generate_qc_montage(
-        aligned_vol, OUTPUT_FOLDER,
-        slice_ids=slice_ids,
-        channel_idx=CK_CHANNEL_IDX,
-        channel_name="CK",
-        title_suffix="AKAZE+BSpline",
-    )
-
-    # --- WRITE REGISTERED VOLUME ---
+    # --- WRITE REGISTERED VOLUME FIRST ---
+    # Write before montages so the result is always saved even if montage fails.
     out_tiff = os.path.join(OUTPUT_FOLDER, f"{TARGET_CORE}_Feature_Aligned.ome.tif")
     logger.info(f"Writing registered volume to {out_tiff}")
-    tifffile.imwrite(
-        out_tiff, aligned_vol,
-        photometric='minisblack',
-        metadata={
-            'axes': 'ZCYX',
-            'Channel': {'Name': CHANNEL_NAMES},
-            'PhysicalSizeX': PIXEL_SIZE_XY_UM,
-            'PhysicalSizeXUnit': 'µm',
-            'PhysicalSizeY': PIXEL_SIZE_XY_UM,
-            'PhysicalSizeYUnit': 'µm',
-            'PhysicalSizeZ': SECTION_THICKNESS_UM,
-            'PhysicalSizeZUnit': 'µm',
-        },
-        compression='deflate', compressionargs={'level': 6},
-    )
+    try:
+        tifffile.imwrite(
+            out_tiff, aligned_vol,
+            photometric='minisblack',
+            metadata={
+                'axes': 'ZCYX',
+                'Channel': {'Name': CHANNEL_NAMES},
+                'PhysicalSizeX': PIXEL_SIZE_XY_UM,
+                'PhysicalSizeXUnit': 'µm',
+                'PhysicalSizeY': PIXEL_SIZE_XY_UM,
+                'PhysicalSizeYUnit': 'µm',
+                'PhysicalSizeZ': SECTION_THICKNESS_UM,
+                'PhysicalSizeZUnit': 'µm',
+            },
+            compression='deflate', compressionargs={'level': 6},
+        )
+        logger.info("Registered volume written.")
+    except Exception as exc:
+        logger.error(f"Volume write failed: {exc}")
+
+    # --- QC MONTAGES ---
+    logger.info("Generating QC montages...")
+    try:
+        generate_qc_montage(
+            affine_vol, OUTPUT_FOLDER,
+            slice_ids=slice_ids,
+            channel_idx=CK_CHANNEL_IDX,
+            channel_name="CK",
+            title_suffix="AKAZE_Affine",
+        )
+    except Exception as exc:
+        logger.error(f"Affine montage failed: {exc}")
+    del affine_vol
+
+    try:
+        generate_qc_montage(
+            aligned_vol, OUTPUT_FOLDER,
+            slice_ids=slice_ids,
+            channel_idx=CK_CHANNEL_IDX,
+            channel_name="CK",
+            title_suffix="AKAZE+BSpline",
+        )
+    except Exception as exc:
+        logger.error(f"BSpline montage failed: {exc}")
+    del aligned_vol
     logger.info("Done.")
 
 if __name__ == "__main__":
