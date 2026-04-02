@@ -18,8 +18,8 @@ Usage:
   --channel  int index (0-7) OR name: DAPI CD31 GAP43 NFP CD3 CD163 CK AF
   --slice_idx  which file in the sorted TMA_<N>_ list (default 0 = first slice)
 
-Requires: numpy matplotlib scipy tifffile
-Install:  pip install numpy matplotlib scipy tifffile
+Requires: numpy matplotlib scipy tifffile opencv-python
+Install:  pip install numpy matplotlib scipy tifffile opencv-python
 """
 
 import os
@@ -82,19 +82,113 @@ def load_slice(data_root: str, core_name: str, slice_idx: int):
     return arr, chosen
 
 
+def prepare_ck(img_arr: np.ndarray):
+    """
+    Exact copy of prepare_ck() from akaze_linear_romav2_warp.py.
+
+    Returns (norm_lin uint8, norm_log uint8) — two separate images:
+
+      norm_lin : linear percentile stretch (0.1–99.9%) → fed to RoMaV2.
+                 Preserves the natural intensity relationships the model was
+                 pretrained on (standard 0–255 linear RGB distribution).
+
+      norm_log : log-stretch then percentile normalise → used for AKAZE
+                 detection, tissue masking, and NCC measurement.
+
+    Both are uint8 [0, 255] — this is what the pipeline actually passes
+    to cv2.AKAZE_create().detectAndCompute() and build_tissue_mask().
+    """
+    import cv2
+
+    img_float = img_arr.astype(np.float32)
+
+    # Linear normalisation — for RoMaV2
+    p_lo_lin, p_hi_lin = np.percentile(img_float[::4, ::4], (0.1, 99.9))
+    norm_lin = cv2.normalize(
+        np.clip(img_float, p_lo_lin, p_hi_lin), None, 0, 255, cv2.NORM_MINMAX
+    ).astype(np.uint8)
+
+    # Log normalisation — for AKAZE, tissue mask, NCC
+    log_img    = np.log1p(img_float)
+    p_lo, p_hi = np.percentile(log_img[::4, ::4], (0.1, 99.9))
+    norm_log   = cv2.normalize(
+        np.clip(log_img, p_lo, p_hi), None, 0, 255, cv2.NORM_MINMAX
+    ).astype(np.uint8)
+
+    return norm_lin, norm_log
+
+
+# Tissue mask constants — match akaze_linear_romav2_warp.py exactly
+MASK_DILATE_PX = 20
+
+
+def build_tissue_mask(ck_log: np.ndarray) -> np.ndarray:
+    """
+    Exact copy of the improved build_tissue_mask() from fix_fig4_and_mask.py.
+
+    Binary tissue mask from norm_log CK channel:
+      1. Otsu threshold on non-zero pixels
+      2. Morphological closing  (fills intra-tissue holes, keeps core as one CC)
+      3. Keep only the largest connected component  (eliminates debris outside core)
+      4. Dilate by MASK_DILATE_PX
+
+    Returns uint8 (H, W): 255 = tissue, 0 = background.
+    This is what the pipeline passes as the mask argument to
+    detector.detectAndCompute() — OpenCV only proposes keypoints
+    where mask == 255.
+    """
+    import cv2
+
+    img     = ck_log.astype(np.uint8)
+    nonzero = img[img > 0]
+    if len(nonzero) == 0:
+        return np.zeros_like(img)
+
+    thresh, _ = cv2.threshold(
+        nonzero.reshape(-1, 1), 0, 255,
+        cv2.THRESH_BINARY + cv2.THRESH_OTSU,
+    )
+    mask = (img > thresh).astype(np.uint8) * 255
+
+    # Closing: fill holes so core stays one connected component
+    close_r  = max(5, MASK_DILATE_PX // 2)
+    kern_cls = cv2.getStructuringElement(
+        cv2.MORPH_ELLIPSE, (2 * close_r + 1, 2 * close_r + 1)
+    )
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kern_cls)
+
+    # Keep only the largest connected component (the TMA core)
+    n_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
+        mask, connectivity=8
+    )
+    if n_labels > 1:
+        largest = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
+        mask = np.where(labels == largest, np.uint8(255), np.uint8(0))
+
+    # Original dilation
+    kern_dil = cv2.getStructuringElement(
+        cv2.MORPH_ELLIPSE, (2 * MASK_DILATE_PX + 1, 2 * MASK_DILATE_PX + 1)
+    )
+    return cv2.dilate(mask, kern_dil)
+
+
 def extract_channel(arr: np.ndarray, channel):
     """
-    Pull one channel from (C, H, W) and preprocess it exactly as prepare_ck()
-    does in the registration script — this is the image AKAZE actually sees.
+    Pull one channel from (C, H, W), run prepare_ck(), and build the tissue mask.
 
-    Steps (mirroring prepare_ck verbatim):
-      1. Cast to float32
-      2. log1p                              (boosts weak signal, matches your pipeline)
-      3. Percentile clip  (0.1, 99.9) on   (sampled at [::4,::4] for speed)
-      4. cv2.normalize → uint8  [0, 255]   (same as AKAZE input in registration)
-      5. Return as float64 in [0, 1]        (divide by 255, for downstream maths)
+    Pipeline data flow reproduced here exactly:
+      raw uint16  →  prepare_ck()  →  norm_log uint8  →  build_tissue_mask()
+                                   →  norm_lin uint8  (shown for comparison only)
 
-    Returns (image float64 [0,1], channel_name string).
+    AKAZE in the pipeline receives norm_log as uint8 directly — NOT divided
+    by 255.  The tissue mask is passed as the second argument to
+    detector.detectAndCompute() so keypoints are only proposed inside the core.
+
+    Returns:
+      norm_log  : uint8 ndarray  — what AKAZE and the mask builder actually receive
+      norm_lin  : uint8 ndarray  — what RoMaV2 receives (shown for comparison)
+      mask      : uint8 ndarray  — tissue mask (255 = tissue)
+      ch_name   : str
     """
     import cv2
 
@@ -113,21 +207,19 @@ def extract_channel(arr: np.ndarray, channel):
     ch_name = CHANNEL_NAMES[ch_idx] if ch_idx < len(CHANNEL_NAMES) else f"ch{ch_idx}"
     print(f"  Channel  : index {ch_idx} → {ch_name}")
 
-    raw = arr[ch_idx].astype(np.float32)
+    raw               = arr[ch_idx]                   # uint16
+    norm_lin, norm_log = prepare_ck(raw)              # both uint8
+    mask              = build_tissue_mask(norm_log)   # uint8 255/0
 
-    # ── exact prepare_ck logic ────────────────────────────────────────────────
-    log_img    = np.log1p(raw)
-    p_lo, p_hi = np.percentile(log_img[::4, ::4], (0.1, 99.9))
-    norm_log   = cv2.normalize(
-        np.clip(log_img, p_lo, p_hi), None, 0, 255, cv2.NORM_MINMAX
-    ).astype(np.uint8)
-    # ─────────────────────────────────────────────────────────────────────────
+    tissue_frac = float(np.count_nonzero(mask)) / mask.size
+    print(f"  norm_log : uint8  range [{norm_log.min()}, {norm_log.max()}]  "
+          f"(log-stretch → AKAZE & mask)")
+    print(f"  norm_lin : uint8  range [{norm_lin.min()}, {norm_lin.max()}]  "
+          f"(linear → RoMaV2, shown for comparison)")
+    print(f"  mask     : tissue fraction = {tissue_frac*100:.1f}%  "
+          f"(passed to detectAndCompute as pixel gate)")
 
-    print(f"  Pre-proc : log1p → percentile clip ({p_lo:.3f}, {p_hi:.3f}) → uint8")
-    print(f"  uint8 range: [{norm_log.min()}, {norm_log.max()}]")
-
-    # Convert to float64 [0,1] for the maths in sections 1-3
-    return norm_log.astype(np.float64) / 255.0, ch_name
+    return norm_log, norm_lin, mask, ch_name
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -158,7 +250,18 @@ def compute_lambda(image, sigma=1.0, percentile=70):
     return lam, grad_mag
 
 
-def plot_conductance(image, ch_name, out_dir):
+def plot_conductance(norm_log, ch_name, out_dir):
+    """
+    Visualise the AKAZE conductance function using norm_log uint8 — the same
+    image the pipeline passes to detectAndCompute().
+
+    gradient magnitudes and λ are computed in the uint8 [0,255] space,
+    matching the scale at which AKAZE internally operates.
+    """
+    # Work in float64 but keep the [0,255] scale — do NOT divide by 255,
+    # so λ and gradient magnitudes are on the same scale as AKAZE sees them.
+    image = norm_log.astype(np.float64)
+
     lam, grad_mag = compute_lambda(image)
     print(f"  λ (70th %ile of |∇Lσ|) = {lam:.6f}")
     gmax = grad_mag.max() * 1.1
@@ -201,7 +304,7 @@ def plot_conductance(image, ch_name, out_dir):
     # ── 1b: conductance map overlaid on image ─────────────────────────────────
     fig, ax = plt.subplots(figsize=(8, 8))
     cond_overlay = g2(grad_mag[::step, ::step], lam)
-    ax.imshow(image[::step, ::step], cmap='gray', vmin=0, vmax=1)
+    ax.imshow(image[::step, ::step], cmap='gray', vmin=0, vmax=255)
     im = ax.imshow(1 - cond_overlay, cmap='hot', alpha=0.55, vmin=0, vmax=1)
     plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04,
                  label='1 − g₂  (bright = diffusion blocked)')
@@ -275,14 +378,38 @@ def find_maxima(response, threshold, min_dist=5, border=24):
     return list(zip(r, c, response[r, c]))
 
 
-def plot_doh(image, ch_name, out_dir):
-    step = max(1, image.shape[0] // 512)
-    img  = image[::step, ::step]
+def plot_doh(norm_log, mask, ch_name, out_dir):
+    """
+    Visualise the Determinant of Hessian blob detector.
+
+    norm_log : uint8 ndarray — the log-normalised CK channel, same as AKAZE input.
+    mask     : uint8 ndarray — tissue mask (255=tissue). Keypoints are only
+               accepted inside the mask, exactly as in the pipeline where
+               detector.detectAndCompute(norm_log, mask) is called.
+
+    Saves two files:
+      2a_image_{ch_name}.png          — standalone: raw AKAZE input image
+      2b_to_2f_doh_{ch_name}.png      — combined 5-panel figure: Lxx, Lyy, Lxy,
+                                         det(H), keypoints with mask boundary
+    Also saves separately (unchanged):
+      2g_lxx_lyy_scatter_{ch_name}.png
+      2h_crosssection_{ch_name}.png
+    """
+    import cv2
+
+    # Keep in [0,255] float64 — matching the scale AKAZE operates at.
+    step    = max(1, norm_log.shape[0] // 512)
+    img     = norm_log[::step, ::step].astype(np.float64)
+    mask_ds = mask[::step, ::step]
     print(f"  Working image: {img.shape}  (1/{step} of original)")
 
     Lxx, Lyy, Lxy, detH = compute_hessian(img)
-    kps = find_maxima(detH, threshold=detH.max() * 0.10, min_dist=6, border=24)
-    print(f"  Keypoints found: {len(kps)}  (border-excluded)")
+
+    # Keypoints: find all maxima then restrict to tissue mask
+    kps_all = find_maxima(detH, threshold=detH.max() * 0.10, min_dist=6, border=24)
+    kps     = [(r, c, v) for (r, c, v) in kps_all if mask_ds[r, c] > 0]
+    print(f"  Keypoints (all):           {len(kps_all)}")
+    print(f"  Keypoints (tissue-masked): {len(kps)}  ← matches pipeline behaviour")
 
     DPI = 200
 
@@ -292,46 +419,67 @@ def plot_doh(image, ch_name, out_dir):
         print(f"  Saved  : {out}")
         plt.close(fig)
 
-    def imsave(data, title, name, cmap='gray', cb=False):
-        fig, ax = plt.subplots(figsize=(8, 8))
-        im = ax.imshow(data, cmap=cmap, origin='upper')
-        ax.set_title(f'{title}\nChannel: {ch_name}', fontsize=12)
-        ax.axis('off')
-        if cb:
-            plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-        plt.tight_layout()
-        save(fig, name)
-
-    # ── 2a: raw channel image ─────────────────────────────────────────────────
-    imsave(img,  f'{ch_name}  (log-stretched, uint8-normalised)',
-           f'2a_image_{ch_name}.png', 'gray')
-
-    # ── 2b-2d: second derivatives ─────────────────────────────────────────────
-    imsave(Lxx, 'Lxx = ∂²L/∂x²  (horizontal curvature)',
-           f'2b_Lxx_{ch_name}.png', 'RdBu_r', cb=True)
-    imsave(Lyy, 'Lyy = ∂²L/∂y²  (vertical curvature)',
-           f'2c_Lyy_{ch_name}.png', 'RdBu_r', cb=True)
-    imsave(Lxy, 'Lxy = ∂²L/∂x∂y  (cross derivative)',
-           f'2d_Lxy_{ch_name}.png', 'RdBu_r', cb=True)
-
-    # ── 2e: det(H) heatmap ────────────────────────────────────────────────────
-    imsave(detH, 'det(H) = Lxx·Lyy − Lxy²  (bright = blob response)',
-           f'2e_detH_{ch_name}.png', 'hot', cb=True)
-
-    # ── 2f: keypoints overlaid ────────────────────────────────────────────────
-    fig, ax = plt.subplots(figsize=(8, 8))
-    ax.imshow(img, cmap='gray', origin='upper')
-    for (r, c, v) in kps:
-        radius = 4 + 18 * (v / (detH.max() + 1e-9))
-        ax.add_patch(plt.Circle((c, r), radius, fill=False,
-                                edgecolor='#7F77DD', lw=1.2))
-        ax.plot(c, r, '+', color='#CECBF6', markersize=4, markeredgewidth=1.0)
-    ax.set_title(f'Keypoints detected: {len(kps)}\nCircle radius ∝ response strength  |  Channel: {ch_name}', fontsize=12)
+    # ── 2a: standalone raw image (kept separate — used as reference) ──────────
+    fig, ax = plt.subplots(figsize=(6, 6))
+    ax.imshow(img, cmap='gray', origin='upper', vmin=0, vmax=255)
+    ax.set_title(f'(a) norm_log — log-stretched uint8\nAKAZE input  |  Channel: {ch_name}',
+                 fontsize=11)
     ax.axis('off')
     plt.tight_layout()
-    save(fig, f'2f_keypoints_{ch_name}.png')
+    save(fig, f'2a_image_{ch_name}.png')
 
-    # ── 2g: Lxx vs Lyy scatter ────────────────────────────────────────────────
+    # ─────────────────────────────────────────────────────────────────────────
+    # ── Combined figure: panels b–e in a single row ───────────────────────────
+    # ─────────────────────────────────────────────────────────────────────────
+    fig, axes = plt.subplots(1, 4, figsize=(22, 6), dpi=DPI)
+    fig.suptitle(
+        f'Determinant of Hessian — Channel: {ch_name}',
+        fontsize=14, fontweight='bold', y=1.02
+    )
+
+    # ── (b) Lxx ──────────────────────────────────────────────────────────────
+    ax = axes[0]
+    vlim = np.percentile(np.abs(Lxx), 99)
+    im = ax.imshow(Lxx, cmap='RdBu_r', origin='upper', vmin=-vlim, vmax=vlim)
+    plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    ax.set_title('(b) Lxx = ∂²L/∂x²\nhorizontal curvature', fontsize=11)
+    ax.axis('off')
+
+    # ── (c) Lyy ──────────────────────────────────────────────────────────────
+    ax = axes[1]
+    vlim = np.percentile(np.abs(Lyy), 99)
+    im = ax.imshow(Lyy, cmap='RdBu_r', origin='upper', vmin=-vlim, vmax=vlim)
+    plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    ax.set_title('(c) Lyy = ∂²L/∂y²\nvertical curvature', fontsize=11)
+    ax.axis('off')
+
+    # ── (d) Lxy ──────────────────────────────────────────────────────────────
+    ax = axes[2]
+    vlim = np.percentile(np.abs(Lxy), 99)
+    im = ax.imshow(Lxy, cmap='RdBu_r', origin='upper', vmin=-vlim, vmax=vlim)
+    plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    ax.set_title('(d) Lxy = ∂²L/∂x∂y\ncross derivative', fontsize=11)
+    ax.axis('off')
+
+    # ── (e) det(H) — diverging colormap centred at zero ──────────────────────
+    ax = axes[3]
+    pos_vals = detH[detH > 0]
+    vmax_doh = float(np.percentile(pos_vals, 99)) if len(pos_vals) else detH.max()
+    im = ax.imshow(detH, cmap='RdYlGn', origin='upper',
+                   vmin=-vmax_doh, vmax=vmax_doh)
+    cb = plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    cb.set_label('det(H)', fontsize=9)
+    cb.ax.axhline(0, color='black', lw=0.8)
+    ax.set_title(
+        '(e) det(H) = Lxx·Lyy − Lxy²\n'
+        'green = blob  ·  yellow = flat  ·  red = saddle',
+        fontsize=11)
+    ax.axis('off')
+
+    plt.tight_layout()
+    save(fig, f'2b_to_2e_doh_{ch_name}.png')
+
+    # ── 2g: Lxx vs Lyy scatter (kept as separate file) ───────────────────────
     fig, ax = plt.subplots(figsize=(7, 7))
     samp  = np.random.choice(img.size, size=min(5000, img.size), replace=False)
     lxx_s = Lxx.ravel()[samp]; lyy_s = Lyy.ravel()[samp]
@@ -341,7 +489,8 @@ def plot_doh(image, ch_name, out_dir):
     ax.axhline(0, color='gray', lw=0.8, ls='--')
     ax.axvline(0, color='gray', lw=0.8, ls='--')
     ax.set_xlabel('Lxx', fontsize=12); ax.set_ylabel('Lyy', fontsize=12)
-    ax.set_title(f'Lxx vs Lyy  —  {ch_name}\npurple = blob (det>0)   red = saddle (det<0)', fontsize=12)
+    ax.set_title(f'Lxx vs Lyy  —  {ch_name}\npurple = blob (det>0)   red = saddle (det<0)',
+                 fontsize=12)
     ax.grid(True, alpha=0.15)
     plt.tight_layout()
     save(fig, f'2g_lxx_lyy_scatter_{ch_name}.png')
@@ -351,13 +500,16 @@ def plot_doh(image, ch_name, out_dir):
         r_best = max(kps, key=lambda x: x[2])[0]
         fig, ax = plt.subplots(figsize=(10, 5))
         ax2_ = ax.twinx()
-        ax.plot(img[r_best],   color='gray',    lw=1.5, label='intensity')
+        ax.plot(img[r_best],    color='gray',    lw=1.5,
+                label='norm_log intensity (uint8 scale)')
         ax2_.plot(detH[r_best], color='#534AB7', lw=2.5, label='det(H)')
-        ax2_.axhline(detH.max() * 0.10, color='orange', lw=1.2, ls='--', label='threshold (10%)')
+        ax2_.axhline(detH.max() * 0.10, color='orange', lw=1.2,
+                     ls='--', label='threshold (10%)')
         ax.set_xlabel('x pixel', fontsize=12)
         ax.set_ylabel('intensity', fontsize=12, color='gray')
         ax2_.set_ylabel('det(H)', fontsize=12, color='#534AB7')
-        ax.set_title(f'Cross-section at row {r_best}  |  Channel: {ch_name}', fontsize=12)
+        ax.set_title(f'Cross-section at row {r_best}  |  Channel: {ch_name}',
+                     fontsize=12)
         l1, b1 = ax.get_legend_handles_labels()
         l2, b2 = ax2_.get_legend_handles_labels()
         ax.legend(l1 + l2, b1 + b2, fontsize=10)
@@ -365,7 +517,7 @@ def plot_doh(image, ch_name, out_dir):
         plt.tight_layout()
         save(fig, f'2h_crosssection_{ch_name}.png')
 
-    return kps, img
+    return kps, img   # img is float64 in [0,255], mask-gated keypoints
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -426,7 +578,7 @@ def plot_mldb(image, kps, ch_name, out_dir):
 
     # ── 3a: raw patch ─────────────────────────────────────────────────────────
     fig, ax = plt.subplots(figsize=(6, 6))
-    ax.imshow(patch, cmap='gray', vmin=0, vmax=1)
+    ax.imshow(patch, cmap='gray', vmin=0, vmax=255)
     ax.plot(24, 24, '+', color='red', markersize=14, markeredgewidth=2.5)
     ax.set_title(f'Extracted patch around keypoint ({c},{r})\nChannel: {ch_name}', fontsize=12)
     ax.axis('off')
@@ -435,7 +587,7 @@ def plot_mldb(image, kps, ch_name, out_dir):
 
     # ── 3b: 3×3 grid with cell averages ──────────────────────────────────────
     fig, ax = plt.subplots(figsize=(6, 6))
-    ax.imshow(patch, cmap='gray', vmin=0, vmax=1, alpha=0.6)
+    ax.imshow(patch, cmap='gray', vmin=0, vmax=255, alpha=0.6)
     for i in range(1, 3):
         ax.axhline(i * cs, color='#7F77DD', lw=2.0)
         ax.axvline(i * cs, color='#7F77DD', lw=2.0)
@@ -454,7 +606,7 @@ def plot_mldb(image, kps, ch_name, out_dir):
     # ── 3c: pair comparison arrows ────────────────────────────────────────────
     from matplotlib.lines import Line2D
     fig, ax = plt.subplots(figsize=(6, 6))
-    ax.imshow(patch, cmap='gray', vmin=0, vmax=1, alpha=0.4)
+    ax.imshow(patch, cmap='gray', vmin=0, vmax=255, alpha=0.4)
     for i in range(1, 3):
         ax.axhline(i * cs, color='#7F77DD', lw=1.0, alpha=0.5)
         ax.axvline(i * cs, color='#7F77DD', lw=1.0, alpha=0.5)
@@ -492,7 +644,7 @@ def plot_mldb(image, kps, ch_name, out_dir):
 
     # ── 3e: multi-scale grids ─────────────────────────────────────────────────
     fig, ax = plt.subplots(figsize=(6, 6))
-    ax.imshow(patch, cmap='gray', vmin=0, vmax=1, alpha=0.55)
+    ax.imshow(patch, cmap='gray', vmin=0, vmax=255, alpha=0.55)
     for n_c, color, lw in [(2,'#1D9E75',2.5),(3,'#534AB7',1.8),(4,'#E85D24',1.2)]:
         sz = 48 / n_c
         for i in range(1, n_c):
@@ -531,15 +683,15 @@ def plot_mldb(image, kps, ch_name, out_dir):
     # ── 3g: Heaviside bit decision ────────────────────────────────────────────
     fig, ax = plt.subplots(figsize=(7, 5))
     ca = cell_avg(patch, 0, 0, 3)
-    br = np.linspace(0, 1, 300)
+    br = np.linspace(0, 255, 300)   # x-axis in uint8 [0,255] — matches pipeline scale
     ax.step(br, (ca > br).astype(float), color='#534AB7', lw=3.0, where='post')
-    ax.axvline(ca, color='#E24B4A', lw=2.0, ls='--', label=f'cell A avg = {ca:.3f}')
+    ax.axvline(ca, color='#E24B4A', lw=2.0, ls='--', label=f'cell A avg = {ca:.1f}')
     ax.fill_between(br, 0, (ca > br).astype(float), alpha=0.12, color='#534AB7')
-    ax.set_xlabel('Cell B average intensity', fontsize=12)
+    ax.set_xlabel('Cell B average intensity  (uint8 scale, 0–255)', fontsize=12)
     ax.set_ylabel('bit  b = H(A − B)', fontsize=12)
     ax.set_title(f'Bit decision — Heaviside step function\nb = 1 if avg(A) > avg(B)  |  Channel: {ch_name}', fontsize=12)
     ax.legend(fontsize=11); ax.grid(True, alpha=0.15)
-    ax.set_xlim(0, 1); ax.set_ylim(-0.1, 1.3); ax.set_yticks([0, 1])
+    ax.set_xlim(0, 255); ax.set_ylim(-0.1, 1.3); ax.set_yticks([0, 1])
     plt.tight_layout()
     save(fig, f'3g_heaviside_{ch_name}.png')
 
@@ -580,16 +732,18 @@ if __name__ == '__main__':
     print()
 
     arr, fpath = load_slice(args.data_root, args.core_name, args.slice_idx)
-    image, ch_name = extract_channel(arr, args.channel)
-    print(f"  Image    : {image.shape}  range [{image.min():.3f}, {image.max():.3f}]")
+    norm_log, norm_lin, mask, ch_name = extract_channel(arr, args.channel)
+    print(f"  norm_log : {norm_log.shape}  dtype={norm_log.dtype}")
+    print(f"  norm_lin : {norm_lin.shape}  dtype={norm_lin.dtype}")
+    print(f"  mask     : {mask.shape}   dtype={mask.dtype}")
     print()
 
     print("[1/3] Conductance function g₂  [paper Eq. 3]")
-    plot_conductance(image, ch_name, args.out_dir)
+    plot_conductance(norm_log, ch_name, args.out_dir)
     print()
 
     print("[2/3] Determinant of Hessian blob detector")
-    kps, img_ds = plot_doh(image, ch_name, args.out_dir)
+    kps, img_ds = plot_doh(norm_log, mask, ch_name, args.out_dir)
     print()
 
     print("[3/3] M-LDB descriptor")

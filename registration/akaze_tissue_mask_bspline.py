@@ -38,7 +38,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(levelname)s | %(
 logger = logging.getLogger(__name__)
 
 # --- CONFIGURATION ---
-parser = argparse.ArgumentParser(description='Feature registration — single level full resolution.')
+parser = argparse.ArgumentParser(description='Feature registration — tissue-masked keypoint detection + NCC B-spline elastic.')
 parser.add_argument('--core_name', type=str, required=True, help='Target core identifier')
 args = parser.parse_args()
 
@@ -47,7 +47,7 @@ TARGET_CORE = args.core_name
 # --- PATHS ---
 DATA_BASE_PATH    = os.path.join(config.DATASPACE, "TMA_Cores_Grouped_Rotate_Conformed")
 INPUT_FOLDER      = os.path.join(DATA_BASE_PATH, TARGET_CORE)
-WORK_OUTPUT       = os.path.join(config.DATASPACE, "Filter_AKAZE_BSpline_Grid_test")
+WORK_OUTPUT       = os.path.join(config.DATASPACE, "Filter_AKAZE_TissueMask_BSpline")
 OUTPUT_FOLDER     = os.path.join(WORK_OUTPUT, TARGET_CORE)
 SLICE_FILTER_YAML = os.path.join(config.DATASPACE, "slice_filter.yaml")
 
@@ -147,13 +147,14 @@ PIXEL_SIZE_XY_UM     = 0.4961
 SECTION_THICKNESS_UM = 4.5
 
 # --- DETECTOR ---
-AKAZE_THRESHOLD = 0.0001   # lower threshold — detect more features on weak CK signal
-                            # (was 0.0003 in older versions; RANSAC is the quality gate)
-
-# --- ANMS ---
-ANMS_KEEP = 6000           # keep more keypoints before matching
-                            # More keypoints → more matches → more inliers.
-                            # ANMS still enforces spatial spread.
+AKAZE_THRESHOLD    = 0.0001   # lower threshold — detect more features on weak CK signal
+                               # (was 0.0003 in older versions; RANSAC is the quality gate)
+AKAZE_MAX_KEYPOINTS = 20_000  # hard cap per image after tissue-masked detection.
+                               # BFMatcher knnMatch has an internal 2^29 index limit that
+                               # fires as an assertion error on very large descriptor sets.
+                               # 20k×20k Hamming matching is fast (~1s); 100k×100k is not.
+                               # Keypoints are ranked by AKAZE response before capping so
+                               # only the strongest tissue features survive.
 
 # --- MATCHING ---
 LOWE_RATIO  = 0.80         # tighter ratio (compensates for more raw keypoints)
@@ -245,31 +246,6 @@ def prepare_ck(img_arr: np.ndarray):
     ).astype(np.uint8)
     return norm_lin, norm_log
 
-def apply_anms(keypoints, descriptors, num_to_keep=2000, c_robust=0.9, max_compute=5000):
-    n = len(keypoints)
-    if n <= num_to_keep or descriptors is None:
-        return keypoints, descriptors
-    # max_compute must be at least num_to_keep — otherwise the candidate pool is
-    # smaller than the requested output and sort_idx[best] silently wraps/truncates.
-    max_compute = max(max_compute, num_to_keep)
-    coords    = np.array([kp.pt for kp in keypoints])
-    responses = np.array([kp.response for kp in keypoints])
-    sort_idx  = np.argsort(responses)[::-1][:max_compute]
-    n         = len(sort_idx)
-    coords    = coords[sort_idx]
-    responses = responses[sort_idx]
-    radii     = np.full(n, np.inf)
-
-    for i in range(1, n):
-        stronger = responses[:i] * c_robust > responses[i]
-        if np.any(stronger):
-            diffs    = coords[:i][stronger] - coords[i]
-            radii[i] = np.min(np.sum(diffs ** 2, axis=1))
-
-    best  = np.argsort(radii)[::-1][:num_to_keep]
-    final = sort_idx[best]
-    return tuple(keypoints[i] for i in final), descriptors[final]
-
 def constrain_affine(M: np.ndarray) -> np.ndarray:
     if M is None: return None
     M_out    = M.copy()
@@ -287,16 +263,30 @@ def transform_is_sane(M: np.ndarray) -> bool:
     return rot_deg <= MAX_ROTATION_DEG
 
 # --- L0: AKAZE AFFINE ---
-# Uses fixed_log / moving_log (log-normalised uint8) for feature detection —
-# log stretch boosts weak CK signal, matching the original design intent.
-def akaze_affine(fixed_8bit: np.ndarray, moving_8bit: np.ndarray, slice_id: str):
-    detector      = cv2.AKAZE_create(threshold=AKAZE_THRESHOLD)
-    kp1_raw, des1 = detector.detectAndCompute(fixed_8bit,  None)
-    coords_raw = np.array([kp.pt for kp in kp1_raw])
-    logger.info(f"[{slice_id}] Raw AKAZE keypoints: n={len(kp1_raw)}, "
-                f"y_range=[{coords_raw[:,1].min():.0f}, {coords_raw[:,1].max():.0f}]")
+# Uses fixed_log / moving_log (log-normalised uint8) for feature detection.
+# Keypoint detection is restricted to tissue pixels via the tissue mask so
+# that boundary-ring and background keypoints are excluded before matching.
+# This replaces the previous ANMS step: rather than detecting everywhere and
+# then spatially sub-sampling, we never detect outside tissue in the first place.
+def akaze_affine(fixed_8bit: np.ndarray, moving_8bit: np.ndarray, slice_id: str,
+                 fixed_mask: np.ndarray = None, moving_mask: np.ndarray = None):
+    detector = cv2.AKAZE_create(threshold=AKAZE_THRESHOLD)
 
-    kp2_raw, des2 = detector.detectAndCompute(moving_8bit, None)
+    # Build tissue masks if not supplied externally
+    if fixed_mask is None:
+        fixed_mask  = build_tissue_mask(fixed_8bit)
+    if moving_mask is None:
+        moving_mask = build_tissue_mask(moving_8bit)
+
+    kp1_raw, des1 = detector.detectAndCompute(fixed_8bit,  fixed_mask)
+    kp2_raw, des2 = detector.detectAndCompute(moving_8bit, moving_mask)
+
+    if len(kp1_raw) > 0:
+        coords_raw = np.array([kp.pt for kp in kp1_raw])
+        logger.info(f"[{slice_id}] AKAZE keypoints (tissue-masked): n={len(kp1_raw)}, "
+                    f"y_range=[{coords_raw[:,1].min():.0f}, {coords_raw[:,1].max():.0f}]")
+    else:
+        logger.info(f"[{slice_id}] AKAZE keypoints (tissue-masked): n=0")
 
     if des1 is None or des2 is None or len(kp1_raw) < 4 or len(kp2_raw) < 4:
         logger.warning(
@@ -305,11 +295,23 @@ def akaze_affine(fixed_8bit: np.ndarray, moving_8bit: np.ndarray, slice_id: str)
         )
         return None, 0, 0, [], [], [], np.array([])
 
-    kp1, des1 = apply_anms(kp1_raw, des1, num_to_keep=ANMS_KEEP)
-    kp2, des2 = apply_anms(kp2_raw, des2, num_to_keep=ANMS_KEEP)
-    coords_anms = np.array([kp.pt for kp in kp1])
-    logger.info(f"[{slice_id}] After ANMS keypoints: n={len(kp1)}, "
-                f"y_range=[{coords_anms[:,1].min():.0f}, {coords_anms[:,1].max():.0f}]")
+    # Cap to AKAZE_MAX_KEYPOINTS by response strength.
+    # Tissue masking already removes background/boundary junk; this cap prevents
+    # the BFMatcher internal index overflow (IMGIDX_ONE assertion) that fires
+    # when descriptor count approaches 2^29, and keeps matching time tractable.
+    def cap_by_response(kps, des, max_kp):
+        if len(kps) <= max_kp:
+            return kps, des
+        responses = np.array([kp.response for kp in kps])
+        keep      = np.argsort(responses)[::-1][:max_kp]
+        return tuple(kps[i] for i in keep), des[keep]
+
+    kp1, des1 = cap_by_response(kp1_raw, des1, AKAZE_MAX_KEYPOINTS)
+    kp2, des2 = cap_by_response(kp2_raw, des2, AKAZE_MAX_KEYPOINTS)
+    logger.info(
+        f"[{slice_id}] After cap: fixed={len(kp1)}, moving={len(kp2)} "
+        f"(cap={AKAZE_MAX_KEYPOINTS})"
+    )
 
     matcher = cv2.BFMatcher(cv2.NORM_HAMMING)
     raw     = matcher.knnMatch(des1, des2, k=2)
@@ -693,9 +695,17 @@ def register_slice(fixed_np, moving_np, slice_id=None):
     moving_lin, moving_log = prepare_ck(moving_ck)
     h, w = fixed_log.shape
 
-    # L0: AKAZE affine — log images (boosts weak signal, original design)
+    # Build tissue masks once — reused by AKAZE detection, NCC measurement,
+    # and B-spline registration so all three operate on the same tissue region.
+    fixed_tissue_mask  = build_tissue_mask(fixed_log)
+    moving_tissue_mask = build_tissue_mask(moving_log)
+    tissue_frac        = float(np.count_nonzero(fixed_tissue_mask)) / fixed_tissue_mask.size
+    logger.info(f"[{sid}] Tissue mask: {tissue_frac*100:.1f}% of canvas covered.")
+
+    # L0: AKAZE affine — tissue-masked keypoint detection
     M_affine, n_matches, n_inliers, kp1, kp2, good_matches, inlier_mask = \
-        akaze_affine(fixed_log, moving_log, sid)
+        akaze_affine(fixed_log, moving_log, sid,
+                     fixed_mask=fixed_tissue_mask, moving_mask=moving_tissue_mask)
     akaze_ok = M_affine is not None
     if not akaze_ok:
         M_affine = np.eye(2, 3, dtype=np.float64)
@@ -722,25 +732,20 @@ def register_slice(fixed_np, moving_np, slice_id=None):
     ncc_value     = 0.0
     ncc_affine    = 0.0   # NCC of affine-prealigned images (baseline for acceptance)
     tile_stats    = []
-    tissue_mask   = None
+    tissue_mask   = fixed_tissue_mask if BSPLINE_USE_TISSUE_MASK else None
     if akaze_ok:
         moving_log_affine = cv2.warpAffine(
             moving_log, M_affine, (w, h),
-            flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT,
+            flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=0,
         )
 
-        # Build tissue mask from the fixed CK log image
-        if BSPLINE_USE_TISSUE_MASK:
-            tissue_mask  = build_tissue_mask(fixed_log)
-            tissue_frac  = float(np.count_nonzero(tissue_mask)) / tissue_mask.size
-            logger.info(f"[{sid}] Tissue mask: {tissue_frac*100:.1f}% of canvas covered.")
-            if tissue_frac < BSPLINE_MIN_TISSUE_FRAC:
-                logger.warning(
-                    f"[{sid}] Tissue fraction {tissue_frac*100:.1f}% < "
-                    f"{BSPLINE_MIN_TISSUE_FRAC*100:.0f}% minimum — skipping B-spline."
-                )
-                aligned_np = moving_affine_vol.astype(np.uint16)
-                akaze_ok   = False   # suppress B-spline plot for this slice
+        if tissue_frac < BSPLINE_MIN_TISSUE_FRAC:
+            logger.warning(
+                f"[{sid}] Tissue fraction {tissue_frac*100:.1f}% < "
+                f"{BSPLINE_MIN_TISSUE_FRAC*100:.0f}% minimum — skipping B-spline."
+            )
+            aligned_np = moving_affine_vol.astype(np.uint16)
+            akaze_ok   = False   # suppress B-spline plot for this slice
 
         if akaze_ok:
             # Measure NCC on affine-prealigned images (masked if available)
@@ -802,9 +807,10 @@ def register_slice(fixed_np, moving_np, slice_id=None):
             tile_stats=tile_stats,
         )
 
-    # MSE -- linear fixed vs log warped (original metric: cross-domain perceptual measure)
+    # MSE — both images in log space so the comparison is within the same domain.
+    # (previously compared fixed_lin vs warped_log which mixed intensity spaces)
     _, warped_log = prepare_ck(aligned_np[CK_CHANNEL_IDX].astype(np.float32))
-    mse = float(np.mean((fixed_lin.astype(np.float32) - warped_log.astype(np.float32)) ** 2))
+    mse = float(np.mean((fixed_log.astype(np.float32) - warped_log.astype(np.float32)) ** 2))
 
     # Stats
     U, S, Vt  = np.linalg.svd(M_affine[:2, :2])
@@ -1086,7 +1092,7 @@ def generate_qc_montage(
 def main():
     logger.info(f"Feature Registration (AKAZE + NCC B-spline) — {TARGET_CORE}")
     logger.info(
-        f"AKAZE threshold={AKAZE_THRESHOLD} | ANMS keep={ANMS_KEEP} | "
+        f"AKAZE threshold={AKAZE_THRESHOLD} | Tissue-masked detection | Max keypoints={AKAZE_MAX_KEYPOINTS} | "
         f"Lowe ratio={LOWE_RATIO} | Min matches={MIN_MATCHES} | "
         f"Min inliers={MIN_INLIERS} | RANSAC thresh={RANSAC_THRESH}px | NCC min improvement={BSPLINE_NCC_MIN_IMPROVEMENT*100:.0f}%"
     )
@@ -1120,7 +1126,7 @@ def main():
     if n_slices < 2:
         logger.warning("Only one slice — writing identity output.")
         vol_in   = tifffile.imread(file_list[0])
-        out_path = os.path.join(OUTPUT_FOLDER, f"{TARGET_CORE}_Feature_Aligned.ome.tif")
+        out_path = os.path.join(OUTPUT_FOLDER, f"{TARGET_CORE}_AKAZE_TissueMask_Aligned.ome.tif")
         tifffile.imwrite(
             out_path, vol_in[np.newaxis],
             photometric='minisblack',
@@ -1247,7 +1253,7 @@ def main():
         "MSE_After", "Runtime_s",
     ]
     df[cols].to_csv(
-        os.path.join(OUTPUT_FOLDER, "registration_stats_AKAZE_BSpline.csv"), index=False
+        os.path.join(OUTPUT_FOLDER, "registration_stats_AKAZE_TissueMask_BSpline.csv"), index=False
     )
 
     n_ok       = int((df["Status"] == "SUCCESS").sum())
@@ -1258,7 +1264,7 @@ def main():
 
     # --- WRITE REGISTERED VOLUME FIRST ---
     # Write before montages so the result is always saved even if montage fails.
-    out_tiff = os.path.join(OUTPUT_FOLDER, f"{TARGET_CORE}_Feature_Aligned.ome.tif")
+    out_tiff = os.path.join(OUTPUT_FOLDER, f"{TARGET_CORE}_AKAZE_TissueMask_Aligned.ome.tif")
     logger.info(f"Writing registered volume to {out_tiff}")
     try:
         tifffile.imwrite(
@@ -1288,7 +1294,7 @@ def main():
             slice_ids=slice_ids,
             channel_idx=CK_CHANNEL_IDX,
             channel_name="CK",
-            title_suffix="AKAZE_Affine",
+            title_suffix="AKAZE_TissueMask_Affine",
         )
     except Exception as exc:
         logger.error(f"Affine montage failed: {exc}")
@@ -1300,7 +1306,7 @@ def main():
             slice_ids=slice_ids,
             channel_idx=CK_CHANNEL_IDX,
             channel_name="CK",
-            title_suffix="AKAZE+BSpline",
+            title_suffix="AKAZE_TissueMask+BSpline",
         )
     except Exception as exc:
         logger.error(f"BSpline montage failed: {exc}")

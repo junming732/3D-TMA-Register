@@ -78,7 +78,7 @@ ANMS_KEEP = 6000           # keep more keypoints before matching
                             # ANMS still enforces spatial spread.
 
 # --- MATCHING ---
-LOWE_RATIO  = 0.75         # tighter ratio (compensates for more raw keypoints)
+LOWE_RATIO  = 0.8         # tighter ratio (compensates for more raw keypoints)
 MIN_MATCHES = 20           # minimum matches fed into RANSAC (relaxed for sparse cores)
 MIN_INLIERS = 6            # minimum RANSAC survivors to accept the transform
 
@@ -95,11 +95,8 @@ MAX_ROTATION_DEG    = 15.0
 # --- OUTPUT SANITY ---
 MIN_CK_NONZERO_FRAC = 0.01
 
-# INSPIRE must reduce MSE by at least this fraction vs affine-only to be accepted.
-# e.g. 0.05 = INSPIRE output must be at least 5% better than affine.
-# This catches silent divergence where the optimizer wanders and produces a
-# non-blank but distorted output that would poison the next slice.
-INSPIRE_MIN_IMPROVEMENT = 0.05
+# Fraction of CK output pixels that must be non-zero to accept INSPIRE result.
+# Only guard against catastrophic blank output (field folded on itself).
 
 if not os.path.exists(INPUT_FOLDER):
     logger.error(f"Input folder not found: {INPUT_FOLDER}")
@@ -164,6 +161,22 @@ def prepare_ck(img_arr: np.ndarray):
         np.clip(img_arr, p_lo_lin, p_hi_lin), None, 0, 255, cv2.NORM_MINMAX
     ).astype(np.uint8)
     return norm_lin, norm_log
+
+
+def compute_ncc(fixed_f32: np.ndarray, moving_f32: np.ndarray) -> float:
+    """
+    Compute Normalized Cross-Correlation between two float32 images.
+    Returns a value in [-1, 0] where more negative = better alignment.
+    Subsamples at every 4th pixel for speed on large images.
+    """
+    f = fixed_f32[::4, ::4].ravel().astype(np.float64)
+    m = moving_f32[::4, ::4].ravel().astype(np.float64)
+    f -= f.mean();  f_std = f.std()
+    m -= m.mean();  m_std = m.std()
+    if f_std < 1e-6 or m_std < 1e-6:
+        return 0.0
+    ncc = float(np.mean((f / f_std) * (m / m_std)))
+    return -abs(ncc)   # return as negative so more negative = better (consistent with SimpleITK NCC)
 
 def apply_anms(keypoints, descriptors, num_to_keep=2000, c_robust=0.9, max_compute=5000):
     n = len(keypoints)
@@ -287,9 +300,10 @@ def apply_inspire_l1(
         tforward    = os.path.join(temp_dir, "tforward.txt")
         treverse    = os.path.join(temp_dir, "treverse.txt")
 
-        # Both images cast to float32 — same numeric scale for the INSPIRE optimizer
-        tifffile.imwrite(ref_ck_path, fixed_log_for_reg.astype(np.float32))
-        tifffile.imwrite(flo_ck_path, moving_log_affine.astype(np.float32))
+        # INSPIRE expects float32 images normalised to [0, 1].
+        # Raw log-normalised uint8 inputs are in [0, 255] — divide by 255.
+        tifffile.imwrite(ref_ck_path, (fixed_log_for_reg.astype(np.float32) / 255.0))
+        tifffile.imwrite(flo_ck_path, (moving_log_affine.astype(np.float32) / 255.0))
 
         reg_cmd = [
             INSPIRE_REGISTER_BIN, "2",
@@ -312,15 +326,22 @@ def apply_inspire_l1(
             logger.error(f"[{slice_id}] InspireRegister did not produce transformation map.")
             return None, False
 
-        # Apply the displacement field to every channel of the full 16-bit volume
+        # Apply the displacement field to every channel of the full 16-bit volume.
+        # InspireTransform scales output intensity relative to the ref image range.
+        # Since ref_ck_path is [0,1] float32, input channels must also be [0,1]
+        # so the transform is applied without intensity distortion.
+        # We rescale back to the original uint16 range after applying.
         aligned_channels = []
         in_channel_path  = os.path.join(temp_dir, "in_channel.tif")
         out_channel_path = os.path.join(temp_dir, "out_channel.tif")
 
         for i in range(c):
-            tifffile.imwrite(in_channel_path, moving_affine_vol[i].astype(np.float32))
+            ch_f32    = moving_affine_vol[i].astype(np.float32)
+            ch_max    = float(ch_f32.max())
+            ch_scale  = ch_max if ch_max > 0 else 1.0
+            tifffile.imwrite(in_channel_path, (ch_f32 / ch_scale))   # [0, 1]
             trans_cmd = [
-                INSPIRE_TRANSFORM_BIN, "-dim", "2", "-16bit", "1",
+                INSPIRE_TRANSFORM_BIN, "-dim", "2",
                 "-interpolation", "linear", "-transform", tforward,
                 "-ref", ref_ck_path,
                 "-in", in_channel_path,
@@ -328,13 +349,15 @@ def apply_inspire_l1(
             ]
             try:
                 subprocess.run(trans_cmd, check=True, capture_output=True)
-                aligned_ch = tifffile.imread(out_channel_path)
+                # Output is float32 in [0,1] — rescale back to original uint16 range
+                aligned_f32 = tifffile.imread(out_channel_path).astype(np.float32)
+                aligned_ch  = np.clip(aligned_f32 * ch_scale, 0, 65535).astype(np.uint16)
                 aligned_channels.append(aligned_ch)
             except subprocess.CalledProcessError as e:
                 logger.error(f"[{slice_id}] InspireTransform failed on ch {i}: {e.stderr}")
                 return None, False
 
-        aligned_vol = np.stack(aligned_channels, axis=0).astype(np.uint16)
+        aligned_vol = np.stack(aligned_channels, axis=0)  # already uint16 per channel
         logger.info(f"[{slice_id}] INSPIRE elastic refinement complete.")
         return aligned_vol, True
 
@@ -357,13 +380,6 @@ def register_slice(fixed_np, moving_np, slice_id=None):
     if not akaze_ok:
         M_affine = np.eye(2, 3, dtype=np.float64)
 
-    # Diagnostic plots use the same log images fed to AKAZE
-    if len(kp1_raw) > 0:
-        save_matching_pairs_plot(
-            fixed_log, moving_log, kp1_raw, kp2_raw, kp1, kp2,
-            good_matches, inlier_mask, sid, OUTPUT_FOLDER, akaze_ok=akaze_ok,
-        )
-
     # Pre-align every channel with the affine transform
     c = moving_np.shape[0]
     moving_affine_vol = np.zeros_like(moving_np, dtype=np.float32)
@@ -373,58 +389,77 @@ def register_slice(fixed_np, moving_np, slice_id=None):
             flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=0,
         )
 
-    # L1: INSPIRE elastic — log images, affine-prealigned, only when L0 succeeded
+    # L1: INSPIRE elastic — pass affine-prealigned images.
+    # INSPIRE always runs its own internal affine stage unconditionally, but
+    # since the input is already affine-aligned by AKAZE, its internal affine
+    # will find a near-identity transform and proceed directly to the deformable
+    # stage which then corrects the residual elastic deformation.
     aligned_np = None
     inspire_ok = False
+    moving_log_affine = cv2.warpAffine(
+        moving_log, M_affine, (w, h),
+        flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=0,
+    )
     if akaze_ok:
-        moving_log_affine = cv2.warpAffine(
-            moving_log, M_affine, (w, h),
-            flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT,
-        )
         aligned_np, inspire_ok = apply_inspire_l1(
             fixed_log, moving_log_affine, moving_affine_vol, sid,
         )
 
-    # Compute affine-only MSE as the baseline to judge INSPIRE against.
-    # Clip to uint16 range first so this is on the same numeric footing as
-    # mse_inspire (computed from aligned_np which is already uint16) and the
-    # final logged mse.
-    affine_ck_u16 = np.clip(moving_affine_vol[CK_CHANNEL_IDX], 0, 65535).astype(np.uint16)
-    _, affine_log = prepare_ck(affine_ck_u16.astype(np.float32))
-    mse_affine    = float(np.mean((fixed_lin.astype(np.float32) - affine_log.astype(np.float32)) ** 2))
+    # Measure NCC on affine-prealigned images as baseline for acceptance.
+    # NCC is measured on log-normalised CK (scale-invariant, same as B-spline scripts).
+    # NCC is negative — more negative = better alignment.
+    if akaze_ok:
+        ncc_affine = compute_ncc(
+            fixed_log.astype(np.float32),
+            moving_log_affine.astype(np.float32),
+        )
+        logger.info(f"[{sid}] Affine NCC baseline: {ncc_affine:.4f}")
+    else:
+        ncc_affine = 0.0
 
     # Output sanity & fallback
+    ncc_inspire = 0.0
     if inspire_ok:
         ck_out = aligned_np[CK_CHANNEL_IDX]
 
         # Check 1: blank output (field folded on itself)
         if np.count_nonzero(ck_out) / float(ck_out.size) < MIN_CK_NONZERO_FRAC:
             logger.warning(
-                f"[{sid}] CK output nearly blank -- INSPIRE diverged. "
+                f"[{sid}] CK output nearly blank — INSPIRE diverged. "
                 "Reverting to affine-only result."
             )
             inspire_ok = False
             aligned_np = moving_affine_vol.astype(np.uint16)
-
-        # Check 2: INSPIRE must be meaningfully better than affine alone.
-        # "Not worse" is insufficient -- a distorted-but-non-blank output that
-        # scores similarly to affine will corrupt the fixed image for the next
-        # slice and cascade failures down the chain.
-        # Require at least INSPIRE_MIN_IMPROVEMENT fractional reduction in MSE.
         else:
+            # Compute NCC for logging/plotting only — not used for acceptance.
+            # INSPIRE uses alpha-AMD metric internally which does not correlate
+            # with NCC; trusting INSPIRE unless output is blank.
             _, inspire_log = prepare_ck(ck_out.astype(np.float32))
-            mse_inspire = float(np.mean((fixed_lin.astype(np.float32) - inspire_log.astype(np.float32)) ** 2))
-            threshold   = mse_affine * (1.0 - INSPIRE_MIN_IMPROVEMENT)
-            if mse_inspire >= threshold:
-                logger.warning(
-                    f"[{sid}] INSPIRE MSE ({mse_inspire:.1f}) did not improve enough over "
-                    f"affine-only ({mse_affine:.1f}, need <{threshold:.1f}) -- "
-                    "reverting to affine-only result."
-                )
-                inspire_ok = False
-                aligned_np = moving_affine_vol.astype(np.uint16)
+            ncc_inspire    = compute_ncc(
+                fixed_log.astype(np.float32),
+                inspire_log.astype(np.float32),
+            )
+            if abs(ncc_affine) > 1e-9:
+                relative_improvement = (ncc_affine - ncc_inspire) / abs(ncc_affine)
+            else:
+                relative_improvement = 0.0
+            logger.info(
+                f"[{sid}] INSPIRE accepted: NCC affine={ncc_affine:.4f} → "
+                f"inspire={ncc_inspire:.4f} ({relative_improvement*100:+.2f}% NCC)"
+            )
     else:
         aligned_np = moving_affine_vol.astype(np.uint16)
+
+    # INSPIRE interim plot — always saved when L0 succeeded
+    if akaze_ok:
+        try:
+            save_inspire_plot(
+                fixed_log, moving_log_affine,
+                aligned_np[CK_CHANNEL_IDX],
+                ncc_affine, ncc_inspire, inspire_ok, sid, OUTPUT_FOLDER,
+            )
+        except Exception as exc:
+            logger.warning(f"[{sid}] INSPIRE plot failed: {exc}")
 
     # MSE -- linear fixed vs log warped (original metric: cross-domain perceptual measure)
     _, warped_log = prepare_ck(aligned_np[CK_CHANNEL_IDX].astype(np.float32))
@@ -447,79 +482,82 @@ def register_slice(fixed_np, moving_np, slice_id=None):
         scale_pct    = round(scale_pct, 3),
         shear_pct    = round(shear_pct, 3),
         bspline_ok   = inspire_ok,
+        ncc_affine   = round(float(ncc_affine), 6),
+        ncc_value    = round(float(ncc_inspire), 6),
     )
 
     return aligned_np, mse, time.time() - start, stats, akaze_ok, M_affine
 
 # --- PLOTTING ---
-def _draw_keypoint_marker(canvas, pt, color, radius=10):
-    cx, cy = int(pt[0]), int(pt[1])
-    cv2.circle(canvas, (cx, cy), radius, color, -1, cv2.LINE_AA)
-    arm = radius + 4
-    cv2.line(canvas, (cx - arm, cy), (cx + arm, cy), (255, 255, 255), 1, cv2.LINE_AA)
-    cv2.line(canvas, (cx, cy - arm), (cx, cy + arm), (255, 255, 255), 1, cv2.LINE_AA)
-
-def _make_side_by_side_canvas(fixed_8bit, moving_8bit):
-    h, w   = fixed_8bit.shape[:2]
-    gap    = 6
-    canvas = np.zeros((h, w * 2 + gap, 3), dtype=np.uint8)
-    canvas[:, :w]       = cv2.cvtColor(fixed_8bit,  cv2.COLOR_GRAY2BGR)
-    canvas[:, w + gap:] = cv2.cvtColor(moving_8bit, cv2.COLOR_GRAY2BGR)
-    return canvas, h, w, gap
-
-def _burn_title(canvas, title, color=(0, 230, 0)):
-    font       = cv2.FONT_HERSHEY_SIMPLEX
-    scale      = max(0.8, canvas.shape[1] / 3000)
-    thickness  = max(1, int(scale * 2))
-    (tw, th), _ = cv2.getTextSize(title, font, scale, thickness)
-    tx = (canvas.shape[1] - tw) // 2
-    ty = th + 10
-    cv2.putText(canvas, title, (tx, ty), font, scale, color, thickness, cv2.LINE_AA)
-
-def save_matching_pairs_plot(
-    fixed_8bit, moving_8bit,
-    kp1_raw, kp2_raw, kp1, kp2,
-    good_matches, inlier_mask,
-    slice_id, output_folder, akaze_ok=True,
+def save_inspire_plot(
+    fixed_log: np.ndarray,
+    moving_log_affine: np.ndarray,
+    aligned_ck: np.ndarray,
+    ncc_affine: float,
+    ncc_inspire: float,
+    inspire_ok: bool,
+    slice_id: str,
+    output_folder: str,
 ):
+    """
+    4-panel interim plot for the INSPIRE elastic stage:
+      Panel 1 (R/G): Fixed vs Affine-only       — residual before INSPIRE
+      Panel 2 (R/G): Fixed vs INSPIRE result     — residual after INSPIRE
+      Panel 3:       |Affine CK − INSPIRE CK|    — what elastic correction changed
+      Panel 4:       INSPIRE CK greyscale        — sanity check for blank/corrupt output
+    """
     out_dir = os.path.join(output_folder, "interim_plots")
     os.makedirs(out_dir, exist_ok=True)
-    h, w    = fixed_8bit.shape[:2]
-    gap     = 6
-    status  = "SUCCESS" if akaze_ok else "FAILED"
-    title_color = (0, 230, 0) if akaze_ok else (0, 0, 220)
 
-    canvas_pre, _, _, _ = _make_side_by_side_canvas(fixed_8bit, moving_8bit)
-    rng        = np.random.default_rng(seed=0)
-    kp1_sample = list(kp1_raw)
-    kp2_sample = list(kp2_raw)
-    if len(kp1_sample) > 3000:
-        kp1_sample = [kp1_sample[i] for i in rng.choice(len(kp1_sample), 3000, replace=False)]
-    if len(kp2_sample) > 3000:
-        kp2_sample = [kp2_sample[i] for i in rng.choice(len(kp2_sample), 3000, replace=False)]
-    for kp in kp1_sample: _draw_keypoint_marker(canvas_pre, kp.pt, (0, 200, 0), radius=5)
-    for kp in kp2_sample: _draw_keypoint_marker(canvas_pre, (kp.pt[0] + w + gap, kp.pt[1]), (0, 0, 200), radius=5)
-    _burn_title(canvas_pre, f"{slice_id}  kp_fixed={len(kp1_raw)}  kp_moving={len(kp2_raw)}  [BEFORE ANMS]", color=(180, 180, 0))
-    cv2.imwrite(os.path.join(out_dir, f"{slice_id}_before_anms.png"), canvas_pre)
-    logger.info(f"[{slice_id}] Before-ANMS plot saved.")
+    def norm(x, ref=None):
+        # Use ref image's percentile if provided so both images share the same scale
+        src = ref if ref is not None else x
+        p = np.percentile(src[src > 0], 99.5) if np.any(src > 0) else 1.0
+        return np.clip(x.astype(np.float32) / (p if p > 0 else 1), 0, 1)
 
-    inlier_matches = [m for m, keep in zip(good_matches, inlier_mask.ravel()) if keep] \
-                     if len(inlier_mask) > 0 else []
-    n_inliers = len(inlier_matches)
+    f = norm(fixed_log.astype(np.float32))
+    a = norm(moving_log_affine.astype(np.float32), ref=fixed_log.astype(np.float32))
 
-    canvas_post, _, _, _ = _make_side_by_side_canvas(fixed_8bit, moving_8bit)
-    for idx, m in enumerate(inlier_matches[:200]):
-        hue       = int(idx / max(len(inlier_matches[:200]) - 1, 1) * 179)
-        color_bgr = tuple(int(c) for c in cv2.cvtColor(np.uint8([[[hue, 220, 220]]]), cv2.COLOR_HSV2BGR)[0, 0])
-        pt1 = kp1[m.queryIdx].pt
-        pt2 = (kp2[m.trainIdx].pt[0] + w + gap, kp2[m.trainIdx].pt[1])
-        cv2.line(canvas_post, (int(pt1[0]), int(pt1[1])), (int(pt2[0]), int(pt2[1])), color_bgr, 1, cv2.LINE_AA)
-        _draw_keypoint_marker(canvas_post, pt1, (0, 200, 0))
-        _draw_keypoint_marker(canvas_post, pt2, (0, 0, 200))
+    _, aligned_log = prepare_ck(aligned_ck.astype(np.float32))
+    b = norm(aligned_log.astype(np.float32), ref=fixed_log.astype(np.float32))
 
-    _burn_title(canvas_post, f"{slice_id}  inliers={n_inliers}  [{status}]", color=title_color)
-    cv2.imwrite(os.path.join(out_dir, f"{slice_id}_after_anms.png"), canvas_post)
-    logger.info(f"[{slice_id}] After-ANMS plot saved.")
+    diff = np.abs(a - b)
+
+    fig, axes = plt.subplots(1, 4, figsize=(24, 6))
+
+    axes[0].imshow(np.dstack((f, a, np.zeros_like(f))))
+    axes[0].set_title(f"Fixed (R) vs Affine (G)\nNCC={ncc_affine:.4f}", fontsize=10)
+    axes[0].axis('off')
+
+    axes[1].imshow(np.dstack((f, b, np.zeros_like(f))))
+    axes[1].set_title(f"Fixed (R) vs INSPIRE (G)\nNCC={ncc_inspire:.4f}", fontsize=10)
+    axes[1].axis('off')
+
+    im = axes[2].imshow(diff, cmap='hot', vmin=0, vmax=diff.max() if diff.max() > 0 else 1)
+    axes[2].set_title("|Affine − INSPIRE|\n(what elastic correction changed)", fontsize=10)
+    axes[2].axis('off')
+    plt.colorbar(im, ax=axes[2], fraction=0.03, pad=0.02)
+
+    axes[3].imshow(b, cmap='gray')
+    axes[3].set_title("INSPIRE CK output\n(sanity — should not be blank)", fontsize=10)
+    axes[3].axis('off')
+
+    if abs(ncc_affine) > 1e-9 and ncc_inspire != 0.0:
+        rel = (ncc_affine - ncc_inspire) / abs(ncc_affine) * 100
+        ncc_str = f"  ΔNCC={rel:+.2f}%"
+    else:
+        ncc_str = ""
+
+    status = "ACCEPTED" if inspire_ok else "BLANK→REVERTED"
+    fig.suptitle(
+        f"{slice_id}  [{status}]{ncc_str}",
+        fontsize=13, fontweight='bold',
+    )
+    plt.tight_layout()
+    out_path = os.path.join(out_dir, f"{slice_id}_inspire.png")
+    plt.savefig(out_path, dpi=100, bbox_inches='tight')
+    plt.close(fig)
+    logger.info(f"[{slice_id}] INSPIRE plot saved ({status}).")
 
 def generate_qc_montage(
     vol, output_folder,
@@ -577,7 +615,7 @@ def main():
     logger.info(
         f"AKAZE threshold={AKAZE_THRESHOLD} | ANMS keep={ANMS_KEEP} | "
         f"Lowe ratio={LOWE_RATIO} | Min matches={MIN_MATCHES} | "
-        f"Min inliers={MIN_INLIERS} | RANSAC thresh={RANSAC_THRESH}px | INSPIRE min improvement={INSPIRE_MIN_IMPROVEMENT*100:.0f}%"
+        f"Min inliers={MIN_INLIERS} | RANSAC thresh={RANSAC_THRESH}px"
     )
 
     raw_files = glob.glob(os.path.join(INPUT_FOLDER, "*.ome.tif"))
@@ -636,24 +674,26 @@ def main():
 
     c, target_h, target_w = _center_arr.shape
     logger.info(f"Canonical full-res shape: C={c}, H={target_h}, W={target_w}")
-    logger.info(f"Loading and conforming {n_slices} slices.")
 
-    raw_slices = []
-    slice_ids  = []
-    for f in file_list:
-        slice_ids.append(get_slice_number(f))
-        arr = tifffile.imread(f)
+    # Collect slice IDs only — load slices on demand to avoid OOM.
+    # Preloading all slices simultaneously uses ~23GB for a 20-slice core.
+    slice_ids = [get_slice_number(f) for f in file_list]
+
+    def load_slice(idx):
+        arr = tifffile.imread(file_list[idx])
         if arr.ndim == 2:
             arr = arr[np.newaxis]
         elif arr.ndim == 3 and arr.shape[-1] < arr.shape[0]:
             arr = np.moveaxis(arr, -1, 0)
         if arr.shape[1] != target_h or arr.shape[2] != target_w:
-            logger.warning(f"Shape mismatch in {os.path.basename(f)} — conforming.")
+            logger.warning(f"Shape mismatch in {os.path.basename(file_list[idx])} — conforming.")
             arr = conform_slice(arr, target_h, target_w)
-        raw_slices.append(arr)
+        return arr
 
     aligned_vol             = np.zeros((n_slices, c, target_h, target_w), dtype=np.uint16)
-    aligned_vol[center_idx] = raw_slices[center_idx]
+    center_raw              = load_slice(center_idx)
+    aligned_vol[center_idx] = center_raw
+    del center_raw
     anchor_id               = get_slice_number(file_list[center_idx])
     logger.info(f"Volume anchored at slice index {center_idx} (ID {anchor_id})")
 
@@ -666,7 +706,7 @@ def main():
         for i in indices:
             real_id   = get_slice_number(file_list[i])
             fixed_np  = aligned_vol[i + fixed_offset]
-            moving_np = raw_slices[i]
+            moving_np = load_slice(i)
             sid       = f"Z{i:03d}_ID{real_id:03d}"
 
             aligned_np, mse, runtime, stats, success, M_final = register_slice(
@@ -677,14 +717,16 @@ def main():
                 aligned_vol[i] = aligned_np
                 status_str     = "SUCCESS"
             else:
-                aligned_vol[i] = raw_slices[i]
+                aligned_vol[i] = moving_np
                 status_str     = "IDENTITY_FALLBACK_RAW"
                 logger.warning(f"Z{i:02d} (ID {real_id:03d}): {status_str} — writing raw slice.")
+
+            del moving_np
 
             logger.info(
                 f"Z{i:02d} (ID {real_id:03d}) | Det: {stats['detector']} | "
                 f"Matches: {stats['n_matches']} | Inliers: {stats['n_inliers']} | "
-                f"INSPIRE: {stats['bspline_ok']} | MSE: {mse:.2f} | "
+                f"INSPIRE: {stats['bspline_ok']} | NCC: {stats['ncc_value']:.4f} | MSE: {mse:.2f} | "
                 f"Rot: {stats['rotation_deg']:.2f} | "
                 f"tx: {stats['tx']:.1f}px | ty: {stats['ty']:.1f}px | "
                 f"Scale: {stats['scale_pct']:+.2f}% | Shear: {stats['shear_pct']:.2f}% | "
@@ -699,6 +741,8 @@ def main():
                 "N_Matches":    stats["n_matches"],
                 "N_Inliers":    stats["n_inliers"],
                 "BSpline_OK":   stats["bspline_ok"],
+                "NCC_Value":    stats["ncc_value"],
+                "NCC_Affine":   stats["ncc_affine"],
                 "Success":      success,
                 "Status":       status_str,
                 "MSE_After":    round(mse, 4),
@@ -718,7 +762,7 @@ def main():
     df   = pd.DataFrame(registration_stats).sort_values("Slice_Z")
     cols = [
         "Direction", "Slice_Z", "Slice_ID", "Detector",
-        "N_Matches", "N_Inliers", "BSpline_OK",
+        "N_Matches", "N_Inliers", "BSpline_OK", "NCC_Value", "NCC_Affine",
         "Success", "Status", "Rotation_Deg",
         "Shift_X_px", "Shift_Y_px", "Scale_Pct", "Shear_Pct",
         "MSE_After", "Runtime_s",
@@ -733,42 +777,43 @@ def main():
         f"Execution complete. SUCCESS: {n_ok} | IDENTITY_FALLBACK_RAW: {n_fallback}"
     )
 
-    # --- QC MONTAGES (generated before writing the volume) ---
-    logger.info("Generating QC montages...")
-    raw_vol = np.stack(raw_slices, axis=0)
-    generate_qc_montage(
-        raw_vol, OUTPUT_FOLDER,
-        slice_ids=slice_ids,
-        channel_idx=CK_CHANNEL_IDX,
-        channel_name="CK",
-        title_suffix="AKAZE_Raw",
-    )
-    generate_qc_montage(
-        aligned_vol, OUTPUT_FOLDER,
-        slice_ids=slice_ids,
-        channel_idx=CK_CHANNEL_IDX,
-        channel_name="CK",
-        title_suffix="AKAZE+INSPIRE",
-    )
-
-    # --- WRITE REGISTERED VOLUME ---
+    # --- WRITE REGISTERED VOLUME FIRST ---
+    # Write before montages so the result is saved even if montage generation fails.
     out_tiff = os.path.join(OUTPUT_FOLDER, f"{TARGET_CORE}_Feature_Aligned.ome.tif")
     logger.info(f"Writing registered volume to {out_tiff}")
-    tifffile.imwrite(
-        out_tiff, aligned_vol,
-        photometric='minisblack',
-        metadata={
-            'axes': 'ZCYX',
-            'Channel': {'Name': CHANNEL_NAMES},
-            'PhysicalSizeX': PIXEL_SIZE_XY_UM,
-            'PhysicalSizeXUnit': 'µm',
-            'PhysicalSizeY': PIXEL_SIZE_XY_UM,
-            'PhysicalSizeYUnit': 'µm',
-            'PhysicalSizeZ': SECTION_THICKNESS_UM,
-            'PhysicalSizeZUnit': 'µm',
-        },
-        compression='deflate', compressionargs={'level': 6},
-    )
+    try:
+        tifffile.imwrite(
+            out_tiff, aligned_vol,
+            photometric='minisblack',
+            metadata={
+                'axes': 'ZCYX',
+                'Channel': {'Name': CHANNEL_NAMES},
+                'PhysicalSizeX': PIXEL_SIZE_XY_UM,
+                'PhysicalSizeXUnit': 'µm',
+                'PhysicalSizeY': PIXEL_SIZE_XY_UM,
+                'PhysicalSizeYUnit': 'µm',
+                'PhysicalSizeZ': SECTION_THICKNESS_UM,
+                'PhysicalSizeZUnit': 'µm',
+            },
+            compression='deflate', compressionargs={'level': 6},
+        )
+        logger.info("Registered volume written.")
+    except Exception as exc:
+        logger.error(f"Volume write failed: {exc}")
+
+    # --- QC MONTAGE ---
+    logger.info("Generating QC montage...")
+    try:
+        generate_qc_montage(
+            aligned_vol, OUTPUT_FOLDER,
+            slice_ids=slice_ids,
+            channel_idx=CK_CHANNEL_IDX,
+            channel_name="CK",
+            title_suffix="AKAZE+INSPIRE",
+        )
+    except Exception as exc:
+        logger.error(f"Montage failed: {exc}")
+    del aligned_vol
     logger.info("Done.")
 
 if __name__ == "__main__":

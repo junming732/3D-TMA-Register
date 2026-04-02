@@ -19,5 +19,5 @@ config.py
 
 archive
 *.log
-akaze_plots
+akaze_plots*
 thesis_figs

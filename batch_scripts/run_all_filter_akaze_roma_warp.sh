@@ -2,14 +2,14 @@
 
 # --- CONFIGURATION ---
 # Range of cores to process (Core_01 to Core_30)
-START=1
+START=2
 END=30
 
 # YOUR ACTUAL ENVIRONMENT PATH
 VENV_PATH="/home/junming/3D-TMA-Register/venv_312"
 
 # LOG DIRECTORY
-LOG_DIR="log/filter_AKAZE_bspline_grid_test"
+LOG_DIR="log/filter_akaze_romav2_warp"
 
 # 1. Activate environment
 source "${VENV_PATH}/bin/activate"
@@ -39,7 +39,7 @@ for i in $(seq $START $END); do
     echo "--------------------------------------------"
     echo "[$(date '+%H:%M:%S')] Processing ${CORE_NAME}... ($((DONE + FAILED + 1))/${TOTAL})"
 
-    python registration/akaze_bspline_grid.py --core_name "${CORE_NAME}" \
+    python registration/akaze_romav2_warp.py --core_name "${CORE_NAME}" \
         > "${LOG_DIR}/${CORE_NAME}.log" 2>&1
 
     EXIT_CODE=$?

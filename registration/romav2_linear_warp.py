@@ -1,29 +1,18 @@
 """
-Feature registration — RoMaV2 native dense warp field (no RANSAC, no B-spline).
+Feature registration — RoMaV2 native dense warp field, linear-normalised input.
 
 Pipeline per slice pair:
   RoMaV2 dense warp → confidence filtering → upsample to full resolution → cv2.remap
 
-This is the most direct use of RoMaV2: the model produces a pixel-dense
-correspondence field at its internal resolution (H_lr × W_lr), which is
-upsampled to the full image size and applied directly with cv2.remap.
+Difference from romav2_warp_registration.py (log-normalised input):
+  RoMaV2 is a deep learning model pretrained on natural RGB images with a standard
+  linear 0–255 intensity distribution. Feeding log-normalised images changes the
+  local contrast patterns the model's feature extraction layers learned to respond
+  to. This script feeds linear percentile-stretched uint8 images to RoMaV2 instead.
+  Log-normalised images are still used for NCC measurement and tissue masking, where
+  the log stretch helps discriminate tissue from background.
 
-Why no RANSAC / no affine / no B-spline:
-  - RoMaV2's warp_AB already encodes a full non-rigid deformation — fitting
-    an affine to it discards all local tissue deformation the model estimated.
-  - The model's confidence map (overlap_AB) replaces RANSAC: low-confidence
-    regions are zeroed out and interpolated smoothly from neighbours rather
-    than used to estimate a global transform.
-  - B-spline on top would be redundant — RoMaV2 already produces a smooth
-    dense field; adding another deformation layer risks over-fitting.
-
-Tradeoff vs affine/landmark approaches:
-  - The warp field resolution is ROMAV2_H × ROMAV2_W (448×448 by default),
-    upsampled to ~6000×6000.  Sub-pixel tissue deformations finer than
-    ~13px (6000/448) cannot be resolved.
-  - No explicit global transform constraint — very large tissue shifts
-    (>image_size/4) may wrap incorrectly if confidence is low.  The
-    WARP_MAX_DISPLACEMENT_PX cap protects against this.
+Use output folder Filter_RoMaV2_Linear_Warp to distinguish from the log version.
 
 Fallback:
   If the confidence-weighted warp produces a blank CK output, reverts to
@@ -78,7 +67,7 @@ logger = logging.getLogger(__name__)
 # ─────────────────────────────────────────────────────────────────────────────
 DATA_BASE_PATH    = os.path.join(config.DATASPACE, "TMA_Cores_Grouped_Rotate_Conformed")
 INPUT_FOLDER      = os.path.join(DATA_BASE_PATH, TARGET_CORE)
-WORK_OUTPUT       = os.path.join(config.DATASPACE, "Filter_RoMaV2_Warp")
+WORK_OUTPUT       = os.path.join(config.DATASPACE, "Filter_RoMaV2_Linear_Warp")
 OUTPUT_FOLDER     = os.path.join(WORK_OUTPUT, TARGET_CORE)
 SLICE_FILTER_YAML = os.path.join(config.DATASPACE, "slice_filter.yaml")
 
@@ -161,13 +150,31 @@ def conform_slice(arr, target_h, target_w):
 
 
 def prepare_ck(img_arr):
+    """
+    Returns (norm_lin, norm_log) — both uint8.
+
+    norm_lin : linear percentile stretch (0.1–99.9%) → fed to RoMaV2.
+               Preserves the natural intensity relationships the model was
+               pretrained on (standard 0–255 linear RGB distribution).
+    norm_log : log-stretch then percentile normalise → used for tissue
+               masking and NCC measurement, where log boosts weak signal.
+    """
     img_float  = img_arr.astype(np.float32)
+
+    # Linear normalisation for RoMaV2
+    p_lo_lin, p_hi_lin = np.percentile(img_float[::4, ::4], (0.1, 99.9))
+    norm_lin = cv2.normalize(
+        np.clip(img_float, p_lo_lin, p_hi_lin), None, 0, 255, cv2.NORM_MINMAX
+    ).astype(np.uint8)
+
+    # Log normalisation for tissue mask / NCC
     log_img    = np.log1p(img_float)
     p_lo, p_hi = np.percentile(log_img[::4, ::4], (0.1, 99.9))
     norm_log   = cv2.normalize(
         np.clip(log_img, p_lo, p_hi), None, 0, 255, cv2.NORM_MINMAX
     ).astype(np.uint8)
-    return norm_log
+
+    return norm_lin, norm_log
 
 
 def ck_to_rgb_pil(ck_log):
@@ -257,40 +264,30 @@ def get_romav2_model():
 # CORE: RoMaV2 dense warp → full-resolution remap maps
 # ─────────────────────────────────────────────────────────────────────────────
 
-def romav2_dense_warp(fixed_log, moving_log, slice_id, orig_h, orig_w):
+def romav2_dense_warp(fixed_lin, moving_lin, slice_id, orig_h, orig_w,
+                      tissue_mask_full=None):
     """
-    Run RoMaV2 and return (map_x, map_y, n_confident) for cv2.remap, or
-    (None, None, 0) on failure.
+    Run RoMaV2 and return (map_x, map_y, n_confident, coverage_pct, mean_confidence).
 
     Strategy
     --------
-    1.  Run model.match() to get preds dict containing:
-          warp_AB   : (1, H_lr, W_lr, 4) — for each location in A the
-                      corresponding location in B, in [-1,1] coords.
-                      Channels 0-1 = A coords, 2-3 = B coords.
-          overlap_AB: (1, H_lr, W_lr)    — per-pixel confidence [0,1].
-
-    2.  Extract the B-side coordinates (channels 2-3 of warp_AB) — these
-        tell us where each pixel of image A maps to in image B.
-
-    3.  Filter by confidence: pixels below WARP_CONFIDENCE_THRESH have
-        their displacement replaced by the identity (no movement) so they
-        don't corrupt the remap.  This is the confidence-map equivalent
-        of RANSAC outlier rejection.
-
-    4.  Convert from [-1,1] to full-resolution pixel coordinates.
-
-    5.  Upsample the (H_lr, W_lr) remap maps to (orig_h, orig_w) using
-        bilinear interpolation.  cv2.resize handles this correctly for
-        floating-point coordinate maps.
-
-    6.  Apply displacement cap.
+    1.  Run model.match() → warp_AB (B-side coords in [-1,1]) + overlap_AB (confidence).
+    2.  Convert B-side coords to full-resolution pixel space.
+    3.  Apply confidence threshold — low-confidence cells revert to identity.
+    4.  Apply displacement cap — protects against catastrophic wrap-around.
+    5.  Apply tissue mask — background cells outside the tissue are forced to
+        identity BEFORE upsampling.  This prevents RoMaV2's featureless-canvas
+        vectors from bleeding into tissue edges through bilinear upsampling and
+        creating hard seam artefacts at the tissue boundary.
+    6.  Upsample to full resolution.
 
     Parameters
     ----------
-    fixed_log, moving_log : uint8 log-normalised CK channel
+    fixed_lin, moving_lin : uint8 linear-normalised CK channel (fed to RoMaV2)
     slice_id              : logging label
     orig_h, orig_w        : full-resolution image dimensions
+    tissue_mask_full      : uint8 (orig_h, orig_w) tissue mask — 255=tissue, 0=background.
+                            Downsampled to (H_lr, W_lr) internally.  Pass None to skip.
 
     Returns
     -------
@@ -301,8 +298,8 @@ def romav2_dense_warp(fixed_log, moving_log, slice_id, orig_h, orig_w):
     """
     try:
         model = get_romav2_model()
-        img_A = ck_to_rgb_pil(fixed_log)
-        img_B = ck_to_rgb_pil(moving_log)
+        img_A = ck_to_rgb_pil(fixed_lin)
+        img_B = ck_to_rgb_pil(moving_lin)
 
         with torch.no_grad():
             preds = model.match(img_A, img_B)
@@ -349,6 +346,25 @@ def romav2_dense_warp(fixed_log, moving_log, slice_id, orig_h, orig_w):
                 f"> {WARP_MAX_DISPLACEMENT_PX}px."
             )
 
+        # Zero out displacement in background regions BEFORE upsampling.
+        # RoMaV2 produces high-confidence but meaningless vectors in featureless
+        # canvas areas outside the tissue.  If left in, bilinear upsampling
+        # propagates these into the tissue boundary creating hard seam artefacts.
+        # Downsampling the mask to lr grid resolution and forcing background
+        # cells to identity eliminates the problem at its source.
+        if tissue_mask_full is not None:
+            mask_lr = cv2.resize(
+                tissue_mask_full, (W_lr, H_lr), interpolation=cv2.INTER_NEAREST
+            ).astype(bool)   # True = tissue
+            background = ~mask_lr
+            if np.any(background):
+                map_x_lr[background] = identity_x[background]
+                map_y_lr[background] = identity_y[background]
+                logger.info(
+                    f"[{slice_id}] Tissue mask: zeroed {int(background.sum())} "
+                    f"background warp cells ({background.sum()/(H_lr*W_lr)*100:.1f}%)."
+                )
+
         # Upsample to full resolution
         map_x = cv2.resize(map_x_lr, (orig_w, orig_h), interpolation=cv2.INTER_LINEAR)
         map_y = cv2.resize(map_y_lr, (orig_w, orig_h), interpolation=cv2.INTER_LINEAR)
@@ -390,22 +406,25 @@ def register_slice(fixed_np, moving_np, slice_id=None):
     fixed_ck  = fixed_np[CK_CHANNEL_IDX].astype(np.float32)
     moving_ck = moving_np[CK_CHANNEL_IDX].astype(np.float32)
 
-    fixed_log  = prepare_ck(fixed_ck)
-    moving_log = prepare_ck(moving_ck)
+    fixed_lin,  fixed_log  = prepare_ck(fixed_ck)
+    moving_lin, moving_log = prepare_ck(moving_ck)
     h, w = fixed_log.shape
 
-    # Tissue mask (for masked NCC — same method as AKAZE script)
+    # Tissue mask and NCC use log-normalised images (better tissue/background separation)
     tissue_mask = build_tissue_mask(fixed_log)
 
-    # NCC before warp (raw moving vs fixed)
+    # NCC before warp — log space, masked
     ncc_before = _measure_ncc_masked(
         fixed_log.astype(np.float32),
         moving_log.astype(np.float32),
         tissue_mask,
     )
 
+    # RoMaV2 receives linear-normalised images — matches its pretraining distribution
+    # tissue_mask passed so background vectors are zeroed before upsampling
     map_x, map_y, n_confident, coverage_pct, mean_confidence = romav2_dense_warp(
-        fixed_log, moving_log, sid, h, w
+        fixed_lin, moving_lin, sid, h, w,
+        tissue_mask_full=tissue_mask,
     )
 
     success = map_x is not None
@@ -434,9 +453,10 @@ def register_slice(fixed_np, moving_np, slice_id=None):
             success    = False
             aligned_np = moving_np.copy()
         else:
-            # NCC after warp — warped log-normalised CK vs fixed
-            warped_ck_f32 = aligned_np[CK_CHANNEL_IDX].astype(np.float32)
-            warped_log    = prepare_ck(warped_ck_f32)
+            # NCC after warp — warp the log image for NCC measurement
+            # (log space consistent with ncc_before)
+            warped_ck_f32  = aligned_np[CK_CHANNEL_IDX].astype(np.float32)
+            _, warped_log  = prepare_ck(warped_ck_f32)
             ncc_after = _measure_ncc_masked(
                 fixed_log.astype(np.float32),
                 warped_log.astype(np.float32),
@@ -468,9 +488,12 @@ def register_slice(fixed_np, moving_np, slice_id=None):
         success             = success,
     )
 
-    # Save warp plot
+    # Save warp plot — overlays use log images for visual contrast;
+    # title notes that RoMaV2 received linear-normalised input
     try:
-        save_warp_plot(fixed_log, moving_log, map_x, map_y, sid, OUTPUT_FOLDER, success)
+        save_warp_plot(fixed_log, moving_log, map_x, map_y, sid, OUTPUT_FOLDER,
+                       success, ncc_before=ncc_before, ncc_after=ncc_after,
+                       fixed_lin=fixed_lin, moving_lin=moving_lin)
     except Exception as exc:
         logger.warning(f"[{sid}] Warp plot failed: {exc}")
 
@@ -482,11 +505,16 @@ def register_slice(fixed_np, moving_np, slice_id=None):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def save_warp_plot(fixed_log, moving_log, map_x, map_y,
-                   slice_id, output_folder, success):
+                   slice_id, output_folder, success,
+                   ncc_before=None, ncc_after=None,
+                   fixed_lin=None, moving_lin=None):
     """
     3-panel interim plot:
-      Panel 1 (R/G): fixed vs moving (before warp)
-      Panel 2 (R/G): fixed vs warped moving
+      Panel 1 (R/G): fixed vs moving — before warp
+                     Uses linear images if supplied, log otherwise.
+      Panel 2 (R/G): fixed vs warped moving — after RoMaV2
+                     Uses linear images if supplied (shows what RoMaV2 saw),
+                     log otherwise.
       Panel 3:       displacement magnitude heatmap
     """
     out_dir = os.path.join(output_folder, "interim_plots")
@@ -496,30 +524,46 @@ def save_warp_plot(fixed_log, moving_log, map_x, map_y,
         p = np.percentile(x, 99.5)
         return np.clip(x.astype(np.float32) / (p if p > 0 else 1), 0, 1)
 
-    f = norm(fixed_log)
-    m = norm(moving_log)
+    # Use linear if available (shows what RoMaV2 actually received),
+    # fall back to log for scripts that don't supply linear images
+    f_display = norm(fixed_lin  if fixed_lin  is not None else fixed_log)
+    m_display = norm(moving_lin if moving_lin is not None else moving_log)
+    input_label = "linear input" if fixed_lin is not None else "log input"
 
     fig, axes = plt.subplots(1, 3, figsize=(18, 6))
-    axes[0].imshow(np.dstack((f, m, np.zeros_like(f))))
-    axes[0].set_title("Fixed (R) vs Moving (G) — before warp", fontsize=11)
+
+    # Panel 1 — before warp
+    ncc_before_str = f"NCC={ncc_before:.4f}" if ncc_before is not None else ""
+    axes[0].imshow(np.dstack((f_display, m_display, np.zeros_like(f_display))))
+    axes[0].set_title(
+        f"Fixed (R) vs Moving (G) — before warp [{input_label}]\n{ncc_before_str}",
+        fontsize=11,
+    )
     axes[0].axis('off')
 
     if map_x is not None:
-        warped_log = cv2.remap(
-            moving_log.astype(np.float32), map_x, map_y,
+        # Remap the same image that was fed to RoMaV2 for the warped panel
+        src_for_remap = (moving_lin if moving_lin is not None else moving_log).astype(np.float32)
+        warped_display = cv2.remap(
+            src_for_remap, map_x, map_y,
             interpolation=cv2.INTER_LINEAR,
             borderMode=cv2.BORDER_CONSTANT, borderValue=0,
         )
-        w_norm = norm(warped_log)
-        axes[1].imshow(np.dstack((f, w_norm, np.zeros_like(f))))
-        axes[1].set_title("Fixed (R) vs Warped (G) — after RoMaV2", fontsize=11)
+        w_norm = norm(warped_display)
 
-        # Displacement magnitude relative to identity
+        # Panel 2 — after warp
+        ncc_after_str = f"NCC={ncc_after:.4f}" if ncc_after is not None else ""
+        axes[1].imshow(np.dstack((f_display, w_norm, np.zeros_like(f_display))))
+        axes[1].set_title(
+            f"Fixed (R) vs Warped (G) — after RoMaV2 [{input_label}]\n{ncc_after_str}",
+            fontsize=11,
+        )
+
+        # Panel 3 — displacement magnitude
         h, w_img = map_x.shape
         id_x = np.arange(w_img, dtype=np.float32)[None, :]
         id_y = np.arange(h,     dtype=np.float32)[:, None]
-        disp_mag = np.sqrt((map_x - id_x)**2 + (map_y - id_y)**2)
-        # Subsample for display
+        disp_mag     = np.sqrt((map_x - id_x)**2 + (map_y - id_y)**2)
         disp_display = cv2.resize(disp_mag, (512, 512), interpolation=cv2.INTER_AREA)
         im = axes[2].imshow(disp_display, cmap='hot', vmin=0,
                             vmax=np.percentile(disp_mag, 99))
@@ -527,13 +571,28 @@ def save_warp_plot(fixed_log, moving_log, map_x, map_y,
         axes[2].axis('off')
         plt.colorbar(im, ax=axes[2], fraction=0.03, pad=0.02)
     else:
-        axes[1].imshow(np.dstack((f, m, np.zeros_like(f))))
+        axes[1].imshow(np.dstack((f_display, m_display, np.zeros_like(f_display))))
         axes[1].set_title("Warp FAILED — identity", fontsize=11)
         axes[2].axis('off')
 
     axes[1].axis('off')
+
+    # Suptitle
     status = "SUCCESS" if success else "FAILED"
-    fig.suptitle(f"{slice_id}  [{status}]", fontsize=13, fontweight='bold')
+    if ncc_before is not None and ncc_after is not None and ncc_after != 0.0:
+        if abs(ncc_before) > 1e-9:
+            delta_pct = (ncc_before - ncc_after) / abs(ncc_before) * 100.0
+        else:
+            delta_pct = 0.0
+        title = (
+            f"{slice_id}  "
+            f"NCC before={ncc_before:.4f} → after={ncc_after:.4f}  "
+            f"Δ={delta_pct:+.1f}%  [{status}]"
+        )
+    else:
+        title = f"{slice_id}  [{status}]"
+
+    fig.suptitle(title, fontsize=13, fontweight='bold')
     plt.tight_layout()
     plt.savefig(os.path.join(out_dir, f"{slice_id}_warp.png"), dpi=100, bbox_inches='tight')
     plt.close(fig)
@@ -582,9 +641,11 @@ def generate_qc_montage(vol, output_folder, slice_ids=None,
 # ─────────────────────────────────────────────────────────────────────────────
 
 def main():
-    logger.info(f"RoMaV2 Native Warp Registration — {TARGET_CORE}")
+    logger.info(f"RoMaV2 Linear-Input Warp Registration — {TARGET_CORE}")
     logger.info(
         f"Resolution: {ROMAV2_H}×{ROMAV2_W} | "
+        f"Input to RoMaV2: LINEAR normalised | "
+        f"NCC/mask: LOG normalised | "
         f"Confidence thresh: {WARP_CONFIDENCE_THRESH} | "
         f"Max displacement: {WARP_MAX_DISPLACEMENT_PX}px"
     )
@@ -617,7 +678,7 @@ def main():
         logger.warning("Only one slice — writing identity output.")
         vol_in = tifffile.imread(file_list[0])
         tifffile.imwrite(
-            os.path.join(OUTPUT_FOLDER, f"{TARGET_CORE}_RoMaV2_Warp_Aligned.ome.tif"),
+            os.path.join(OUTPUT_FOLDER, f"{TARGET_CORE}_RoMaV2_Linear_Warp_Aligned.ome.tif"),
             vol_in[np.newaxis], photometric='minisblack',
             metadata={
                 'axes': 'ZCYX', 'Channel': {'Name': CHANNEL_NAMES},
@@ -717,14 +778,14 @@ def main():
 
     df = pd.DataFrame(registration_stats).sort_values("Slice_Z")
     df.to_csv(
-        os.path.join(OUTPUT_FOLDER, "registration_stats_RoMaV2_Warp.csv"), index=False
+        os.path.join(OUTPUT_FOLDER, "registration_stats_RoMaV2_Linear_Warp.csv"), index=False
     )
     n_ok = int((df["Status"] == "SUCCESS").sum())
     n_fb = int((df["Status"] == "IDENTITY_FALLBACK_RAW").sum())
     logger.info(f"Complete. SUCCESS: {n_ok} | IDENTITY_FALLBACK_RAW: {n_fb}")
 
     # Write volume first
-    out_tiff = os.path.join(OUTPUT_FOLDER, f"{TARGET_CORE}_RoMaV2_Warp_Aligned.ome.tif")
+    out_tiff = os.path.join(OUTPUT_FOLDER, f"{TARGET_CORE}_RoMaV2_Linear_Warp_Aligned.ome.tif")
     logger.info(f"Writing volume to {out_tiff}")
     try:
         tifffile.imwrite(
@@ -746,7 +807,7 @@ def main():
     try:
         generate_qc_montage(aligned_vol, OUTPUT_FOLDER, slice_ids=slice_ids,
                             channel_idx=CK_CHANNEL_IDX, channel_name="CK",
-                            title_suffix="RoMaV2_Warp")
+                            title_suffix="RoMaV2_Linear_Warp")
     except Exception as exc:
         logger.error(f"Montage failed: {exc}")
     del aligned_vol
