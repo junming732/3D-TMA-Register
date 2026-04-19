@@ -6,7 +6,7 @@ segmentation masks that were run on the original, unregistered images.
 
 Workflow
 --------
-1. Run CellPose on the original (unregistered) CD3 channel images → label masks.
+1. Run CellPose on the original (unregistered) DAPI channel images → label masks.
 2. Run the updated registration script → deformation_maps/*.npz are saved.
 3. Run this script → warped masks aligned to the registered space.
 
@@ -18,7 +18,6 @@ Usage
         --deform_dir <path/to/deformation_maps> \
         --out_dir    <path/to/warped_masks>      \
         [--mask_suffix _cp_masks.tif]            \
-        [--channel CD3]                          \
         [--plot_qc]
 
 Mask filename convention expected
@@ -26,7 +25,7 @@ Mask filename convention expected
 The script matches each .npz deformation file to a mask file by slice ID.
 Masks must contain the slice ID in their filename in the same TMA_<ID>_ format
 as the original ome.tif slices, e.g.:
-    TMA_007_CD3_cp_masks.tif
+    TMA_007_DAPI_cp_masks.tif
 
 Output
 ------
@@ -71,8 +70,6 @@ parser.add_argument('--out_dir',      required=True,
                     help="Output folder for warped masks")
 parser.add_argument('--mask_suffix',  default='_cp_masks.tif',
                     help="Filename suffix to identify mask files (default: _cp_masks.tif)")
-parser.add_argument('--channel',      default='CD3',
-                    help="Channel label used in mask filenames (default: CD3)")
 parser.add_argument('--interp',       default='nearest',
                     choices=['nearest', 'linear'],
                     help="Interpolation: 'nearest' for label masks, "
@@ -95,7 +92,7 @@ if args.plot_qc:
 
 def get_slice_id_from_path(path: str) -> int | None:
     name = os.path.basename(path)
-    # Mask files: TMA_016_CD3_cp_masks.tif
+    # Mask files: TMA_016_DAPI_cp_masks.tif
     match = re.search(r"TMA_(\d+)_", name)
     if match:
         return int(match.group(1))
@@ -126,6 +123,16 @@ def apply_deformation(mask: np.ndarray, npz_path: str,
     warp_ok  = bool(d['warp_ok'])
 
     logger.debug(f"  AKAZE_OK={akaze_ok}  WARP_OK={warp_ok}  shape=({h},{w})")
+
+    # Guard: mask must match the resolution the deformation was computed at.
+    # If CellPose was run on a downsampled image this will catch the mismatch
+    # before it produces silently wrong output.
+    if mask.shape != (h, w):
+        raise ValueError(
+            f"Mask shape {mask.shape} does not match deformation map size "
+            f"({h}, {w}) stored in {os.path.basename(npz_path)}. "
+            f"Ensure CellPose was run on the full-resolution image."
+        )
 
     mask_f32 = mask.astype(np.float32)
 
@@ -192,12 +199,12 @@ def save_qc_plot(original_mask: np.ndarray,
 # ─────────────────────────────────────────────────────────────────────────────
 
 def main():
-    # Collect mask files
-    mask_pattern = os.path.join(args.mask_dir, f"*{args.channel}*{args.mask_suffix}")
+    # Hardcoded DAPI channel matching
+    mask_pattern = os.path.join(args.mask_dir, f"*DAPI*{args.mask_suffix}")
     mask_files   = sorted(glob.glob(mask_pattern))
 
     if not mask_files:
-        # Try without channel filter
+        # Fallback: Try without explicit DAPI filter in case filenames omit it
         mask_pattern = os.path.join(args.mask_dir, f"*{args.mask_suffix}")
         mask_files   = sorted(glob.glob(mask_pattern))
 
@@ -227,8 +234,23 @@ def main():
             continue
 
         if sid not in id_to_npz:
-            logger.warning(f"No deformation map found for slice ID {sid:03d} — skipping")
-            n_skip += 1
+            # The anchor/center slice has no deformation map because registration
+            # is never run on it — the correct action is to copy it unchanged.
+            logger.info(
+                f"No deformation map for slice ID {sid:03d} "
+                f"(likely the anchor slice) — copying mask unchanged."
+            )
+            base     = os.path.splitext(os.path.basename(mask_path))[0]
+            out_name = f"{base}_warped.tif"
+            out_path = os.path.join(args.out_dir, out_name)
+            try:
+                tifffile.imwrite(out_path, mask, compression='deflate')
+                logger.info(f"  → {out_path}  (anchor copy, "
+                            f"labels: {len(np.unique(mask)) - 1} cells)")
+                n_ok += 1
+            except Exception as exc:
+                logger.error(f"Failed to copy anchor mask for slice {sid}: {exc}")
+                n_skip += 1
             continue
 
         npz_path = id_to_npz[sid]

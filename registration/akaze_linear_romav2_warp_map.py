@@ -132,7 +132,7 @@ ROMAV2_H                 = 448
 ROMAV2_W                 = 448
 ROMAV2_H_HR              = None
 ROMAV2_W_HR              = None
-WARP_CONFIDENCE_THRESH   = 0.0     # raise to 0.5 if warp field is noisy
+WARP_CONFIDENCE_THRESH   = 0.5     # 0.0 = no filtering; 0.5 is a safe default
 WARP_MAX_DISPLACEMENT_PX = 200.0   # tighter cap — residual after affine should be small
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -610,9 +610,10 @@ def romav2_dense_warp(fixed_lin, moving_lin, slice_id, orig_h, orig_w,
                     f"background warp cells ({background.sum()/(H_lr*W_lr)*100:.1f}%)."
                 )
 
-        # Upsample to full resolution
-        map_x = cv2.resize(map_x_lr, (orig_w, orig_h), interpolation=cv2.INTER_LINEAR)
-        map_y = cv2.resize(map_y_lr, (orig_w, orig_h), interpolation=cv2.INTER_LINEAR)
+        # Upsample to full resolution — INTER_CUBIC reduces ringing at the
+        # hard tissue/background boundary compared to bilinear.
+        map_x = cv2.resize(map_x_lr, (orig_w, orig_h), interpolation=cv2.INTER_CUBIC)
+        map_y = cv2.resize(map_y_lr, (orig_w, orig_h), interpolation=cv2.INTER_CUBIC)
 
         logger.info(
             f"[{slice_id}] RoMaV2 warp: {H_lr}×{W_lr} grid, "
@@ -1152,6 +1153,24 @@ def main():
     del center_raw
     logger.info(f"Anchor: slice index {center_idx} (ID {slice_ids[center_idx]})")
 
+    # Save identity deformation for the anchor slice so warp_cellpose_masks.py
+    # never skips it — applying a no-op transform is the correct behaviour.
+    center_sid = f"Z{center_idx:03d}_ID{slice_ids[center_idx]:03d}"
+    try:
+        save_deformation_maps(
+            slice_id = center_sid,
+            M_affine = np.eye(2, 3, dtype=np.float64),
+            map_x    = None,   # triggers identity grid inside save_deformation_maps
+            map_y    = None,
+            akaze_ok = False,
+            warp_ok  = False,
+            orig_h   = target_h,
+            orig_w   = target_w,
+        )
+        logger.info(f"Anchor [{center_sid}] identity deformation map saved.")
+    except Exception as exc:
+        logger.warning(f"Anchor [{center_sid}] Failed to save identity map: {exc}")
+
     registration_stats = []
 
     def process_pass(indices, direction):
@@ -1189,8 +1208,8 @@ def main():
                         akaze_ok=False, warp_ok=False,
                         orig_h=target_h, orig_w=target_w,
                     )
-                except Exception as exc:
-                    logger.warning(f"[{sid}] Failed to save identity map: {map_exc}")
+                except Exception as save_exc:
+                    logger.warning(f"[{sid}] Failed to save identity map: {save_exc}")
 
 
             aligned_vol[i] = aligned_np

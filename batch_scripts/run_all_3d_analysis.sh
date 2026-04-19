@@ -4,35 +4,30 @@
 # run_all_3d_analysis.sh
 # Step 4: 3D connected-component analysis across registered CellPose masks
 #
-# Requires Steps 1-3 (registration → CellPose → warp) to have already run.
+# Requires Steps 1-3 (registration -> CellPose -> warp) to have already run.
 # Reads warped masks from CellPose_<CHANNEL>_Warped/<CORE_NAME>/
 # Writes 3D label volumes + stats to CellPose_<CHANNEL>_3D/<CORE_NAME>/
 # =============================================================================
 
-# ─────────────────────────────────────────────────────────────────────────────
-# CONFIGURATION — edit these
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
+# CONFIGURATION
+# -----------------------------------------------------------------------------
 START=1
 END=30
 
 VENV_PATH="/home/junming/3D-TMA-Register/venv_312"
 
-# Channels to analyse (must match what was segmented and warped)
-CELLPOSE_CHANNELS="CD3 CD31"
+# Channels to analyse. CD31 isolated for future testing.
+CELLPOSE_CHANNELS="DAPI"
 
-# 3D analysis flags — tune MAX_SLICES per cell type:
-#   T-cells (CD3)  ~10 µm → 2-3 slices at 4.5 µm/section → MAX_SLICES=4
-#   Vessels (CD31) larger  → MAX_SLICES=6
+# Global 3D analysis flags
 MIN_SLICES=1
-MAX_SLICES=4
 MIN_VOLUME=10
-# Co-localisation: second channel to compare against, or leave empty to skip
-# e.g. when running CD3, set COLOC_CHANNEL=CD163 to get nearest-neighbour distances
-COLOC_CHANNEL="CD163"
-COLOC_RADIUS_UM=50
 MIN_CONFIRMED=2
 
-ANALYSIS_FLAGS="--plot_qc --min_slices ${MIN_SLICES} --max_slices ${MAX_SLICES} --min_area_px ${MIN_VOLUME} --min_overlap 3 --min_confirmed ${MIN_CONFIRMED} --coloc_radius_um ${COLOC_RADIUS_UM}"
+# Co-localisation: second channel to compare against, or leave empty to skip
+COLOC_CHANNEL="CD163"
+COLOC_RADIUS_UM=50
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
@@ -42,14 +37,14 @@ ANALYSIS_SCRIPT="${PROJECT_ROOT}/registration/analyse_3d_cells.py"
 LOG_ROOT="${PROJECT_ROOT}/log/full_pipeline"
 LOG_3D="${LOG_ROOT}/3d_analysis"
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # SETUP
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 source "${VENV_PATH}/bin/activate"
 
 DATASPACE="$(python -c "import sys; sys.path.insert(0,'${PROJECT_ROOT}'); import config; print(config.DATASPACE)")"
 if [ -z "${DATASPACE}" ]; then
-    echo "[ERROR] Could not read DATASPACE from config.py — aborting."
+    echo "[ERROR] Could not read DATASPACE from config.py -- aborting."
     exit 1
 fi
 echo "  DATASPACE : ${DATASPACE}"
@@ -67,13 +62,12 @@ echo "============================================================"
 echo "  3D Cell Analysis Pipeline"
 echo "  Cores     : Core_$(printf "%02d" $START) -> Core_$(printf "%02d" $END)"
 echo "  Channels  : ${CELLPOSE_CHANNELS}"
-echo "  Z-span    : ${MIN_SLICES} - ${MAX_SLICES} slices"
 echo "  Start time: $(date)"
 echo "============================================================"
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # MAIN LOOP
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 for i in $(seq $START $END); do
 
     CORE_NAME="Core_$(printf "%02d" $i)"
@@ -88,9 +82,21 @@ for i in $(seq $START $END); do
 
     for CH in $CELLPOSE_CHANNELS; do
 
+        # --- DYNAMIC BIOLOGICAL CONSTRAINTS ---
+        # Assign Z-span limits based on the specific morphology of the channel
+        if [ "$CH" == "DAPI" ]; then
+            MAX_SLICES=5   # Nuclei: ~4.5 um sections, nucleus ~10 um diameter → 2-4 slices max
+        elif [ "$CH" == "CD3" ]; then
+            MAX_SLICES=3   # T-cells: strict topological severing
+        elif [ "$CH" == "CD31" ]; then
+            MAX_SLICES=15  # Vessels: allow long continuous structures (Inactive)
+        else
+            MAX_SLICES=4   # Default fallback
+        fi
+
         WARPED_DIR="${DATASPACE}CellPose_${CH}_Warped/${CORE_NAME}"
 
-        # Skip if warped masks don't exist yet
+        # Skip if warped masks do not exist yet
         if [ ! -d "${WARPED_DIR}" ]; then
             echo "  [SKIP] ${CH}: no warped mask directory at ${WARPED_DIR}"
             echo "         Run registration + CellPose + warp first."
@@ -108,18 +114,36 @@ for i in $(seq $START $END); do
             continue
         fi
 
-        echo "  [1/1] 3D analysis -- channel ${CH}  (${N_MASKS} warped slices)..."
+        # Per-channel tuning: nuclei are much larger than T-cells
+        if [ "$CH" = "DAPI" ]; then
+            CH_MIN_AREA=200   # consistent with CellPose min_size for DAPI
+            CH_MIN_OVERLAP=30 # larger nuclei need more overlap to confirm a true link
+        else
+            CH_MIN_AREA=${MIN_VOLUME}
+            CH_MIN_OVERLAP=3
+        fi
+
+        echo "  [RUN] 3D analysis -- channel ${CH}  (Max Slices: ${MAX_SLICES}) (${N_MASKS} warped slices)..."
+        
         # Pass coloc channel only if set and different from current channel
         COLOC_FLAG=""
         if [ -n "${COLOC_CHANNEL}" ] && [ "${COLOC_CHANNEL}" != "${CH}" ]; then
             COLOC_FLAG="--coloc_channel ${COLOC_CHANNEL}"
         fi
+        
         python "${ANALYSIS_SCRIPT}" \
             --core_name "${CORE_NAME}" \
             --channel   "${CH}" \
-            ${ANALYSIS_FLAGS} \
+            --plot_qc \
+            --min_slices ${MIN_SLICES} \
+            --max_slices ${MAX_SLICES} \
+            --min_area_px ${CH_MIN_AREA} \
+            --min_overlap ${CH_MIN_OVERLAP} \
+            --min_confirmed ${MIN_CONFIRMED} \
+            --coloc_radius_um ${COLOC_RADIUS_UM} \
             ${COLOC_FLAG} \
             > "${LOG_3D}/${CORE_NAME}_${CH}.log" 2>&1
+            
         EXIT_CODE=$?
 
         if [ $EXIT_CODE -ne 0 ]; then
@@ -148,9 +172,9 @@ for i in $(seq $START $END); do
 
 done
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # SUMMARY
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 N_CHANNELS=$(echo $CELLPOSE_CHANNELS | wc -w)
 MAX_RUNS=$((TOTAL * N_CHANNELS))
 

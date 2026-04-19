@@ -1,30 +1,21 @@
 """
 cellpose_segmentation.py
 ===============
-Run CellPose segmentation on original (unregistered) mIF slices.
+Run CellPose nuclear segmentation on original (unregistered) mIF slices
+using the DAPI channel only.
 
-Supports two segmentation modes depending on the target channel:
-
-  CD3  (channel index 4) — compact T-cell segmentation
-       Model  : cyto3
-       Input  : single channel (CD3 only); CellPose normalises internally
+  DAPI (channel index 0) — nuclear segmentation
+       Model  : nuclei
+       Input  : single channel (DAPI only); CellPose normalises internally
        Output : integer label masks, one per slice
-
-  CD31 (channel index 1) — endothelial / vessel segmentation
-       Model  : cyto3  (vessels are elongated — lower flow_threshold)
-       Input  : single channel (CD31 only); CellPose normalises internally
-       Output : integer label masks + optional binary vessel-area mask
-
-Additional channels can be added in CHANNEL_CONFIGS below.
 
 Usage
 -----
-    python run_cellpose.py \\
+    python cellpose_segmentation.py \\
         --core_name  <CORE_NAME>           \\
-        --channel    CD3                   \\
-        [--diameter  30]                   \\
+        [--diameter  25]                   \\
         [--flow_threshold 0.4]             \\
-        [--cellprob_threshold 0.0]         \\
+        [--cellprob_threshold -1.0]        \\
         [--use_gpu]                        \\
         [--batch_size 1]                   \\
         [--plot_qc]                        \\
@@ -37,12 +28,12 @@ Original (unregistered) ome.tif slices from:
 
 Output (per slice)
 ------------------
-    <DATASPACE>/CellPose_<CHANNEL>/<CORE_NAME>/
-        TMA_<ID>_<CHANNEL>_cp_masks.tif    — uint32 label mask
-        TMA_<ID>_<CHANNEL>_cp_flows.tif    — (optional) flow magnitude map
-        TMA_<ID>_<CHANNEL>_cp_probs.tif    — cell probability map
-        <CORE_NAME>_cellpose_<CHANNEL>_stats.csv
+    <DATASPACE>/CellPose_DAPI/<CORE_NAME>/
+        TMA_<ID>_DAPI_cp_masks.tif         — uint32 label mask
+        TMA_<ID>_DAPI_cp_flows.tif         — (optional) flow magnitude map
+        <CORE_NAME>_cellpose_DAPI_stats.csv
         qc_plots/  (if --plot_qc)
+            TMA_<ID>_DAPI_qc.png           — 3-panel: raw | mask overlay | centroid overlay
 
 Downstream
 ----------
@@ -81,98 +72,63 @@ logging.basicConfig(level=logging.INFO,
 logger = logging.getLogger(__name__)
 
 # ─────────────────────────────────────────────────────────────────────────────
-# CHANNEL CONFIGURATIONS
+# DAPI CHANNEL CONFIGURATION
 # ─────────────────────────────────────────────────────────────────────────────
-# Each entry describes how CellPose should handle that marker.
+# idx            : channel index in the ome.tif (C dimension)
+# model          : CellPose model name
+# diameter       : expected nucleus diameter in pixels (None = auto-estimate)
+# flow_threshold : CellPose flow error threshold (higher → more permissive)
+# cellprob_threshold : cell probability threshold (lower → more cells detected)
+# notes          : free-text explanation
 #
-#   idx            : channel index in the ome.tif (C dimension)
-#   nuclear_idx    : index of the nuclear (DAPI) channel, or None
-#   model          : CellPose model name
-#   diameter       : expected cell/object diameter in pixels (None = auto-estimate)
-#   flow_threshold : CellPose flow error threshold (higher → more permissive)
-#   cellprob_threshold : cell probability threshold (lower → more cells detected)
-#   notes          : free-text explanation
-#
-CHANNEL_CONFIGS = {
-    'CD3': dict(
-        idx                = 4,
-        nuclear_idx        = None,   # single-channel only — CD3 is membranous,
-                                     # DAPI adds noise more than signal in mIF
-        model              = 'cyto3',
-        diameter           = 30,     # ~15 µm / 0.5 µm per px; tune per dataset
-        flow_threshold     = 0.4,
-        cellprob_threshold = 0.0,
-        notes = (
-            "T-cells: compact round morphology. Single-channel cyto3 on CD3 only. "
-            "Diameter ~30 px at 0.5 µm/px ≈ 15 µm."
-        ),
+DAPI_CONFIG = dict(
+    idx                = 0,
+    model              = 'nuclei',
+    diameter           = 14,     # 0.4961 µm/px → 25 px ≈ 12.4 µm; mid-range for typical nuclei (10–15 µm)
+                                 # Override with --diameter 20 for small nuclei or --diameter 30 for large
+    flow_threshold     = 0.8,    # standard for nuclei; lower to 0.3 if over-segmenting
+    cellprob_threshold = -3.0,   # slightly permissive to catch dim/peripheral nuclei;
+                                 # raise to 0.0 if getting too much background
+    notes = (
+        "Nuclear segmentation at 0.4961 µm/px. Uses the 'nuclei' model (single-channel). "
+        "diameter=25 px ≈ 12.4 µm — mid-range for typical nuclei (10–15 µm). "
+        "Run with --min_size 200 to filter debris. "
+        "Tune: --diameter 20 (small nuclei) or --diameter 30 (large nuclei). "
+        "Lower cellprob_threshold to -2.0 if missing dim nuclei; raise to 0.0 to reduce background."
     ),
-    'CD31': dict(
-        idx                = 1,
-        nuclear_idx        = None,   # endothelial cells lack reliable DAPI signal
-        model              = 'cyto3',
-        diameter           = 50,     # vessels are larger and elongated
-        flow_threshold     = 0.6,    # more permissive — irregular vessel shapes
-        cellprob_threshold = -1.0,   # lower to catch dim vessel margins
-        notes = (
-            "Endothelial / vessel marker. Objects are elongated vessel cross-sections, "
-            "not individual round cells. Interpret label count as vessel segments, "
-            "not cell count. Consider binary vessel-area analysis as complement."
-        ),
-    ),
-    'DAPI': dict(
-        idx                = 0,
-        nuclear_idx        = None,
-        model              = 'nuclei',
-        diameter           = 20,
-        flow_threshold     = 0.4,
-        cellprob_threshold = 0.0,
-        notes              = "Nuclear segmentation using the nuclei model.",
-    ),
-    'CD163': dict(
-        idx                = 5,
-        nuclear_idx        = None,   # single-channel only — consistent with CD3 approach
-        model              = 'cyto3',
-        diameter           = 30,
-        flow_threshold     = 0.4,
-        cellprob_threshold = 0.0,
-        notes              = "Macrophage marker; single-channel cyto3 on CD163 only.",
-    ),
-}
+)
+
+CH_NAME = 'DAPI'
+CFG     = DAPI_CONFIG
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CLI
 # ─────────────────────────────────────────────────────────────────────────────
 parser = argparse.ArgumentParser(
-    description='CellPose segmentation on original mIF slices.'
+    description='CellPose nuclear segmentation on DAPI channel of mIF slices.'
 )
 parser.add_argument('--core_name',          type=str,   required=True)
-parser.add_argument('--channel',            type=str,   required=True,
-                    choices=list(CHANNEL_CONFIGS.keys()),
-                    help=f"Target channel. One of: {list(CHANNEL_CONFIGS.keys())}")
 parser.add_argument('--diameter',           type=float, default=None,
-                    help="Override diameter (px). Default: from CHANNEL_CONFIGS.")
+                    help="Override nucleus diameter (px). Default: 25 px ≈ 12.4 µm at 0.4961 µm/px.")
 parser.add_argument('--flow_threshold',     type=float, default=None,
-                    help="Override flow_threshold. Default: from CHANNEL_CONFIGS.")
+                    help="Override flow_threshold. Default: 0.4")
 parser.add_argument('--cellprob_threshold', type=float, default=None,
-                    help="Override cellprob_threshold. Default: from CHANNEL_CONFIGS.")
+                    help="Override cellprob_threshold. Default: -1.0")
 parser.add_argument('--use_gpu',            action='store_true',
                     help="Use GPU if available.")
 parser.add_argument('--batch_size',         type=int,   default=1,
                     help="Number of slices to process per CellPose call (default: 1).")
 parser.add_argument('--plot_qc',            action='store_true',
-                    help="Save QC overlay images.")
+                    help="Save QC overlay images (mask overlay + centroid overlay).")
 parser.add_argument('--save_flows',         action='store_true',
                     help="Save flow magnitude TIFF alongside label masks.")
-parser.add_argument('--min_size',           type=int,   default=15,
-                    help="Minimum cell size in pixels (default: 15).")
+parser.add_argument('--min_size',           type=int,   default=50,
+                    help="Minimum nucleus size in pixels (default: 200; ~π*(25/2)² * 0.5 at 0.4961 µm/px).")
 parser.add_argument('--slice_filter_yaml',  type=str,   default=None,
                     help="Path to slice_filter.yaml (default: <DATASPACE>/slice_filter.yaml).")
 args = parser.parse_args()
 
 TARGET_CORE = args.core_name
-CH_NAME     = args.channel
-CFG         = CHANNEL_CONFIGS[CH_NAME]
 
 # Allow CLI overrides
 DIAMETER           = args.diameter           if args.diameter           is not None else CFG['diameter']
@@ -190,7 +146,7 @@ logger.info(
 # ─────────────────────────────────────────────────────────────────────────────
 DATA_BASE_PATH    = os.path.join(config.DATASPACE, "TMA_Cores_Grouped_Rotate_Conformed")
 INPUT_FOLDER      = os.path.join(DATA_BASE_PATH, TARGET_CORE)
-OUTPUT_FOLDER     = os.path.join(config.DATASPACE, f"CellPose_{CH_NAME}", TARGET_CORE)
+OUTPUT_FOLDER     = os.path.join(config.DATASPACE, "CellPose_DAPI", TARGET_CORE)
 SLICE_FILTER_YAML = args.slice_filter_yaml or os.path.join(config.DATASPACE, "slice_filter.yaml")
 
 if not os.path.exists(INPUT_FOLDER):
@@ -286,59 +242,141 @@ def get_model(model_name: str, use_gpu: bool):
 # QC PLOT
 # ─────────────────────────────────────────────────────────────────────────────
 
-def save_qc_plot(raw_img: np.ndarray, masks: np.ndarray,
-                 flows_mag: np.ndarray | None,
+def _percentile_stretch(img: np.ndarray, lo: float = 0.5, hi: float = 99.5) -> np.ndarray:
+    """Percentile-stretch a 2-D float array to [0, 1], ignoring zero-padding."""
+    fg = img[img > 0]
+    p_lo, p_hi = np.percentile(fg, (lo, hi)) if fg.size > 0 else (0, 1)
+    return np.clip((img.astype(np.float32) - p_lo) / max(p_hi - p_lo, 1e-6), 0, 1)
+
+
+def _compute_centroids(masks: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Return (cy, cx) arrays of nucleus centroid coordinates.
+    Uses label bounding-box moments — fast even for 100 k+ nuclei.
+    """
+    from scipy import ndimage as ndi
+    labels = np.arange(1, masks.max() + 1)
+    
+    # Capture the list of coordinate tuples: [(y1, x1), (y2, x2), ...]
+    centroids = ndi.center_of_mass(masks > 0, labels=masks, index=labels)
+    
+    # Convert to a 2D NumPy array for vectorized slicing
+    centroids_arr = np.array(centroids)
+    
+    # Safety check: Ensure the array has the expected 2D shape (N, 2)
+    # This prevents IndexError if the mask contains labels but no valid volumes
+    if centroids_arr.ndim != 2:
+        return np.array([]), np.array([])
+        
+    # Slice the array by column to separate Y and X coordinates
+    cy = centroids_arr[:, 0]
+    cx = centroids_arr[:, 1]
+    
+    return cy, cx
+
+
+def save_qc_plot(raw_dapi: np.ndarray, masks: np.ndarray,
                  slice_id: int, n_cells: int, out_path: str):
     """
-    3-panel QC plot:
-      Panel 1 — raw channel (percentile-stretched)
-      Panel 2 — label mask overlay (random colours)
-      Panel 3 — flow magnitude (if available)
+    3-panel QC figure for DAPI nuclear segmentation:
+
+      Panel 1 — raw DAPI (percentile-stretched, grayscale)
+      Panel 2 — mask overlay  : coloured label masks on raw DAPI
+      Panel 3 — centroid overlay : nucleus centroids (dots) on raw DAPI
+
+    Both overlay panels are plotted at the full image resolution so that
+    even small/touching nuclei can be inspected by zooming the saved PNG.
     """
     import matplotlib
     matplotlib.use('Agg')
     import matplotlib.pyplot as plt
 
-    n_panels = 3 if flows_mag is not None else 2
-    fig, axes = plt.subplots(1, n_panels, figsize=(6 * n_panels, 6))
+    display = _percentile_stretch(raw_dapi)
 
-    # Panel 1: raw — percentile stretch on foreground pixels only so that
-    # zero-padded canvas borders don't compress the tissue dynamic range.
-    _fg     = raw_img[raw_img > 0]
-    p_lo, p_hi = np.percentile(_fg, (0.5, 99.5)) if _fg.size > 0 else (0, 1)
-    display    = np.clip((raw_img.astype(np.float32) - p_lo) / max(p_hi - p_lo, 1), 0, 1)
+    fig, axes = plt.subplots(1, 3, figsize=(18, 6))
+
+    # ── Panel 1: raw DAPI ────────────────────────────────────────────────────
     axes[0].imshow(display, cmap='gray', interpolation='nearest')
-    axes[0].set_title(f"Raw {CH_NAME}  (ID {slice_id})", fontsize=11)
+    axes[0].set_title(f"Raw DAPI  (slice {slice_id})", fontsize=11)
     axes[0].axis('off')
 
-    # Panel 2: mask overlay — cycle through tab20 so even sparse detections
-    # are clearly visible regardless of total object count.
+    # ── Panel 2: mask overlay ────────────────────────────────────────────────
     axes[1].imshow(display, cmap='gray', interpolation='nearest')
     if n_cells > 0:
-        # Map foreground labels to 1..19 (never 0) so background and any
-        # label that is a multiple of 20 don't both render as tab20 index-0 blue.
+        # Cycle tab20 colours so adjacent labels are visually distinct.
+        # Shift by 1 so background (0) and any label that is a multiple of
+        # 19 don't both render as the same tab20 bin-0 blue.
         cycled = np.where(masks > 0, (masks % 19) + 1, 0).astype(np.uint8)
         axes[1].imshow(cycled, cmap='tab20', vmin=0, vmax=20,
-                       interpolation='nearest', alpha=0.6)
-    axes[1].set_title(f"Masks — {n_cells} objects", fontsize=11)
+                       interpolation='nearest', alpha=0.55)
+    axes[1].set_title(f"Mask overlay — {n_cells} nuclei", fontsize=11)
     axes[1].axis('off')
 
-    # Panel 3: flows
-    if flows_mag is not None and n_panels == 3:
-        im = axes[2].imshow(flows_mag, cmap='hot', interpolation='nearest')
-        axes[2].set_title("Flow magnitude", fontsize=11)
-        axes[2].axis('off')
-        plt.colorbar(im, ax=axes[2], fraction=0.03, pad=0.02)
+    # ── Panel 3: centroid overlay ────────────────────────────────────────────
+    axes[2].imshow(display, cmap='gray', interpolation='nearest')
+    if n_cells > 0:
+        cy, cx = _compute_centroids(masks)
+        # Dot size: scale inversely with nucleus count so the plot stays
+        # readable from a handful of nuclei up to >100 k.
+        dot_size = max(1.0, min(8.0, 3000.0 / max(n_cells, 1)))
+        axes[2].scatter(cx, cy, s=dot_size, c='#00e5ff',
+                        linewidths=0, alpha=0.8, rasterized=True)
+    axes[2].set_title(f"Centroid overlay — {n_cells} nuclei", fontsize=11)
+    axes[2].axis('off')
 
     fig.suptitle(
-        f"CellPose QC — {TARGET_CORE}  {CH_NAME}  slice ID {slice_id}  "
-        f"diameter={DIAMETER}  flow_thresh={FLOW_THRESHOLD}",
+        f"CellPose DAPI QC — {TARGET_CORE}  slice {slice_id}  "
+        f"diameter={DIAMETER}  flow_thresh={FLOW_THRESHOLD}  "
+        f"cellprob_thresh={CELLPROB_THRESHOLD}",
         fontsize=12, fontweight='bold',
     )
     plt.tight_layout()
-    plt.savefig(out_path, dpi=100, bbox_inches='tight')
+    plt.savefig(out_path, dpi=120, bbox_inches='tight')
     plt.close(fig)
+    logger.info(f"  QC plot saved → {out_path}")
 
+
+def save_full_res_overlay_tiff(raw_dapi: np.ndarray, masks: np.ndarray, out_path: str):
+    """
+    Generates a 1:1 native resolution RGB overlay of the entire slice
+    and saves it directly via tifffile, bypassing Matplotlib's DPI limits.
+    """
+    # 1. Normalize DAPI to 8-bit
+    fg_pixels = raw_dapi[raw_dapi > 0]
+    p_lo, p_hi = np.percentile(fg_pixels, (0.5, 99.5)) if fg_pixels.size > 0 else (0, 1)
+    
+    dapi_norm = np.clip((raw_dapi.astype(np.float32) - p_lo) / max(p_hi - p_lo, 1e-6), 0, 1)
+    dapi_8bit = (dapi_norm * 255).astype(np.uint8)
+    
+    # 2. Broadcast to 3-channel RGB (H, W, 3)
+    rgb_img = np.stack([dapi_8bit] * 3, axis=-1)
+    
+    # 3. Generate a deterministic color lookup table (LUT)
+    np.random.seed(42)
+    lut = np.random.randint(0, 256, size=(256, 3), dtype=np.uint8)
+    lut[0] = [0, 0, 0]  # Ensure background (0) maps strictly to black
+    
+    # Map uint32 masks into the 8-bit LUT space. 
+    # Shift by 1 to prevent valid labels from hashing to 0.
+    mask_mod = np.where(masks > 0, (masks % 255) + 1, 0).astype(np.uint8)
+    color_mask = lut[mask_mod]
+    
+    # 4. Blend images via NumPy vectorization
+    fg_idx = masks > 0
+    alpha = 0.4  # Opacity of the segmentation mask
+    
+    # Apply standard alpha blending: Background * (1 - alpha) + Foreground * alpha
+    rgb_img[fg_idx] = (rgb_img[fg_idx] * (1.0 - alpha) + color_mask[fg_idx] * alpha).astype(np.uint8)
+    
+    # 5. Write directly to disk as a compressed BigTIFF
+    tifffile.imwrite(
+        out_path,
+        rgb_img,
+        photometric='rgb',
+        compression='deflate',
+        bigtiff=True
+    )
+    logger.info(f"  Full-res RGB overlay saved → {out_path}")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # SEGMENT ONE SLICE
@@ -346,17 +384,18 @@ def save_qc_plot(raw_img: np.ndarray, masks: np.ndarray,
 
 def segment_slice(arr: np.ndarray, slice_id: int) -> dict:
     """
-    Run CellPose on one slice and write outputs.
+    Run CellPose on the DAPI channel of one slice and write outputs.
 
     Returns a stats dict for the summary CSV.
     """
     t0 = time.time()
 
-    ch_idx = CFG['idx']
-    model  = get_model(CFG['model'], args.use_gpu)
+    model = get_model(CFG['model'], args.use_gpu)
 
-    # Build input image — (H, W) float32, single channel
-    cp_input = extract_channel(arr, ch_idx)
+    # Extract DAPI channel — (H, W) float32, single channel.
+    # normalize=True is passed to model.eval() so CellPose handles
+    # normalisation per-tile internally, avoiding checkerboard artifacts.
+    dapi_img = extract_channel(arr, CFG['idx'])   # (H, W) float32
 
     # ── Run CellPose ─────────────────────────────────────────────────────────
     # normalize=True: CellPose normalises each tile independently and
@@ -364,12 +403,12 @@ def segment_slice(arr: np.ndarray, slice_id: int) -> dict:
     # map that appears when a globally pre-normalised image is tiled.
     #
     # Tiling is critical for 6000+ px images: without it CellPose downsizes
-    # the entire image to its internal resolution and loses all small cells.
+    # the entire image to its internal resolution and loses all small nuclei.
     # tile=True (default) with tile_overlap=0.1 avoids seam artefacts.
     # ─────────────────────────────────────────────────────────────────────────
     try:
         masks, flows, styles = model.eval(
-            cp_input,
+            dapi_img,
             diameter           = DIAMETER,
             flow_threshold     = FLOW_THRESHOLD,
             cellprob_threshold = CELLPROB_THRESHOLD,
@@ -386,12 +425,12 @@ def segment_slice(arr: np.ndarray, slice_id: int) -> dict:
             median_area_px=0.0, total_area_px=0, runtime_s=0.0, status="FAILED",
         )
 
-    # Use uint32 — large tissue sections routinely exceed 65535 cells
+    # Use uint32 — large tissue sections routinely exceed 65535 nuclei
     masks   = masks.astype(np.uint32)
     n_cells  = int(masks.max())
     runtime  = time.time() - t0
 
-    # ── Cell size statistics ──────────────────────────────────────────────────
+    # ── Nucleus size statistics ───────────────────────────────────────────────
     if n_cells > 0:
         # bincount is orders of magnitude faster than iterating per label
         areas       = np.bincount(masks.ravel())[1:]   # index 0 = background
@@ -402,65 +441,45 @@ def segment_slice(arr: np.ndarray, slice_id: int) -> dict:
         mean_area = median_area = total_area = 0.0
 
     logger.info(
-        f"  Slice ID {slice_id:03d}: {n_cells} objects | "
+        f"  Slice ID {slice_id:03d}: {n_cells} nuclei | "
         f"mean area={mean_area:.0f}px  median={median_area:.0f}px | "
         f"{runtime:.1f}s"
     )
 
     # ── Save label mask ───────────────────────────────────────────────────────
-    base      = f"TMA_{slice_id:03d}_{CH_NAME}"
+    base      = f"TMA_{slice_id:03d}_DAPI"
     mask_path = os.path.join(OUTPUT_FOLDER, f"{base}_cp_masks.tif")
     tifffile.imwrite(mask_path, masks.astype(np.uint32), compression='deflate')
 
-    # ── Save probability map ──────────────────────────────────────────────────
-    # flows[2] is the cell probability map in CellPose v3/v4 — but only when
-    # it is a 2-D spatial array matching the input image shape.  In some v4
-    # builds flows[2] can be a 1-D style embedding; guard against that.
-    for _fi in range(2, min(len(flows), 5)):
-        if flows[_fi] is None:
-            continue
-        _arr = np.array(flows[_fi])
-        if _arr.ndim == 2 and _arr.shape == masks.shape:
-            prob_map  = _arr.astype(np.float32)
-            # prob_path = os.path.join(OUTPUT_FOLDER, f"{base}_cp_probs.tif")
-            # tifffile.imwrite(prob_path, prob_map, compression='deflate')
-            # logger.info(f"  Prob map saved from flows[{_fi}] shape={prob_map.shape}")
-            break
-    else:
-        logger.warning(f"  No valid 2-D probability map found in flows — skipping probs.tif")
-
-    # # ── Save flow magnitude (optional) ────────────────────────────────────────
-    flows_mag = None
+    # ── Save flow magnitude (optional) ────────────────────────────────────────
     if args.save_flows and len(flows) > 1 and flows[1] is not None:
-        xy        = np.array(flows[1])   # (2, H, W) or (H, W, 2)
+        xy = np.array(flows[1])   # (2, H, W) or (H, W, 2)
         if xy.ndim == 3 and xy.shape[0] == 2:
             xy = np.moveaxis(xy, 0, -1)  # → (H, W, 2)
         flows_mag = np.sqrt(xy[..., 0]**2 + xy[..., 1]**2).astype(np.float32)
-        # flow_path = os.path.join(OUTPUT_FOLDER, f"{base}_cp_flows.tif")
-        # tifffile.imwrite(flow_path, flows_mag, compression='deflate')
+        flow_path = os.path.join(OUTPUT_FOLDER, f"{base}_cp_flows.tif")
+        tifffile.imwrite(flow_path, flows_mag, compression='deflate')
 
     # ── QC plot ───────────────────────────────────────────────────────────────
     if args.plot_qc:
         qc_path = os.path.join(QC_DIR, f"{base}_qc.png")
+        overlay_path = os.path.join(QC_DIR, f"{base}_full_overlay.tif")
         try:
             save_qc_plot(
-                raw_img   = arr[ch_idx],
-                masks     = masks,
-                flows_mag = flows_mag,
-                slice_id  = slice_id,
-                n_cells   = n_cells,
-                out_path  = qc_path,
+                raw_dapi = dapi_img,
+                masks    = masks,
+                slice_id = slice_id,
+                n_cells  = n_cells,
+                out_path = qc_path,
+            )
+
+            save_full_res_overlay_tiff(
+                raw_dapi = dapi_img,
+                masks    = masks,
+                out_path = overlay_path
             )
         except Exception as exc:
             logger.warning(f"QC plot failed for slice {slice_id}: {exc}")
-
-    # ── CD31-specific: binary vessel-area mask ────────────────────────────────
-    if CH_NAME == 'CD31' and n_cells > 0:
-        vessel_binary = (masks > 0).astype(np.uint8) * 255
-        vessel_path   = os.path.join(OUTPUT_FOLDER, f"{base}_vessel_binary.tif")
-        tifffile.imwrite(vessel_path, vessel_binary, compression='deflate')
-        vessel_frac   = float(vessel_binary.mean()) / 255.0
-        logger.info(f"  CD31 vessel area: {vessel_frac*100:.2f}% of image")
 
     return dict(
         slice_id       = slice_id,
@@ -481,7 +500,7 @@ def segment_slice(arr: np.ndarray, slice_id: int) -> dict:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def main():
-    logger.info(f"CellPose segmentation — core={TARGET_CORE}  channel={CH_NAME}")
+    logger.info(f"CellPose DAPI nuclear segmentation — core={TARGET_CORE}")
     logger.info(f"Input : {INPUT_FOLDER}")
     logger.info(f"Output: {OUTPUT_FOLDER}")
 
@@ -520,7 +539,7 @@ def main():
     # Summary CSV
     df = pd.DataFrame(all_stats)
     csv_path = os.path.join(OUTPUT_FOLDER,
-                            f"{TARGET_CORE}_cellpose_{CH_NAME}_stats.csv")
+                            f"{TARGET_CORE}_cellpose_DAPI_stats.csv")
     df.to_csv(csv_path, index=False)
 
     n_ok    = int((df['status'] == 'OK').sum())
@@ -530,12 +549,6 @@ def main():
         f"Done. OK={n_ok}  EMPTY={n_empty}  FAILED/CRASHED={n_fail} | "
         f"Stats → {csv_path}"
     )
-
-    if CH_NAME == 'CD31':
-        logger.info(
-            "CD31 note: label count = vessel segments, not individual cells. "
-            "Consider using *_vessel_binary.tif for area-based vessel quantification."
-        )
 
 
 if __name__ == "__main__":

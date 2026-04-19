@@ -596,7 +596,7 @@ def fig4_warp_field_anatomy(out_path, w, h,
 # FIGURE 5 — All Channels Fixed Image Grid
 # ─────────────────────────────────────────────────────────────────────────────
 
-def fig5_fixed_all_channels(out_path, f_arr, channel_names):
+def fig5_fixed_all_channels(out_path, f_arr, channel_names, core_name=None, fixed_id=None):
     """
     Generates a grid showing all multiplexed channels from the fixed image.
     Applies custom pseudo-coloring for clear visual distinction across channels.
@@ -606,7 +606,11 @@ def fig5_fixed_all_channels(out_path, f_arr, channel_names):
     rows = int(np.ceil(num_channels / cols))
 
     fig, axes = plt.subplots(rows, cols, figsize=(4 * cols, 4 * rows), dpi=DPI)
-    fig.suptitle('Multiplexed Channels — Fixed Image Reference', fontsize=16, fontweight='bold', y=1.02)
+
+    title_lines = ['Multiplexed Channels — Fixed Image Reference']
+    if core_name is not None:
+        title_lines.append(f'Core: {core_name}   |   Slice: {fixed_id}')
+    fig.suptitle('\n'.join(title_lines), fontsize=16, fontweight='bold', y=1.02)
 
     if num_channels == 1:
         axes = [axes]
@@ -628,15 +632,19 @@ def fig5_fixed_all_channels(out_path, f_arr, channel_names):
     for i in range(len(axes)):
         if i < num_channels:
             ch_data = f_arr[i].astype(np.float32)
-            p_hi = np.percentile(ch_data, 99.9)
-            if p_hi > 0:
-                ch_norm = np.clip(ch_data / p_hi, 0, 1)
+
+            # Aggressive linear percentile stretch: map p_lo→0, p_hi→1.
+            # Uses a tight window (1st–99th) so even very faint channels fill
+            # the full display range while preserving relative photometric shape.
+            p_lo, p_hi = np.percentile(ch_data[::4, ::4], (1.0, 99.0))
+            if p_hi > p_lo:
+                ch_norm = np.clip((ch_data - p_lo) / (p_hi - p_lo), 0, 1)
             else:
-                ch_norm = ch_data
+                ch_norm = np.zeros_like(ch_data)
 
             rgb = np.zeros((*ch_norm.shape, 3), dtype=np.float32)
             color = colors[i % len(colors)]
-            
+
             # Apply tint to grayscale array
             rgb[..., 0] = ch_norm * color[0]
             rgb[..., 1] = ch_norm * color[1]
@@ -776,8 +784,9 @@ def main():
     print(" -> fig4_warp_field_anatomy saved.")
 
     fig5_fixed_all_channels(
-        os.path.join(OUT_DIR, f"fig5_all_channels_{base}.png"), 
-        f_arr, CHANNEL_NAMES
+        os.path.join(OUT_DIR, f"fig5_all_channels_{base}.png"),
+        f_arr, CHANNEL_NAMES,
+        core_name=args.core_name, fixed_id=args.fixed_id
     )
     print(" -> fig5_all_channels saved.")
 
