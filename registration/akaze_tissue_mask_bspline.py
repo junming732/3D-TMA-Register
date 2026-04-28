@@ -2,7 +2,7 @@
 Feature registration — single full-resolution AKAZE affine + NCC B-spline elastic.
 
 Pipeline per slice pair:
-  L0  AKAZE + ANMS + RANSAC at full resolution -> affine transform
+  L0  AKAZE (tissue-masked detection) + RANSAC at full resolution -> affine transform
   L1  SimpleITK NCC B-spline FFD -> elastic residual correction
       Skipped if L0 failed (no valid pre-alignment to refine).
 
@@ -25,6 +25,9 @@ import cv2
 import SimpleITK as sitk
 import matplotlib
 import matplotlib.pyplot as plt
+import matplotlib.cm as mcm
+import matplotlib.colors as mcolors
+from matplotlib.patches import Rectangle
 import yaml
 
 current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -262,6 +265,43 @@ def transform_is_sane(M: np.ndarray) -> bool:
     rot_deg  = abs(np.degrees(np.arctan2(R[1, 0], R[0, 0])))
     return rot_deg <= MAX_ROTATION_DEG
 
+
+def build_tissue_mask(ck_log: np.ndarray) -> np.ndarray:
+    """
+    Derive a uint8 binary tissue mask from the log-normalised CK channel.
+
+    Returns a (H, W) uint8 array: 255 = tissue, 0 = background.
+
+    Strategy
+    --------
+    - If BSPLINE_MASK_OTSU is True: Otsu threshold on non-zero pixels only,
+      so the background class does not bias the threshold estimate.
+    - Otherwise: simple > 0 threshold (works when canvas background is truly
+      zero after conformation).
+    - A morphological dilation by BSPLINE_MASK_DILATE_PX is applied so the
+      mask slightly over-covers the tissue boundary.
+    """
+    img = ck_log.astype(np.uint8)
+    if BSPLINE_MASK_OTSU:
+        nonzero = img[img > 0]
+        if len(nonzero) == 0:
+            return np.zeros_like(img)
+        thresh, _ = cv2.threshold(
+            nonzero.reshape(-1, 1), 0, 255,
+            cv2.THRESH_BINARY + cv2.THRESH_OTSU,
+        )
+        mask = (img > thresh).astype(np.uint8) * 255
+    else:
+        mask = (img > 0).astype(np.uint8) * 255
+
+    if BSPLINE_MASK_DILATE_PX > 0:
+        r    = BSPLINE_MASK_DILATE_PX
+        kern = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * r + 1, 2 * r + 1))
+        mask = cv2.dilate(mask, kern)
+
+    return mask
+
+
 # --- L0: AKAZE AFFINE ---
 # Uses fixed_log / moving_log (log-normalised uint8) for feature detection.
 # Keypoint detection is restricted to tissue pixels via the tissue mask so
@@ -354,43 +394,8 @@ def akaze_affine(fixed_8bit: np.ndarray, moving_8bit: np.ndarray, slice_id: str,
     )
     return M, len(good), n_inliers, kp1, kp2, good, mask
 
+
 # --- L1: SIMPLEITK NCC B-SPLINE ELASTIC REFINEMENT ---
-
-def build_tissue_mask(ck_log: np.ndarray) -> np.ndarray:
-    """
-    Derive a uint8 binary tissue mask from the log-normalised CK channel.
-
-    Returns a (H, W) uint8 array: 255 = tissue, 0 = background.
-
-    Strategy
-    --------
-    - If BSPLINE_MASK_OTSU is True: Otsu threshold on non-zero pixels only,
-      so the background class does not bias the threshold estimate.
-    - Otherwise: simple > 0 threshold (works when canvas background is truly
-      zero after conformation).
-    - A morphological dilation by BSPLINE_MASK_DILATE_PX is applied so the
-      mask slightly over-covers the tissue boundary.
-    """
-    img = ck_log.astype(np.uint8)
-    if BSPLINE_MASK_OTSU:
-        nonzero = img[img > 0]
-        if len(nonzero) == 0:
-            return np.zeros_like(img)
-        thresh, _ = cv2.threshold(
-            nonzero.reshape(-1, 1), 0, 255,
-            cv2.THRESH_BINARY + cv2.THRESH_OTSU,
-        )
-        mask = (img > thresh).astype(np.uint8) * 255
-    else:
-        mask = (img > 0).astype(np.uint8) * 255
-
-    if BSPLINE_MASK_DILATE_PX > 0:
-        r    = BSPLINE_MASK_DILATE_PX
-        kern = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * r + 1, 2 * r + 1))
-        mask = cv2.dilate(mask, kern)
-
-    return mask
-
 
 def _measure_ncc_masked(
     fixed_f32: np.ndarray,
@@ -996,7 +1001,6 @@ def save_bspline_plot(
 
             rect_color = (r, g, 0.0, 0.35)
 
-            from matplotlib.patches import Rectangle
             rect = Rectangle(
                 (x0, y0), tw, th,
                 linewidth=2, edgecolor=(r, g, 0.0, 0.9),
@@ -1014,8 +1018,6 @@ def save_bspline_plot(
             )
 
         # Colour bar legend (green=best, red=worst)
-        import matplotlib.cm as mcm
-        import matplotlib.colors as mcolors
         cmap   = mcolors.LinearSegmentedColormap.from_list("rg", ["red", "yellow", "green"])
         sm     = plt.cm.ScalarMappable(cmap=cmap, norm=mcolors.Normalize(vmin=ncc_max, vmax=ncc_min))
         sm.set_array([])

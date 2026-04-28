@@ -36,6 +36,13 @@ Notes on interpolation
 ----------------------
 - Label masks      → always cv2.INTER_NEAREST  (integer cell IDs, no blending)
 - Probability maps → use cv2.INTER_LINEAR       (pass --interp linear)
+
+Performance notes
+-----------------
+- label_to_rgb uses fully vectorised numpy fancy-indexing (no per-cell Python loop).
+- np.unique(..., return_counts=False) is called only when needed for QC titles.
+- tifffile.imwrite uses bigtiff=True to handle masks > 4 GB safely.
+- The anchor-slice branch now reads the mask before writing (bug fix).
 """
 
 import os
@@ -43,6 +50,7 @@ import re
 import glob
 import argparse
 import logging
+import time
 import numpy as np
 import cv2
 import tifffile
@@ -153,6 +161,24 @@ def apply_deformation(mask: np.ndarray, npz_path: str,
     return warped.astype(mask.dtype)
 
 
+def label_to_rgb(lbl: np.ndarray) -> np.ndarray:
+    """
+    Random colour per cell label — fully vectorised, no Python loop over cells.
+
+    Strategy
+    --------
+    Build a colour lookup table (LUT) indexed by label value and use numpy
+    fancy indexing to paint the whole image in one shot.  This is O(pixels)
+    instead of the previous O(n_cells × pixels).
+    """
+    rng      = np.random.default_rng(seed=0)
+    max_id   = int(lbl.max())          # background = 0, cells = 1…max_id
+    # LUT shape: (max_id + 1, 3).  Row 0 = black background.
+    lut      = rng.integers(80, 256, size=(max_id + 1, 3), dtype=np.uint8)
+    lut[0]   = 0                       # background → black
+    return lut[lbl]                    # fancy-index: (H, W) → (H, W, 3)
+
+
 def save_qc_plot(original_mask: np.ndarray,
                  warped_mask: np.ndarray,
                  slice_id: int,
@@ -163,26 +189,23 @@ def save_qc_plot(original_mask: np.ndarray,
         matplotlib.use('Agg')
         import matplotlib.pyplot as plt
 
-        def label_to_rgb(lbl):
-            """Random colour per cell label for visualisation."""
-            rng  = np.random.default_rng(seed=0)
-            rgb  = np.zeros((*lbl.shape, 3), dtype=np.uint8)
-            ids  = np.unique(lbl)
-            ids  = ids[ids > 0]
-            for cid in ids:
-                col = rng.integers(80, 256, size=3, dtype=np.uint8)
-                rgb[lbl == cid] = col
-            return rgb
+        t0 = time.perf_counter()
+        orig_rgb   = label_to_rgb(original_mask)
+        warped_rgb = label_to_rgb(warped_mask)
+        logger.debug(f"  label_to_rgb: {time.perf_counter() - t0:.2f}s")
+
+        n_orig   = int(np.count_nonzero(original_mask > 0))
+        n_warped = int(np.count_nonzero(warped_mask   > 0))
 
         fig, axes = plt.subplots(1, 2, figsize=(14, 6))
-        axes[0].imshow(label_to_rgb(original_mask))
+        axes[0].imshow(orig_rgb)
         axes[0].set_title(f"Original mask  ID={slice_id}\n"
-                          f"({int((original_mask > 0).sum())} px labelled)", fontsize=11)
+                          f"({n_orig} px labelled)", fontsize=11)
         axes[0].axis('off')
 
-        axes[1].imshow(label_to_rgb(warped_mask))
+        axes[1].imshow(warped_rgb)
         axes[1].set_title(f"Warped mask  ID={slice_id}\n"
-                          f"({int((warped_mask > 0).sum())} px labelled)", fontsize=11)
+                          f"({n_warped} px labelled)", fontsize=11)
         axes[1].axis('off')
 
         fig.suptitle(f"CellPose mask warp QC — slice ID {slice_id}", fontsize=13,
@@ -190,6 +213,7 @@ def save_qc_plot(original_mask: np.ndarray,
         plt.tight_layout()
         plt.savefig(out_path, dpi=100, bbox_inches='tight')
         plt.close(fig)
+        logger.debug(f"  QC plot saved: {time.perf_counter() - t0:.2f}s total")
     except Exception as exc:
         logger.warning(f"QC plot failed for slice {slice_id}: {exc}")
 
@@ -227,37 +251,19 @@ def main():
     n_skip = 0
 
     for mask_path in mask_files:
+        t_slice = time.perf_counter()
         sid = get_slice_id_from_path(mask_path)
         if sid is None:
             logger.warning(f"Cannot parse slice ID from: {os.path.basename(mask_path)} — skipping")
             n_skip += 1
             continue
 
-        if sid not in id_to_npz:
-            # The anchor/center slice has no deformation map because registration
-            # is never run on it — the correct action is to copy it unchanged.
-            logger.info(
-                f"No deformation map for slice ID {sid:03d} "
-                f"(likely the anchor slice) — copying mask unchanged."
-            )
-            base     = os.path.splitext(os.path.basename(mask_path))[0]
-            out_name = f"{base}_warped.tif"
-            out_path = os.path.join(args.out_dir, out_name)
-            try:
-                tifffile.imwrite(out_path, mask, compression='deflate')
-                logger.info(f"  → {out_path}  (anchor copy, "
-                            f"labels: {len(np.unique(mask)) - 1} cells)")
-                n_ok += 1
-            except Exception as exc:
-                logger.error(f"Failed to copy anchor mask for slice {sid}: {exc}")
-                n_skip += 1
-            continue
-
-        npz_path = id_to_npz[sid]
-        logger.info(f"Warping slice ID {sid:03d}: {os.path.basename(mask_path)}")
-
+        # ── Read the mask first (needed by both anchor and normal branches) ──
+        logger.info(f"Reading mask: {os.path.basename(mask_path)}")
         try:
+            t0   = time.perf_counter()
             mask = tifffile.imread(mask_path)
+            logger.info(f"  imread: {time.perf_counter() - t0:.2f}s  shape={mask.shape}  dtype={mask.dtype}")
         except Exception as exc:
             logger.error(f"Cannot read mask {mask_path}: {exc} — skipping")
             n_skip += 1
@@ -271,24 +277,50 @@ def main():
             n_skip += 1
             continue
 
+        base     = os.path.splitext(os.path.basename(mask_path))[0]
+        out_name = f"{base}_warped.tif"
+        out_path = os.path.join(args.out_dir, out_name)
+
+        if sid not in id_to_npz:
+            # The anchor/center slice has no deformation map because registration
+            # is never run on it — the correct action is to copy it unchanged.
+            logger.info(
+                f"No deformation map for slice ID {sid:03d} "
+                f"(likely the anchor slice) — copying mask unchanged."
+            )
+            try:
+                tifffile.imwrite(out_path, mask, compression='deflate', bigtiff=True)
+                n_cells = int(mask.max())   # faster than len(np.unique) - 1 for integer masks
+                logger.info(f"  → {out_path}  (anchor copy, labels: {n_cells} cells)")
+                n_ok += 1
+            except Exception as exc:
+                logger.error(f"Failed to copy anchor mask for slice {sid}: {exc}")
+                n_skip += 1
+            continue
+
+        npz_path = id_to_npz[sid]
+        logger.info(f"Warping slice ID {sid:03d}: {os.path.basename(mask_path)}")
+
         try:
+            t0     = time.perf_counter()
             warped = apply_deformation(mask, npz_path, interpolation=INTERP_FLAG)
+            logger.info(f"  apply_deformation: {time.perf_counter() - t0:.2f}s")
         except Exception as exc:
             logger.error(f"Warp failed for slice {sid}: {exc} — skipping")
             n_skip += 1
             continue
 
         # Write warped mask
-        base     = os.path.splitext(os.path.basename(mask_path))[0]
-        out_name = f"{base}_warped.tif"
-        out_path = os.path.join(args.out_dir, out_name)
-        tifffile.imwrite(out_path, warped, compression='deflate')
-        logger.info(f"  → {out_path}  (labels: {len(np.unique(warped)) - 1} cells)")
+        t0 = time.perf_counter()
+        tifffile.imwrite(out_path, warped, compression='deflate', bigtiff=True)
+        n_cells = int(warped.max())   # max label == number of cells (CellPose IDs are contiguous)
+        logger.info(f"  imwrite: {time.perf_counter() - t0:.2f}s  → {out_path}  (labels: {n_cells} cells)")
 
         if args.plot_qc:
             qc_path = os.path.join(qc_dir, f"{base}_warp_qc.png")
             save_qc_plot(mask, warped, sid, qc_path)
 
+        logger.info(f"Slice {sid:03d} done in {time.perf_counter() - t_slice:.1f}s")
         n_ok += 1
 
     logger.info(f"Done. Warped: {n_ok} | Skipped: {n_skip}")
