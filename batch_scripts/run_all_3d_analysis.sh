@@ -26,8 +26,9 @@ MIN_VOLUME=10
 MIN_CONFIRMED=2
 
 # Co-localisation: second channel to compare against, or leave empty to skip
-COLOC_CHANNEL="CD163"
+COLOC_CHANNEL=""
 COLOC_RADIUS_UM=50
+CH_MIN_OVERLAP_FRAC=0.10   # cuts the near-zero spike
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
@@ -141,6 +142,7 @@ for i in $(seq $START $END); do
             --min_overlap ${CH_MIN_OVERLAP} \
             --min_confirmed ${MIN_CONFIRMED} \
             --coloc_radius_um ${COLOC_RADIUS_UM} \
+            --min_overlap_frac ${CH_MIN_OVERLAP_FRAC} \
             ${COLOC_FLAG} \
             > "${LOG_3D}/${CORE_NAME}_${CH}.log" 2>&1
             

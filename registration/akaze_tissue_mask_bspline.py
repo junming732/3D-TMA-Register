@@ -707,6 +707,15 @@ def register_slice(fixed_np, moving_np, slice_id=None):
     tissue_frac        = float(np.count_nonzero(fixed_tissue_mask)) / fixed_tissue_mask.size
     logger.info(f"[{sid}] Tissue mask: {tissue_frac*100:.1f}% of canvas covered.")
 
+    # ── NCC raw (before any alignment) — log space, masked ───────────────────
+    tissue_mask = fixed_tissue_mask if BSPLINE_USE_TISSUE_MASK else None
+    ncc_raw = _measure_ncc_masked(
+        fixed_log.astype(np.float32),
+        moving_log.astype(np.float32),
+        tissue_mask,
+    )
+    logger.info(f"[{sid}] NCC raw (before alignment): {ncc_raw:.4f}")
+
     # L0: AKAZE affine — tissue-masked keypoint detection
     M_affine, n_matches, n_inliers, kp1, kp2, good_matches, inlier_mask = \
         akaze_affine(fixed_log, moving_log, sid,
@@ -737,7 +746,6 @@ def register_slice(fixed_np, moving_np, slice_id=None):
     ncc_value     = 0.0
     ncc_affine    = 0.0   # NCC of affine-prealigned images (baseline for acceptance)
     tile_stats    = []
-    tissue_mask   = fixed_tissue_mask if BSPLINE_USE_TISSUE_MASK else None
     if akaze_ok:
         moving_log_affine = cv2.warpAffine(
             moving_log, M_affine, (w, h),
@@ -761,10 +769,33 @@ def register_slice(fixed_np, moving_np, slice_id=None):
             )
             logger.info(f"[{sid}] Affine NCC baseline (masked={BSPLINE_USE_TISSUE_MASK}): {ncc_affine:.4f}")
 
-            aligned_np, ncc_value, elastic_ok, tile_stats = apply_bspline_l1(
-                fixed_log, moving_log_affine, moving_affine_vol, sid,
-                tissue_mask=tissue_mask,
-            )
+            # ── Affine NCC acceptance — revert to identity if affine degraded NCC ─
+            # AKAZE may pass geometric checks (inliers, sane matrix) but still hurt
+            # NCC — e.g. a wrong rotation on a low-texture core.  If the affine NCC
+            # is worse than raw (less negative), fall back to identity so B-spline
+            # runs on the unmodified images rather than a degraded baseline.
+            # We use a strict threshold of 0.0: any regression reverts, because even
+            # a small degradation makes the B-spline acceptance easier to pass
+            # spuriously (it is relative to ncc_affine).
+            if ncc_affine > ncc_raw:
+                logger.warning(
+                    f"[{sid}] Affine NCC ({ncc_affine:.4f}) is worse than raw "
+                    f"({ncc_raw:.4f}) — reverting affine to identity so B-spline "
+                    "sees the unmodified images."
+                )
+                akaze_ok          = False
+                M_affine          = np.eye(2, 3, dtype=np.float64)
+                moving_affine_vol = np.zeros_like(moving_np, dtype=np.float32)
+                for ch in range(c):
+                    moving_affine_vol[ch] = moving_np[ch].astype(np.float32)
+                moving_log_affine = moving_log.copy()
+                ncc_affine        = ncc_raw   # B-spline acceptance is now vs raw NCC
+                aligned_np        = moving_affine_vol.astype(np.uint16)
+            else:
+                aligned_np, ncc_value, elastic_ok, tile_stats = apply_bspline_l1(
+                    fixed_log, moving_log_affine, moving_affine_vol, sid,
+                    tissue_mask=tissue_mask,
+                )
 
     # Output sanity & fallback
     if elastic_ok:
@@ -834,8 +865,9 @@ def register_slice(fixed_np, moving_np, slice_id=None):
         scale_pct    = round(scale_pct, 3),
         shear_pct    = round(shear_pct, 3),
         bspline_ok   = elastic_ok,
-        ncc_value    = round(float(ncc_value), 6),
+        ncc_raw      = round(float(ncc_raw),    6),
         ncc_affine   = round(float(ncc_affine), 6),
+        ncc_value    = round(float(ncc_value),  6),
     )
 
     # affine_np: the affine-only result (before B-spline), always uint16.
@@ -1213,7 +1245,9 @@ def main():
             logger.info(
                 f"Z{i:02d} (ID {real_id:03d}) | Det: {stats['detector']} | "
                 f"Matches: {stats['n_matches']} | Inliers: {stats['n_inliers']} | "
-                f"BSpline: {stats['bspline_ok']} | NCC: {stats['ncc_value']:.4f} | MSE: {mse:.2f} | "
+                f"BSpline: {stats['bspline_ok']} | "
+                f"NCC: raw={stats['ncc_raw']:.4f} affine={stats['ncc_affine']:.4f} bspline={stats['ncc_value']:.4f} | "
+                f"MSE: {mse:.2f} | "
                 f"Rot: {stats['rotation_deg']:.2f} | "
                 f"tx: {stats['tx']:.1f}px | ty: {stats['ty']:.1f}px | "
                 f"Scale: {stats['scale_pct']:+.2f}% | Shear: {stats['shear_pct']:.2f}% | "
@@ -1228,8 +1262,9 @@ def main():
                 "N_Matches":    stats["n_matches"],
                 "N_Inliers":    stats["n_inliers"],
                 "BSpline_OK":   stats["bspline_ok"],
-                "NCC_Value":    stats["ncc_value"],
+                "NCC_Raw":      stats["ncc_raw"],
                 "NCC_Affine":   stats["ncc_affine"],
+                "NCC_Value":    stats["ncc_value"],
                 "Success":      success,
                 "Status":       status_str,
                 "MSE_After":    round(mse, 4),
@@ -1249,7 +1284,8 @@ def main():
     df   = pd.DataFrame(registration_stats).sort_values("Slice_Z")
     cols = [
         "Direction", "Slice_Z", "Slice_ID", "Detector",
-        "N_Matches", "N_Inliers", "BSpline_OK", "NCC_Value", "NCC_Affine",
+        "N_Matches", "N_Inliers", "BSpline_OK",
+        "NCC_Raw", "NCC_Affine", "NCC_Value",
         "Success", "Status", "Rotation_Deg",
         "Shift_X_px", "Shift_Y_px", "Scale_Pct", "Shear_Pct",
         "MSE_After", "Runtime_s",

@@ -1,28 +1,36 @@
 """
 denoise_volume.py
 =================
-Dust-aware white top-hat denoising for all channels of a registered OME-TIFF
-volume.  Run this ONCE per core before phenotype_cells.py.
+Artifact detection and background correction for all channels of a registered
+OME-TIFF volume.  Run this ONCE per core before phenotype_cells.py.
 
-Pipeline per slice × channel (parallelised across channels via threads):
-  1. Median filter (ksize=3)  — removes isolated hot pixels
-  2. White top-hat            — isolates foreground structures smaller than the
-                                SE (nucleus radius), suppressing slowly-varying
-                                background illumination
-  3. Dust-mask (connected-component)  — zeros large bright blobs in the top-hat
-                                image (dust, fold artefacts)
-  4. log1p                    — compresses the cleaned signal for downstream KDE
+Pipeline per slice × channel (parallelised across channels):
+  Stage 1 — ARTIFACT DETECTION
+    DAPI:       1a. Large-blob scan — stride-sampled CC scan that catches the
+                    known macroscopic bubble by raw size alone.
+                1b. Intensity + circularity scan — two-gate CC analysis on the
+                    post-1a image (Gate A: any bright blob; Gate B: bright AND
+                    round).  Catches residual bright compact debris.
+    Non-DAPI:   1c. DoG bandpass scan — Difference of Gaussians filter that
+                    suppresses both fine noise and slowly-varying background,
+                    boosting only intermediate-scale macro-artifacts.  Candidates
+                    filtered by area, circularity, and solidity; top-N by
+                    (area × peak DoG response) are masked.
+    After detection (all channels): masked pixels are inpainted from local
+    neighbours, then the mask is dilated by ~7.5 µm to absorb optical halos.
+
+  Stage 2 — BACKGROUND CORRECTION  (per-channel mode)
+    'tophat'   — white morphological top-hat (image − opening).
+                 Use for punctate nuclear markers: DAPI, CD3, CD163.
+    'gaussian' — subtract a large Gaussian blur of the inpainted image.
+                 Use for fibrous/vascular markers: CD31, GAP43, NFP, CK, AF.
 
 Output
 ------
-  <OUTPUT_DIR>/<CORE>/<CORE>_denoised.ome.tif   — ZCYX uint16, same shape as
-                                                    the input volume; pixel
-                                                    values are the cleaned
-                                                    top-hat in uint16 scale
-                                                    (before log1p so that
-                                                    phenotype_cells.py can
-                                                    apply log1p itself and
-                                                    keep its existing QC path)
+  <OUTPUT_DIR>/<CORE>/<CORE>_denoised.ome.tif  — ZCYX uint16, same shape as
+    input; pixel values are the background-corrected, artifact-zeroed signal
+    scaled to uint16 per-channel global max (log1p applied downstream by
+    phenotype_cells.py).
 
 Usage
 -----
@@ -113,92 +121,116 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 # PER-CHANNEL DENOISING STRATEGY CONFIG
 # ─────────────────────────────────────────────────────────────────────────────
 #
-# Two-stage pipeline per channel:
+# ── DAPI only: Passes 1a + 1b ────────────────────────────────────────────────
+#   artifact_max_area_um2  — Pass 1a: blobs larger than this (µm²) are removed
+#     by the fast stride-sampled size scan.  Sized to catch DAPI's macroscopic
+#     bubble while leaving real nuclei untouched.
 #
-#   Stage 1 — ARTIFACT DETECTION (on the raw image, before any background math)
-#       Finds physically implausible bright blobs: high intensity AND compact
-#       shape AND above a per-channel "impossible" threshold. These are fibers,
-#       dust, debris on the slide — not tissue.  Masked pixels are interpolated
-#       from local neighbours so downstream steps see clean signal.
+#   artifact_thresh_factor — Pass 1b Gate A: blob_max > factor × DUST_PCT-pct
+#     ceiling → flagged regardless of shape.  High value = extreme outliers only.
+#   artifact_circ_factor   — Pass 1b Gate B intensity multiplier.  Must be ≤
+#     thresh_factor.  Blobs above this AND with circularity ≥ circ_thresh are
+#     flagged.  Catches compact round debris that sits below Gate A.
+#   artifact_circ_thresh   — Minimum circularity (0–1) for Gate B.
 #
-#   Stage 2 — BACKGROUND CORRECTION (preserves all real tissue signal)
-#       Two modes, chosen per channel:
+# ── Non-DAPI channels: Pass 1c (DoG) only ────────────────────────────────────
+#   Intensity-based detection (Passes 1a/1b) does not reliably separate macro-
+#   artifacts from real tissue in these channels.  The DoG bandpass scanner is
+#   the sole artifact detector.
 #
-#       'gaussian'  — subtract a large Gaussian blur of the masked image.
-#                     Models slow illumination falloff / out-of-focus haze.
-#                     Safe for ANY channel because it cannot strip structures
-#                     that are smaller than the blur sigma; real tissue
-#                     intensity relationships are preserved.
-#                     Use for: CD31, GAP43, NFP, CK — anything with structures
-#                     spanning many µm that top-hat would destroy.
+#   dog_sigma_high_um  — High-sigma Gaussian for the bandpass (µm).
+#     Controls the maximum artifact radius the scanner responds to.  Raise if
+#     large macro-artifacts are missed; lower to avoid catching real tissue.
+#   dog_min_area_um2   — Minimum blob area to be considered a macro-artifact.
+#   dog_max_area_um2   — Maximum blob area.  Structures larger than this are
+#     likely connected tissue and are ignored.
+#   dog_min_circ       — Minimum circularity for DoG candidates (kept loose,
+#     ~0.20, because macro-artifact edges are often irregular).
+#   dog_min_solid      — Minimum solidity.
+#   dog_top_n          — Maximum artifacts removed per slice.  Conservative to
+#     avoid over-masking.
 #
-#       'tophat'    — white morphological top-hat (image − opening).
-#                     Best when signal is truly punctate (single cells) and
-#                     background is smoothly varying at the SE scale.
-#                     Use for: DAPI, CD3, CD163 — nuclear-scale markers.
-#                     SE radius should be ≥ 1.5× the largest real structure
-#                     you expect so the opening models background correctly.
-#
-#       None        — skip background correction (median hot-pixel removal only).
-#
-# ARTIFACT_THRESH_FACTOR: a pixel whose value exceeds
-#   artifact_thresh_factor × (99th-percentile of the masked tissue signal)
-#   AND belongs to a compact connected component is flagged as an artifact.
-#   Increase if real bright structures (vessel lumens, glands) get masked.
-#   Decrease if bright artifacts are slipping through.
-#
-# BG_SIGMA_UM (gaussian mode): Gaussian sigma for background estimation.
-#   Rule: set to ≥ 3× the largest real tissue structure you want to keep.
-#   Larger = more conservative (safer for intensity preservation).
-#
-# SE_RADIUS_UM (tophat mode): morphological SE radius.
-#   Rule: set to ≥ 1.5× the largest nucleus/cell you expect.
-
-# ARTIFACT_THRESH_FACTOR: Criterion A — blob mean > factor × 99th-pct ceiling.
-#   High value = only extreme outliers. Raise if real bright tissue gets masked.
-#
-# ARTIFACT_CIRC_FACTOR: Criterion B intensity multiplier — lower than A.
-#   Blobs above this AND with circularity > ARTIFACT_CIRC_THRESH are flagged.
-#   For channels where real signal is always elongated (CD31, GAP43, NFP),
-#   set this low (1.5–2×) to catch modestly-bright round artifacts.
-#   For channels where real cells are round (DAPI, CD3, CD163), set higher
-#   or rely on Criterion A only.
-#
-# ARTIFACT_CIRC_THRESH: minimum circularity (0–1) for Criterion B.
-#   0.55 comfortably separates round debris from elongated vessels/axons.
-#   Raise toward 0.75 to be more conservative (fewer false positives).
+# ── Stage 2: Background correction (all channels) ─────────────────────────────
+#   mode = 'tophat'   — white morphological top-hat (image − opening).
+#     SE must be ≥ 1.5× the largest real structure.  Use for punctate markers.
+#   mode = 'gaussian' — subtract large Gaussian blur of the inpainted image.
+#     Cannot strip structures smaller than sigma.  Use for fibrous/vascular
+#     markers where top-hat would destroy real signal.
+#   se_radius_um  — SE radius for tophat mode (µm).
+#   bg_sigma_um   — Gaussian sigma for gaussian mode (µm).
+#     Rule: ≥ 3× the largest real tissue structure you want to preserve.
 
 CHANNEL_CONFIG = {
-    'DAPI':  dict(mode='tophat',   bg_sigma_um=None,  se_radius_um=8.0,
-                  artifact_thresh_factor=6.0, artifact_circ_factor=6.0,  artifact_circ_thresh=0.75,
-                  artifact_max_area_um2=0.0),
-    'CD31':  dict(mode='gaussian', bg_sigma_um=80.0,  se_radius_um=None,
-                  # Reverted to safe local parameters
-                  artifact_thresh_factor=3.5, artifact_circ_factor=3.5,  artifact_circ_thresh=0.60,
-                  # ACTIVATED: Catch artifacts by sheer mass (1000 µm²)
-                  artifact_max_area_um2=1000.0),
+    # ── DAPI ─────────────────────────────────────────────────────────────────
+    # Has a giant macroscopic bubble.  Pass 1a catches it by size; Pass 1b mops
+    # up any residual compact bright debris.  DoG pass not used for DAPI.
+    'DAPI': dict(
+        mode='tophat', se_radius_um=8.0, bg_sigma_um=None,
+        artifact_max_area_um2=5000.0,
+        artifact_thresh_factor=6.0, artifact_circ_factor=6.0, artifact_circ_thresh=0.75,
+    ),
 
-    'GAP43': dict(mode='gaussian', bg_sigma_um=60.0,  se_radius_um=None,
-                  artifact_thresh_factor=6.0, artifact_circ_factor=1.5,  artifact_circ_thresh=0.55,
-                  artifact_max_area_um2=0.0),
-    'NFP':   dict(mode='gaussian', bg_sigma_um=60.0,  se_radius_um=None,
-                  # Lowered intensity threshold to catch dim peaks
-                  artifact_thresh_factor=2.0, artifact_circ_factor=2.0,  
-                  # Relies on shape to protect squiggly nerve fibers
-                  artifact_circ_thresh=0.65,
-                  artifact_max_area_um2=0.0),
-    'CD3':   dict(mode='tophat',   bg_sigma_um=None,  se_radius_um=8.0,
-                  artifact_thresh_factor=6.0, artifact_circ_factor=6.0,  artifact_circ_thresh=0.75,
-                  artifact_max_area_um2=0.0),
-    'CD163': dict(mode='tophat',   bg_sigma_um=None,  se_radius_um=8.0,
-                  artifact_thresh_factor=6.0, artifact_circ_factor=6.0,  artifact_circ_thresh=0.75,
-                  artifact_max_area_um2=0.0),
-    'CK':    dict(mode='gaussian', bg_sigma_um=150.0, se_radius_um=None,
-                  artifact_thresh_factor=8.0, artifact_circ_factor=3.0,  artifact_circ_thresh=0.65,
-                  artifact_max_area_um2=0.0),
-    'AF':    dict(mode='gaussian', bg_sigma_um=40.0,  se_radius_um=None,
-                  artifact_thresh_factor=8.0, artifact_circ_factor=3.0,  artifact_circ_thresh=0.65,
-                  artifact_max_area_um2=0.0),
+    # ── CD31 ──────────────────────────────────────────────────────────────────
+    # Vascular marker with fine capillary network.  Intensity-based detection
+    # cannot distinguish dye precipitates from real vessels — DoG is the only
+    # viable scanner.
+    'CD31': dict(
+        mode='gaussian', se_radius_um=None, bg_sigma_um=80.0,
+        dog_sigma_high_um=60.0, dog_min_area_um2=5000.0, dog_max_area_um2=35_000.0,
+        dog_min_circ=0.20, dog_min_solid=0.40, dog_top_n=3,
+    ),
+
+    # ── GAP43 ─────────────────────────────────────────────────────────────────
+    # Fibrous axonal marker.  Real signal is elongated; DoG catches macro-scale
+    # fold-edge and debris artifacts by area + shape rather than intensity.
+    'GAP43': dict(
+        mode='gaussian', se_radius_um=None, bg_sigma_um=60.0,
+        dog_sigma_high_um=60.0, dog_min_area_um2=10_000.0, dog_max_area_um2=35_000.0,
+        dog_min_circ=0.20, dog_min_solid=0.40, dog_top_n=3,
+    ),
+
+    # ── NFP ───────────────────────────────────────────────────────────────────
+    # Neurofilament; same approach as GAP43.
+    'NFP': dict(
+        mode='gaussian', se_radius_um=None, bg_sigma_um=60.0,
+        dog_sigma_high_um=60.0, dog_min_area_um2=5000.0, dog_max_area_um2=35_000.0,
+        dog_min_circ=0.20, dog_min_solid=0.40, dog_top_n=3,
+    ),
+
+    # ── CD3 ───────────────────────────────────────────────────────────────────
+    # T-cell marker; real cells are small and round so intensity gates produce
+    # false positives.  DoG handles macro-artifacts; top-hat corrects background.
+    'CD3': dict(
+        mode='tophat', se_radius_um=8.0, bg_sigma_um=None,
+        dog_sigma_high_um=60.0, dog_min_area_um2=10_000.0, dog_max_area_um2=35_000.0,
+        dog_min_circ=0.20, dog_min_solid=0.40, dog_top_n=3,
+    ),
+
+    # ── CD163 ─────────────────────────────────────────────────────────────────
+    # Macrophage marker; same approach as CD3.
+    'CD163': dict(
+        mode='tophat', se_radius_um=8.0, bg_sigma_um=None,
+        dog_sigma_high_um=60.0, dog_min_area_um2=10_000.0, dog_max_area_um2=35_000.0,
+        dog_min_circ=0.20, dog_min_solid=0.40, dog_top_n=3,
+    ),
+
+    # ── CK ────────────────────────────────────────────────────────────────────
+    # Cytokeratin; large epithelial sheets with variable intensity.  Large
+    # bg_sigma preserves sheet-scale signal.
+    'CK': dict(
+        mode='gaussian', se_radius_um=None, bg_sigma_um=150.0,
+        dog_sigma_high_um=30.0, dog_min_area_um2=10_000.0, dog_max_area_um2=35_000.0,
+        dog_min_circ=0.20, dog_min_solid=0.40, dog_top_n=3,
+    ),
+
+    # ── AF (autofluorescence) ─────────────────────────────────────────────────
+    # Broad background channel.  Artifacts are typically fold-edge halos or
+    # lipofuscin deposits caught well by DoG.
+    'AF': dict(
+        mode='gaussian', se_radius_um=None, bg_sigma_um=40.0,
+        dog_sigma_high_um=60.0, dog_min_area_um2=10_000.0, dog_max_area_um2=35_000.0,
+        dog_min_circ=0.20, dog_min_solid=0.40, dog_top_n=3,
+    ),
 }
 
 # Ordered channel list — index must match the volume's channel axis
@@ -228,19 +260,18 @@ ARTIFACT_MIN_AREA_PX = max(10, int(ARTIFACT_MIN_AREA_UM2 / (PIXEL_UM ** 2)))
 
 logger.info('Per-channel denoising configuration:')
 for _ch, _cfg in CHANNEL_CONFIG.items():
-    _illum = _cfg.get('illum_sigma_um')
-    _illum_str = f'illum_σ={_illum:.0f}µm' if _illum else 'illum=off'
-    if _cfg['mode'] == 'tophat':
-        _r_px = _um_to_px(_cfg['se_radius_um'])
-        logger.info(f"  {_ch:8s}  mode=tophat     SE radius: {_cfg['se_radius_um']:.0f} µm "
-                    f"({_r_px} px)  A_factor={_cfg['artifact_thresh_factor']}  "
-                    f"B_factor={_cfg['artifact_circ_factor']}  B_circ={_cfg['artifact_circ_thresh']}  {_illum_str}")
-    elif _cfg['mode'] == 'gaussian':
-        logger.info(f"  {_ch:8s}  mode=gaussian   bg_sigma: {_cfg['bg_sigma_um']:.0f} µm  "
-                    f"A_factor={_cfg['artifact_thresh_factor']}  "
-                    f"B_factor={_cfg['artifact_circ_factor']}  B_circ={_cfg['artifact_circ_thresh']}  {_illum_str}")
+    _mode = _cfg['mode']
+    _bg_str = (f"SE={_cfg['se_radius_um']:.0f}µm ({_um_to_px(_cfg['se_radius_um'])}px)"
+               if _mode == 'tophat' else f"σ={_cfg['bg_sigma_um']:.0f}µm")
+    if _cfg.get('artifact_max_area_um2'):
+        _det_str = (f"1a: largeBlob≤{_cfg['artifact_max_area_um2']:.0f}µm²  "
+                    f"1b: A={_cfg['artifact_thresh_factor']}×  "
+                    f"B={_cfg['artifact_circ_factor']}×@circ≥{_cfg['artifact_circ_thresh']}")
     else:
-        logger.info(f"  {_ch:8s}  mode=None       (median only)  {_illum_str}")
+        _det_str = (f"1c DoG: σ_hi={_cfg['dog_sigma_high_um']}µm  "
+                    f"area=[{_cfg['dog_min_area_um2']:.0f}–{_cfg['dog_max_area_um2']:.0f}]µm²  "
+                    f"top_n={_cfg['dog_top_n']}")
+    logger.info(f"  {_ch:8s}  mode={_mode:8s}  bg={_bg_str:28s}  {_det_str}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -255,9 +286,14 @@ _LARGE_BLOB_STRIDE = 32
 
 def _large_blob_mask(med: np.ndarray, max_area_px: int) -> np.ndarray:
     """
-    PASS 1 — Fast size-only scan for implausibly large bright structures.
-    UPDATED: Uses the 99th percentile (DUST_PCT) instead of the 80th percentile 
-    to prevent dense capillary beds from connecting into false-positive webs.
+    Pass 1a — Fast stride-sampled size scan for implausibly large bright blobs.
+
+    Operates on a 1/32-downsampled view of the image to avoid allocating a full
+    copy.  Blobs whose area in the downsampled image exceeds max_area_px/(ds²)
+    are projected back to full resolution and dilated to absorb ragged edges.
+
+    Only enabled for channels where artifact_max_area_um2 > 0 (currently DAPI).
+    Returns an all-False mask immediately when max_area_px <= 0.
     """
     if max_area_px <= 0:
         return np.zeros(med.shape, dtype=bool)
@@ -267,32 +303,31 @@ def _large_blob_mask(med: np.ndarray, max_area_px: int) -> np.ndarray:
     H, W = med.shape
     ds = _LARGE_BLOB_STRIDE
 
-    # 1. Zero-copy stride subsample
+    # Zero-copy stride subsample
     small = med[::ds, ::ds]
     Hd, Wd = small.shape
 
-    # 2. Threshold using the extreme tissue ceiling (Top 1%)
+    # Threshold at the DUST_PCT tissue ceiling — same anchor as Pass 1b so
+    # the two passes are consistently calibrated.
     pos_ds = small[small > 0]
     if pos_ds.size == 0:
         return np.zeros(med.shape, dtype=bool)
-    
-    # REPLACED '80' with 'DUST_PCT' to isolate dye precipitates from real tissue
-    ceiling_ds = float(np.percentile(pos_ds, DUST_PCT))
-    bright_ds = (small >= ceiling_ds).astype(np.uint8)
 
-    # 3. CC on tiny image
+    ceiling_ds = float(np.percentile(pos_ds, DUST_PCT))
+    bright_ds  = (small >= ceiling_ds).astype(np.uint8)
+
+    # CC on downsampled image
     _, label_ds, stats_ds, _ = cv2.connectedComponentsWithStats(
         bright_ds, connectivity=8
     )
 
-    # 4. Project oversized blobs to full-res
+    # Project oversized blobs back to full resolution with a small dilation pad
     max_area_ds = max_area_px / (ds * ds)
     mask_full   = np.zeros((H, W), dtype=bool)
-    pad = 2 
+    pad = 2
 
-    # Pre-compute the morphological kernel
     dilate_radius = pad * ds
-    kernel_size = (dilate_radius * 2) + 1
+    kernel_size   = (dilate_radius * 2) + 1
     dilate_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
 
     for i in range(stats_ds.shape[0] - 1):
@@ -330,16 +365,19 @@ def _detect_artifacts(med: np.ndarray, artifact_thresh_factor: float,
                        circularity_thresh: float = 0.82,
                        circularity_intensity_factor: float = 3.5) -> np.ndarray:
     """
-    PASS 2 — Intensity AND circularity scan for artifacts (hot spots, round debris).
+    PASS 2 — Two-gate intensity + circularity scan for compact artifacts.
 
-    Both gates must pass (AND logic):
-      Gate 1 — blob peak > artifact_thresh_factor × tissue ceiling (intensity)
-      Gate 2 — circularity >= circularity_thresh (shape)
+    Gate A (intensity-only): blob_max > ceiling × artifact_thresh_factor
+        → flagged unconditionally regardless of shape.  Catches extreme hot-spots.
 
-    This prevents real tissue structures that are bright but irregular (vessel
-    clusters, glands) from being falsely flagged. circularity_intensity_factor
-    is retained in the signature for config compatibility but is no longer used
-    as an independent OR criterion — artifact_thresh_factor drives segmentation.
+    Gate B (intensity + shape): blob_max > ceiling × artifact_circ_factor
+        AND circularity >= circularity_thresh
+        → catches modestly-bright but perfectly round debris (dye precipitates,
+          dust) that would slip below Gate A.  circularity_intensity_factor must
+          be < artifact_thresh_factor for this branch to do any extra work.
+
+    Both thresholds are anchored to the DUST_PCT percentile tissue ceiling so
+    real biological structures are never flagged.
     """
     pos = med[med > 0]
     if pos.size == 0:
@@ -349,12 +387,15 @@ def _detect_artifacts(med: np.ndarray, artifact_thresh_factor: float,
     if ceiling <= 0:
         return np.zeros(med.shape, dtype=bool)
 
-    # Segment at the intensity gate threshold — only pixels bright enough to
-    # potentially be artifacts are candidates. This is intentionally the same
-    # factor as artifact_thresh_factor so Gate 1 and segmentation are consistent.
-    base_thresh = ceiling * artifact_thresh_factor
+    # Gate A: unconditional intensity tripwire (high bar)
+    thresh_a = ceiling * artifact_thresh_factor
+    # Gate B: lower intensity bar — only flags if shape is also round
+    thresh_b = ceiling * circularity_intensity_factor
 
-    bright_bin = (med >= base_thresh).astype(np.uint8)
+    # Seed the CC analysis from the lower of the two thresholds so Gate B
+    # candidates are included in the connected-component image.
+    seed_thresh = min(thresh_a, thresh_b)
+    bright_bin  = (med >= seed_thresh).astype(np.uint8)
 
     _, label_img, stats, _ = cv2.connectedComponentsWithStats(
         bright_bin, connectivity=8
@@ -372,18 +413,16 @@ def _detect_artifacts(med: np.ndarray, artifact_thresh_factor: float,
         blob_pixels = med[label_img == lbl]
         blob_max    = float(blob_pixels.max())
 
-        # ── Gate 1 (intensity): blob peak must be implausibly bright.
-        # This is the primary discriminator. Real tissue (vessels, dense
-        # staining) is filtered out here before shape is even considered.
-        # For CD31: real vessels peak ~117, real artifacts peak ~564 → ~5×
-        # gap; a factor of 3.5 is conservative and safe.
-        if blob_max <= ceiling * artifact_thresh_factor:
-            continue   # not bright enough to be an artifact — skip regardless of shape
+        # Gate A: bright enough to flag without any shape check
+        if blob_max >= thresh_a:
+            artifact_ids.append(lbl)
+            continue
 
-        # ── Gate 2 (circularity): intensity passed; now confirm compact shape.
-        # Dust/debris is round (circularity ~0.97). Real structures that happen
-        # to be very bright (large vessels, glands) are elongated or irregular.
-        # Both gates must pass — AND logic, not OR.
+        # Gate B: only evaluate if this blob exceeds the lower circularity bar
+        if blob_max < thresh_b:
+            continue
+
+        # Gate B — shape check: only round blobs are artifacts at this intensity level
         blob_mask_u8 = (label_img == lbl).astype(np.uint8)
         contours, _  = cv2.findContours(blob_mask_u8,
                                          cv2.RETR_EXTERNAL,
@@ -399,6 +438,87 @@ def _detect_artifacts(med: np.ndarray, artifact_thresh_factor: float,
         return np.zeros(med.shape, dtype=bool)
 
     return np.isin(label_img, artifact_ids)
+
+
+def _dog_artifact_mask(med: np.ndarray, pixel_um: float, cfg: dict, ch_name: str) -> np.ndarray:
+    """
+    Pass 1c — DoG (Difference of Gaussians) bandpass macro-artifact scanner.
+    """
+    try:
+        from skimage.measure import regionprops
+    except ImportError:
+        logger.warning('scikit-image not available — DoG artifact pass skipped.')
+        return np.zeros(med.shape, dtype=bool)
+
+    sigma_high_um = cfg['dog_sigma_high_um']
+    min_area_um2  = cfg['dog_min_area_um2']
+    max_area_um2  = cfg['dog_max_area_um2']
+    min_circ      = cfg['dog_min_circ']
+    min_solid     = cfg['dog_min_solid']
+    top_n         = cfg['dog_top_n']
+
+    SIGMA_LOW_UM  = 2.0    # fixed: removes hot-pixel / single-cell scale noise
+    DOG_THRESHOLD = 1.0    # minimum DoG response to seed CC analysis
+
+    sigma_low_px  = SIGMA_LOW_UM  / pixel_um
+    sigma_high_px = sigma_high_um / pixel_um
+    min_area_px   = min_area_um2  / (pixel_um ** 2)
+    max_area_px   = max_area_um2  / (pixel_um ** 2)
+
+    # DoG response map
+    img_f      = med.astype(np.float32)
+    blur_low   = cv2.GaussianBlur(img_f, (0, 0), sigmaX=sigma_low_px,  sigmaY=sigma_low_px)
+    blur_high  = cv2.GaussianBlur(img_f, (0, 0), sigmaX=sigma_high_px, sigmaY=sigma_high_px)
+    dog_map    = blur_low - blur_high
+    dog_map[dog_map < 0] = 0.0  # bright-blob only
+
+    # Connected components on thresholded DoG map
+    binary   = (dog_map > DOG_THRESHOLD).astype(np.uint8)
+    n_labels, label_img = cv2.connectedComponents(binary, connectivity=8)
+    if n_labels <= 1:
+        return np.zeros(med.shape, dtype=bool)
+
+    regions = regionprops(label_img)
+
+    candidates = []
+    for reg in regions:
+        area = reg.area
+        if not (min_area_px <= area <= max_area_px):
+            continue
+        perimeter = reg.perimeter
+        if perimeter == 0:
+            continue
+        circularity = (4 * np.pi * area) / (perimeter ** 2)
+        if circularity < min_circ:
+            continue
+        if reg.solidity < min_solid:
+            continue
+
+        blob_pixels  = dog_map[label_img == reg.label]
+        max_response = float(blob_pixels.max())
+        candidates.append({
+            'label':    reg.label,
+            'centroid': reg.centroid,
+            'area_um2': area * (pixel_um ** 2),
+            'score':    max_response,
+        })
+
+    if not candidates:
+        return np.zeros(med.shape, dtype=bool)
+
+    # Rank by (area × DoG peak) and keep top_n
+    candidates.sort(key=lambda x: x['area_um2'] * x['score'], reverse=True)
+    top = candidates[:top_n]
+
+    final_mask = np.zeros(med.shape, dtype=bool)
+    for t in top:
+        final_mask[label_img == t['label']] = True
+        logger.debug(f"    [{ch_name}] DoG artifact: center=({t['centroid'][0]:.0f},{t['centroid'][1]:.0f})  "
+                     f"area={t['area_um2']:.0f}µm²  score={t['score']:.1f}")
+
+    logger.info(f'[{ch_name}] Stage 1c (DoG): {len(top)} macro-artifact(s) detected '
+                f'({int(final_mask.sum()):,} px)')
+    return final_mask
 
 
 def _inpaint_artifact(img: np.ndarray, mask: np.ndarray) -> np.ndarray:
@@ -444,17 +564,18 @@ def _gaussian_background(img_clean: np.ndarray, sigma_px: float) -> np.ndarray:
 
 
 
-def denoise_channel(raw: np.ndarray, cfg: dict) -> dict:
+def denoise_channel(raw: np.ndarray, cfg: dict, ch_name: str) -> dict:
     """
-    Two-stage tissue-preserving denoise for one 2-D float32 channel.
+    Artifact detection + background correction for one 2-D float32 channel.
     """
-    mode                  = cfg['mode']
-    artifact_thresh_factor = cfg['artifact_thresh_factor']
+    mode    = cfg['mode']
+    is_dapi = 'artifact_max_area_um2' in cfg   # DAPI has 1a/1b keys; others do not
 
     raw_max = float(raw.max())
     if raw_max == 0:
         empty = np.zeros_like(raw)
         return dict(cleaned=empty, dust_mask=empty.astype(bool),
+                    large_mask=empty.astype(bool), dog_mask=empty.astype(bool),
                     tophat=empty, bg=empty, removed=empty)
 
     # ── Hot-pixel removal ─────────────────────────────────────────────────
@@ -463,51 +584,43 @@ def denoise_channel(raw: np.ndarray, cfg: dict) -> dict:
     med_u16 = cv2.medianBlur(u16, 3)
     med     = med_u16.astype(np.float32) / scale
 
-    # ── Stage 1a: Large-blob scan ─────────────────────────────────────────
-    max_area_um2 = cfg.get('artifact_max_area_um2', 0.0)
-    max_area_px = int(max_area_um2 / (PIXEL_UM ** 2)) if max_area_um2 > 0 else 0
-    large_mask = _large_blob_mask(med, max_area_px)
-    
-    # ── Stage 1b: Intensity + circularity scan ────────────────────────────
-    med_no_large = med.copy()
-    med_no_large[large_mask] = 0.0
+    # ── Stage 1: Artifact detection ───────────────────────────────────────
+    if is_dapi:
+        # Pass 1a: large-blob size scan
+        max_area_px = int(cfg['artifact_max_area_um2'] / (PIXEL_UM ** 2))
+        large_mask  = _large_blob_mask(med, max_area_px)
+        n_1a = int(large_mask.sum())
 
-    small_mask = _detect_artifacts(
-        med_no_large,
-        artifact_thresh_factor       = cfg['artifact_thresh_factor'],
-        circularity_thresh           = cfg.get('artifact_circ_thresh', 0.82),
-        circularity_intensity_factor = cfg.get('artifact_circ_factor', 3.5),
-    )
+        # Pass 1b: intensity + circularity scan on the post-1a image
+        med_no_large = med.copy()
+        med_no_large[large_mask] = 0.0
+        small_mask = _detect_artifacts(
+            med_no_large,
+            artifact_thresh_factor       = cfg['artifact_thresh_factor'],
+            circularity_thresh           = cfg['artifact_circ_thresh'],
+            circularity_intensity_factor = cfg['artifact_circ_factor'],
+        )
+        n_1b = int(small_mask.sum())
 
-    artifact_mask = large_mask | small_mask
+        artifact_mask = large_mask | small_mask
+        dog_mask      = np.zeros(med.shape, dtype=bool)
 
-    # ── NEW: Smart Optical Halo Dilation (Vessel Preserving) ─────────────
-    # Expands the mask to catch the halo, but protects entangled vessels 
-    # using a local high-frequency shield.
+        if n_1a > 0 or n_1b > 0:
+            logger.info(f"[{ch_name}] Stage 1a (Large-blob): {n_1a:,} px removed | Stage 1b (Intensity/Circ): {n_1b:,} px removed")
+
+    else:
+        # Pass 1c: DoG bandpass scan — sole detector for non-DAPI channels
+        large_mask    = np.zeros(med.shape, dtype=bool)
+        dog_mask      = _dog_artifact_mask(med, PIXEL_UM, cfg, ch_name)
+        artifact_mask = dog_mask
+
+    # Dilate the combined mask by ~7.5 µm to absorb optical halos
     if artifact_mask.any():
-        # 1. Create the Wrecking Ball (Blind Dilation)
-        # 31x31 diameter = 15px radius (~7.5 µm expansion)
-        dilate_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (31, 31))
-        expanded_mask = cv2.dilate(artifact_mask.astype(np.uint8), dilate_kernel).astype(bool)
-
-        # 2. Build the Shield (Isolate sharp vessels from smooth halos)
-        # We calculate the local background using a medium Gaussian blur.
-        local_bg = cv2.GaussianBlur(med, (21, 21), 0, borderType=cv2.BORDER_REFLECT)
-        
-        # A pixel is a vessel if it is >50% brighter than its immediate local blur.
-        # Halos are smooth, so halo pixels will fail this test and remain unshielded.
-        vessel_shield = med > (local_bg * 1.5) 
-
-        # 3. Apply the Shield
-        # The final mask is the expanded mask, MINUS the shielded vessels, 
-        # PLUS the original core artifact (to guarantee the core stays dead).
-        artifact_mask = (expanded_mask & ~vessel_shield) | artifact_mask
-    # ─────────────────────────────────────────────────────────────────────
+        dilate_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (41, 41))
+        artifact_mask = cv2.dilate(artifact_mask.astype(np.uint8), dilate_kernel).astype(bool)
 
     # Inpaint artifact regions using fast local topography
     med_inpainted = _inpaint_artifact(med, artifact_mask)
-
-    # ── Stage 2: Background correction ────────────────────────────────────
     if mode == 'gaussian':
         sigma_px = _gaussian_sigma_px(cfg['bg_sigma_um'])
         bg       = _gaussian_background(med_inpainted, sigma_px)
@@ -535,6 +648,7 @@ def denoise_channel(raw: np.ndarray, cfg: dict) -> dict:
         cleaned=cleaned,
         dust_mask=artifact_mask,
         large_mask=large_mask,
+        dog_mask=dog_mask,
         tophat=tophat_display,
         bg=bg,
         removed=raw - cleaned
@@ -548,7 +662,6 @@ def denoise_slice(raw_slice: np.ndarray, n_channels: int, max_workers: int) -> l
     results = [None] * n_channels
     workers = min(max_workers, n_channels)
 
-    # Replaced ThreadPoolExecutor with ProcessPoolExecutor to bypass the GIL
     with ProcessPoolExecutor(max_workers=workers) as pool:
         futures = {}
         for c in range(n_channels):
@@ -557,7 +670,8 @@ def denoise_slice(raw_slice: np.ndarray, n_channels: int, max_workers: int) -> l
                 mode='gaussian', bg_sigma_um=40.0, se_radius_um=None,
                 artifact_thresh_factor=8.0,
             ))
-            fut = pool.submit(denoise_channel, raw_slice[c].astype(np.float32), cfg)
+            # Added ch_name to the arguments submitted to the pool
+            fut = pool.submit(denoise_channel, raw_slice[c].astype(np.float32), cfg, ch_name)
             futures[fut] = c
             
         for fut in as_completed(futures):
@@ -614,8 +728,10 @@ def save_qc_slice_plot(
         mode      = cfg.get('mode', '?')
         n_dust_px  = int(dust.sum())
         large_mask = res.get('large_mask', np.zeros_like(dust))
+        dog_mask   = res.get('dog_mask',   np.zeros_like(dust))
         n_large_px = int(large_mask.sum())
-        n_small_px = n_dust_px - n_large_px
+        n_dog_px   = int(dog_mask.sum())
+        n_small_px = n_dust_px - n_large_px - n_dog_px
 
         if mode == 'tophat':
             mode_str = f"tophat  SE={cfg.get('se_radius_um', 0):.0f} µm"
@@ -629,7 +745,7 @@ def save_qc_slice_plot(
             f'{TARGET_CORE}  |  Z={z_idx:03d}  |  Ch {c:02d}: {ch_label}  '
             f'|  mode: {mode_str}  '
             f'|  artifact px removed: {n_dust_px:,}  '
-            f'(large-blob: {n_large_px:,}  small: {n_small_px:,})',
+            f'(large-blob: {n_large_px:,}  DoG: {n_dog_px:,}  small: {n_small_px:,})',
             fontsize=12, fontweight='bold',
         )
 

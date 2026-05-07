@@ -16,7 +16,9 @@ Why this order:
 
 Fallback hierarchy:
   L0 fails  → run RoMaV2 on raw images (better than identity for moderate shifts)
+  L0 succeeds but affine NCC ≤ raw NCC → revert affine to identity; RoMaV2 on raw
   L1 fails  → use affine-only result (L0 output)
+  L1 does not improve NCC by WARP_NCC_MIN_IMPROVEMENT over affine → revert to affine
   Both fail → identity (raw moving slice)
 
 NCC is measured at three points for comparison:
@@ -134,6 +136,14 @@ ROMAV2_H_HR              = None
 ROMAV2_W_HR              = None
 WARP_CONFIDENCE_THRESH   = 0.5     # 0.0 = no filtering; 0.5 is a safe default
 WARP_MAX_DISPLACEMENT_PX = 200.0   # tighter cap — residual after affine should be small
+# RoMaV2 warp acceptance criterion — mirrors BSPLINE_NCC_MIN_IMPROVEMENT in the B-spline
+# script.  The warp result is accepted only if it improves NCC (relative to the affine
+# baseline) by at least this fraction.
+# NCC is negative — improvement means becoming more negative.
+# Relative improvement = (ncc_affine − ncc_warp) / |ncc_affine|
+# e.g. ncc_affine=−0.72, ncc_warp=−0.76 → gain=(−0.72−−0.76)/0.72 = +0.056 → accepted.
+# Set to 0.0 to accept any non-negative improvement; raise to be stricter.
+WARP_NCC_MIN_IMPROVEMENT = 0.05
 
 # ─────────────────────────────────────────────────────────────────────────────
 # TISSUE MASK
@@ -713,6 +723,31 @@ def register_slice(fixed_np, moving_np, slice_id=None):
     )
     logger.info(f"[{sid}] NCC after affine: {ncc_affine:.4f}")
 
+    # ── Affine NCC acceptance — revert to identity if affine made things worse ─
+    # AKAZE succeeded geometrically (enough inliers, sane matrix) but the affine
+    # transform could still hurt NCC — e.g. a slightly wrong rotation on a low-
+    # texture core.  If the affine NCC is worse than raw, fall back to identity
+    # so RoMaV2 runs on the unmodified images rather than a degraded baseline.
+    # "Worse" = ncc_affine > ncc_raw (less negative), i.e. no improvement at all.
+    # We use a strict threshold of 0.0 (any regression reverts) because even a
+    # small affine degradation compounds once RoMaV2's acceptance is relative to
+    # ncc_affine — a worse baseline makes the warp easier to accept spuriously.
+    if akaze_ok and ncc_affine > ncc_raw:
+        logger.warning(
+            f"[{sid}] Affine NCC ({ncc_affine:.4f}) is worse than raw "
+            f"({ncc_raw:.4f}) — reverting affine to identity so RoMaV2 "
+            "sees the unmodified images."
+        )
+        akaze_ok          = False
+        M_affine          = np.eye(2, 3, dtype=np.float64)
+        moving_affine_vol = np.zeros_like(moving_np, dtype=np.float32)
+        for ch in range(moving_np.shape[0]):
+            moving_affine_vol[ch] = moving_np[ch].astype(np.float32)
+        affine_np         = moving_np.copy()
+        moving_lin_affine = moving_lin.copy()
+        moving_log_affine = moving_log.copy()
+        ncc_affine        = ncc_raw   # RoMaV2 acceptance is now relative to raw NCC
+
     # ── L1: RoMaV2 warp on affine-prealigned LINEAR images ───────────────────
     warp_ok         = False
     ncc_warp        = 0.0
@@ -755,9 +790,36 @@ def register_slice(fixed_np, moving_np, slice_id=None):
                     warped_log.astype(np.float32),
                     fixed_tissue_mask,
                 )
-                aligned_np = warp_candidate
-                warp_ok    = True
                 logger.info(f"[{sid}] NCC after RoMaV2 warp: {ncc_warp:.4f}")
+
+                # ── NCC monotonic acceptance — mirrors bspline strategy ───────
+                # Accept the warp only if it improves NCC over the affine
+                # baseline by at least WARP_NCC_MIN_IMPROVEMENT (relative).
+                # NCC is negative — improvement means becoming more negative.
+                # This guards against RoMaV2 producing a plausible-looking warp
+                # that nonetheless degrades alignment (e.g. on low-texture
+                # regions where the confidence filter alone is insufficient).
+                if abs(ncc_affine) > 1e-9:
+                    relative_improvement = (ncc_affine - ncc_warp) / abs(ncc_affine)
+                else:
+                    relative_improvement = 0.0
+
+                if relative_improvement < WARP_NCC_MIN_IMPROVEMENT:
+                    logger.warning(
+                        f"[{sid}] RoMaV2 NCC ({ncc_warp:.4f}) did not improve enough "
+                        f"over affine baseline ({ncc_affine:.4f}): "
+                        f"relative gain={relative_improvement*100:.2f}% < required "
+                        f"{WARP_NCC_MIN_IMPROVEMENT*100:.0f}% "
+                        "— reverting to affine-only result."
+                    )
+                    map_x = map_y = None   # store identity so downstream never branches
+                else:
+                    aligned_np = warp_candidate
+                    warp_ok    = True
+                    logger.info(
+                        f"[{sid}] RoMaV2 warp accepted "
+                        f"(NCC gain={relative_improvement*100:.2f}%)."
+                    )
         else:
             logger.warning(f"[{sid}] RoMaV2 warp failed — using affine-only result.")
     else:
