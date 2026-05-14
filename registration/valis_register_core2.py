@@ -48,7 +48,7 @@ def main():
     # 1. Path Definitions & I/O Setup
     # -------------------------------------------------------------------------
     # Restored exact path routing from the original script
-    DATA_BASE_PATH = os.path.join(config.DATASPACE, "TMA_Cores_Grouped_Rotate")
+    DATA_BASE_PATH = os.path.join(config.DATASPACE, "TMA_Cores_Grouped_Rotate_Conformed")
     input_dir      = os.path.join(DATA_BASE_PATH, args.core_name)
     WORK_OUTPUT    = os.path.join(config.DATASPACE, "VALIS_Baseline_Eval")
     output_dir     = os.path.join(WORK_OUTPUT, args.core_name)

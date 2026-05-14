@@ -215,10 +215,16 @@ CHANNEL_CONFIG = {
     ),
 
     # ── CK ────────────────────────────────────────────────────────────────────
-    # Cytokeratin; large epithelial sheets with variable intensity.  Large
-    # bg_sigma preserves sheet-scale signal.
+    # Cytokeratin; signal manifests as large contiguous epithelial sheets whose
+    # spatial extent approaches the sigma of any practical Gaussian kernel, so
+    # Gaussian background subtraction erodes real signal rather than removing
+    # illumination variation.  A white morphological top-hat is used instead.
+    # SE radius = 40 µm: large enough to exceed the diameter of individual
+    # cellular structures within the sheets (so the opening cannot fit inside
+    # them and they are fully retained), yet smaller than the broad illumination
+    # gradient (which the opening absorbs).
     'CK': dict(
-        mode='gaussian', se_radius_um=None, bg_sigma_um=150.0,
+        mode='tophat', se_radius_um=40.0, bg_sigma_um=None,
         dog_sigma_high_um=30.0, dog_min_area_um2=10_000.0, dog_max_area_um2=35_000.0,
         dog_min_circ=0.20, dog_min_solid=0.40, dog_top_n=3,
     ),
@@ -746,35 +752,35 @@ def save_qc_slice_plot(
             f'|  mode: {mode_str}  '
             f'|  artifact px removed: {n_dust_px:,}  '
             f'(large-blob: {n_large_px:,}  DoG: {n_dog_px:,}  small: {n_small_px:,})',
-            fontsize=12, fontweight='bold',
+            fontsize=13, fontweight='bold', fontfamily='monospace',
         )
 
         # ── Col 0: Raw ────────────────────────────────────────────────────
         axes[0].imshow(_stretch(raw), cmap='gray', interpolation='nearest')
         raw_max = float(raw.max())
-        axes[0].set_title(f'Raw\n(max={raw_max:.0f})', fontsize=10)
+        axes[0].set_title(f'Raw\n(max={raw_max:.0f})', fontsize=11)
         axes[0].axis('off')
 
         # ── Col 1: Background-corrected ───────────────────────────────────
         axes[1].imshow(_stretch(tophat), cmap='gray', interpolation='nearest')
-        axes[1].set_title(f'BG-corrected\n({mode_str})', fontsize=10)
+        axes[1].set_title(f'BG-corrected\n({mode_str})', fontsize=11)
         axes[1].axis('off')
 
         # ── Col 2: Dust mask overlaid ─────────────────────────────────────
         rgb_dust = np.stack([_stretch(tophat)] * 3, axis=-1)
         if n_dust_px > 0:
-            rgb_dust[dust, 0] = 1.0   
+            rgb_dust[dust, 0] = 1.0
             rgb_dust[dust, 1] = 0.0
             rgb_dust[dust, 2] = 0.0
         axes[2].imshow(rgb_dust, interpolation='nearest')
         dust_pct_px = 100.0 * n_dust_px / raw.size
-        axes[2].set_title(f'Dust mask\n({n_dust_px:,} px, {dust_pct_px:.2f}% of image)', fontsize=10)
+        axes[2].set_title(f'Dust mask\n({n_dust_px:,} px, {dust_pct_px:.2f}% of image)', fontsize=11)
         axes[2].axis('off')
 
         # ── Col 3: Cleaned ────────────────────────────────────────────────
         axes[3].imshow(_stretch(cleaned), cmap='gray', interpolation='nearest')
         signal_px = int((cleaned > 0).sum())
-        axes[3].set_title(f'Cleaned\n({signal_px:,} signal px retained)', fontsize=10)
+        axes[3].set_title(f'Cleaned\n({signal_px:,} signal px retained)', fontsize=11)
         axes[3].axis('off')
 
         # ── Col 4: Histogram ──────────────────────────────────────────────
@@ -792,11 +798,11 @@ def save_qc_slice_plot(
                       label=f'Cleaned  (n={cleaned_pos.size:,})', density=True)
 
         ax_h.set_yscale('log')
-        ax_h.set_xlabel('Pixel intensity', fontsize=9)
-        ax_h.set_ylabel('Density (log)', fontsize=9)
-        ax_h.set_title('Intensity distribution\nRaw vs Cleaned', fontsize=10)
-        ax_h.legend(fontsize=8)
-        ax_h.tick_params(labelsize=8)
+        ax_h.set_xlabel('Pixel intensity', fontsize=10)
+        ax_h.set_ylabel('Density (log)', fontsize=10)
+        ax_h.set_title('Intensity distribution\nRaw vs Cleaned', fontsize=11)
+        ax_h.legend(fontsize=9)
+        ax_h.tick_params(labelsize=9)
 
         fig.tight_layout(rect=[0, 0, 1, 0.95])
 

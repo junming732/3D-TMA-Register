@@ -129,19 +129,40 @@ def prepare_ck(img_arr):
 
     return norm_lin, norm_log
 
+def get_summed_projection(arr: np.ndarray) -> np.ndarray:
+    """
+    Replicates the exact normalization logic from cropping_cores_rotate.py.
+    Collapses a (C, H, W) array into a single 2D image via summation,
+    and applies an 8-bit normalization capped at the 99th percentile.
+    """
+    combined = np.sum(arr, axis=0, dtype=np.float32)
+    p99 = np.percentile(combined, 99)
+    if p99 < 1: 
+        p99 = combined.max() if combined.max() > 0 else 1.0
+    
+    norm = np.clip((combined / p99) * 255.0, 0, 255).astype(np.uint8)
+    return norm
+
 def build_tissue_mask(ck_log: np.ndarray) -> np.ndarray:
     """
-    Generates a tissue mask matching the exact dual-path segmentation logic 
-    from the cropping pipeline (Safe Mask + Triangle Thresholding).
-    
-    Args:
-        ck_log (np.ndarray): Input uint8 array (log-normalized CK channel).
-        
-    Returns:
-        np.ndarray: Binary mask (0 and 255) of the same shape.
+    Generates a high-fidelity binary tissue mask.
+    Includes transient downsampling to match the low-resolution 
+    spatial scale of the original cropping pipeline kernels.
     """
-    img = ck_log.astype(np.uint8)
+    orig_h, orig_w = ck_log.shape
     
+    # --- FIX: Transient Downsampling ---
+    # Scale down to a max dimension of ~512 to mimic the low-res pyramidal layer
+    # This ensures the 71x71 and 15x15 kernels cover the correct physical area.
+    TARGET_MAX_DIM = 512.0
+    scale = TARGET_MAX_DIM / max(orig_h, orig_w)
+    
+    if scale < 1.0:
+        new_w, new_h = int(orig_w * scale), int(orig_h * scale)
+        img = cv2.resize(ck_log.astype(np.uint8), (new_w, new_h), interpolation=cv2.INTER_AREA)
+    else:
+        img = ck_log.astype(np.uint8)
+
     # 1. Generate "Safe Mask" (Background Removal)
     kernel_bg = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (71, 71))
     bg_est = cv2.morphologyEx(img, cv2.MORPH_OPEN, kernel_bg)
@@ -151,7 +172,7 @@ def build_tissue_mask(ck_log: np.ndarray) -> np.ndarray:
     kernel_safe = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (21, 21))
     safe_mask = cv2.morphologyEx(rough_mask, cv2.MORPH_DILATE, kernel_safe)
     
-    # 2. Contrast Enhancement (Linear Stretch equivalent inline)
+    # 2. Contrast Enhancement (Linear Stretch inline)
     nonzero = img[img > 0]
     if len(nonzero) > 0:
         p_min, p_max = np.percentile(nonzero, (0.5, 99.5))
@@ -171,8 +192,15 @@ def build_tissue_mask(ck_log: np.ndarray) -> np.ndarray:
     OPEN_KERNEL = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
     
     closed = cv2.morphologyEx(binary_masked, cv2.MORPH_CLOSE, CLOSE_KERNEL, iterations=2)
-    final_mask = cv2.morphologyEx(closed, cv2.MORPH_OPEN, OPEN_KERNEL, iterations=2)
+    final_mask_lr = cv2.morphologyEx(closed, cv2.MORPH_OPEN, OPEN_KERNEL, iterations=2)
     
+    # --- RESTORE: Upsample back to High Resolution ---
+    if scale < 1.0:
+        # Use NEAREST interpolation to maintain strict binary (0 or 255) values
+        final_mask = cv2.resize(final_mask_lr, (orig_w, orig_h), interpolation=cv2.INTER_NEAREST)
+    else:
+        final_mask = final_mask_lr
+        
     return final_mask
 
 def measure_ncc(fixed_f32, moving_f32, mask_uint8):
@@ -362,51 +390,56 @@ def create_faded_bg(img_float, mask):
 # FIGURE 1 — Preprocessing comparison (raw | log-normalised | tissue-masked)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def fig1_preprocessing_comparison(out_path, f_ck_raw, f_lin, f_log, mask_f):
+def fig1_preprocessing_comparison(out_path, f_ck_raw, f_lin, f_log, mask_f, core_name=None, fixed_id=None):
     """
-    4-panel comparison of the fixed CK channel at each preprocessing stage:
-      (a) Raw fluorescence (uint16 percentile-clipped)
-      (b) Log-normalised   → used by AKAZE, tissue masking, NCC
-      (c) Linear-normalised → fed directly to RoMaV2 (no log transform)
-      (d) Tissue mask boundary overlaid on log image (contour only — pixels never modified)
+    4-panel comparison of the fixed CK channel at each preprocessing stage.
+    Fonts scaled up for legibility when reduced to \textwidth in LaTeX.
     """
-    fig, axes = plt.subplots(1, 4, figsize=(20, 5), dpi=DPI)
-    fig.suptitle('CK Channel — Preprocessing Stages (Fixed Slice)',
-                 fontsize=14, fontweight='bold', y=1.02)
+    fig, axes = plt.subplots(1, 4, figsize=(24, 6), dpi=DPI, constrained_layout=True)
+    
+    title_text = 'CK Channel — Preprocessing Stages'
+    if core_name is not None and fixed_id is not None:
+        title_text += f' {core_name}   |   Slice: {fixed_id}'
+        
+    # Scale 1: Suptitle increased to 28, y-offset adjusted
+    fig.suptitle(title_text, fontsize=28, fontweight='bold', y=1.08)
+
+    # Scale 2: Subplot titles increased to 20
+    TITLE_FS = 20
 
     # (a) Raw
     raw_float = f_ck_raw.astype(np.float32)
     p_hi_raw  = np.percentile(raw_float, 99.9)
     raw_disp  = np.clip(raw_float / (p_hi_raw if p_hi_raw > 0 else 1.0), 0.0, 1.0)
     axes[0].imshow(raw_disp, cmap='gray', vmin=0, vmax=1)
-    axes[0].set_title('(a) Raw fluorescence\n(uint16, percentile-clipped for display)',
-                      fontsize=10, pad=10)
+    axes[0].set_title('(a) Raw fluorescence\n(uint16, percentile-clipped\nfor display)',
+                      fontsize=TITLE_FS, pad=16)
 
-    # (b) Log-normalised — input to AKAZE, tissue mask, NCC
+    # (b) Log-normalised
     log_disp = f_log.astype(np.float32) / 255.0
     axes[1].imshow(log_disp, cmap='gray', vmin=0, vmax=1)
-    axes[1].set_title('(b) Log-normalised\n(→ AKAZE · tissue mask · NCC)',
-                      fontsize=10, pad=10)
+    axes[1].set_title('(b) Log-normalised\n(→ AKAZE · tissue mask\n· NCC)',
+                      fontsize=TITLE_FS, pad=16)
 
-    # (c) Linear-normalised — what RoMaV2 actually receives
+    # (c) Linear-normalised
     lin_disp = f_lin.astype(np.float32) / 255.0
     axes[2].imshow(lin_disp, cmap='gray', vmin=0, vmax=1)
-    axes[2].set_title('(c) Linear-normalised\n(→ RoMaV2 dense matching input)',
-                      fontsize=10, pad=10)
+    axes[2].set_title('(c) Linear-normalised\n(→ RoMaV2 dense\nmatching input)',
+                      fontsize=TITLE_FS, pad=16)
 
-    # (d) Tissue mask boundary — contour only, pixels never modified in pipeline
+    # (d) Tissue mask boundary
     axes[3].imshow(log_disp, cmap='gray', vmin=0, vmax=1)
     contours, _ = cv2.findContours(mask_f, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     for cnt in contours:
         pts = cnt[:, 0, :]
-        axes[3].plot(pts[:, 0], pts[:, 1], color='#00AEEF', lw=1.2, alpha=0.9)
-    axes[3].set_title('(d) Tissue mask boundary\n(cyan contour — pixels unchanged in pipeline)',
-                      fontsize=10, pad=10)
+        # Scale 3: Line width increased to 2.5 for downscaling survival
+        axes[3].plot(pts[:, 0], pts[:, 1], color='#00AEEF', lw=5.0, alpha=0.9)
+    axes[3].set_title('(d) Tissue mask boundary\n(cyan contour — pixels\nunchanged in pipeline)',
+                      fontsize=TITLE_FS, pad=16)
 
     for ax in axes:
         ax.axis('off')
 
-    fig.tight_layout()
     fig.savefig(out_path, bbox_inches='tight')
     plt.close(fig)
 
@@ -418,9 +451,9 @@ def fig2_affine_stages(out_path, w, h, f_norm, m_raw_norm,
                         m_aff_norm, f_lin_norm, m_lin_aff_norm,
                         mask_f, mask_m, mask_m_aff,
                         kp1, kp2, good, inlier_mask):
-    fig, axes = plt.subplots(1, 5, figsize=(20, 4.0), dpi=DPI)
+    fig, axes = plt.subplots(1, 5, figsize=(40, 4.0), dpi=DPI)
     fig.suptitle('Stage 1 — AKAZE + RANSAC Affine Alignment',
-                 fontsize=14, fontweight='bold', y=1.01)
+                 fontsize=32, fontweight='bold', y=1.01)
 
     for ax in axes:
         ax.set_xlim(0, w); ax.set_ylim(h, 0); ax.axis('off')
@@ -429,7 +462,7 @@ def fig2_affine_stages(out_path, w, h, f_norm, m_raw_norm,
     axes[0].imshow(create_cyan_magenta_overlay(f_norm, m_raw_norm, mask_f, mask_m),
                    extent=[0, w, h, 0])
     axes[0].set_title("(a) Raw pair (log-normalised)\nCyan=Fixed, Magenta=Moving",
-                      fontsize=10, pad=10)
+                      fontsize=32, pad=10)
 
     # (b) AKAZE keypoints on log image (AKAZE runs on log)
     axes[1].imshow(create_single_tint(f_norm, mask_f, 'cyan'),
@@ -444,7 +477,7 @@ def fig2_affine_stages(out_path, w, h, f_norm, m_raw_norm,
             axes[1].plot(pts_tissue[:, 0], pts_tissue[:, 1],
                          '.', ms=3, color='#004488', alpha=0.6)
     axes[1].set_title("(b) AKAZE keypoints\n(detected on log image, tissue-masked)",
-                      fontsize=10, pad=10)
+                      fontsize=32, pad=10)
 
     # (c) RANSAC inlier matches
     axes[2].set_xlim(0, w*2.2)
@@ -461,19 +494,19 @@ def fig2_affine_stages(out_path, w, h, f_norm, m_raw_norm,
             p2 = kp2[m.trainIdx].pt
             axes[2].plot([p1[0], p2[0] + w*1.2], [p1[1], p2[1]],
                          color=C_AFFINE, lw=0.4, alpha=0.7)
-    axes[2].set_title("(c) RANSAC inlier\nmatches", fontsize=10, pad=10)
+    axes[2].set_title("(c) RANSAC inlier\nmatches", fontsize=32, pad=10)
 
     # (d) After affine — log overlay (log used for NCC and visual QC)
     axes[3].imshow(create_cyan_magenta_overlay(f_norm, m_aff_norm, mask_f, mask_m_aff),
                    extent=[0, w, h, 0])
     axes[3].set_title("(d) After affine (log-normalised)\nDeep Blue = Perfect Overlap",
-                      fontsize=10, pad=10)
+                      fontsize=32, pad=10)
 
     # (e) Affine-aligned linear pair — what is handed off to RoMaV2
     axes[4].imshow(create_cyan_magenta_overlay(f_lin_norm, m_lin_aff_norm, mask_f, mask_m_aff),
                    extent=[0, w, h, 0])
     axes[4].set_title("(e) Handoff to RoMaV2 (linear-normalised)\nwhat Stage 2 actually receives",
-                      fontsize=10, pad=10)
+                      fontsize=32, pad=10)
 
     fig.tight_layout()
     fig.savefig(out_path, bbox_inches='tight')
@@ -492,9 +525,9 @@ def fig3_romav2_grid(out_path, w, h, f_lin_norm, m_lin_aff_norm, f_norm, m_warp_
       (c) Displacement magnitude — derived from warp_AB tensor
       (d) Output — log overlay after applying the dense warp (for visual QC)
     """
-    fig, axes = plt.subplots(1, 4, figsize=(16, 5), dpi=DPI)
+    fig, axes = plt.subplots(1, 4, figsize=(40, 5), dpi=DPI)
     fig.suptitle('Stage 2 — RoMaV2 Dense Warp: Inputs & Outputs',
-                 fontsize=14, fontweight='bold', y=1.02)
+                 fontsize=32, fontweight='bold', y=1.02)
 
     for ax in axes:
         ax.set_xlim(0, w); ax.set_ylim(h, 0); ax.axis('off')
@@ -504,7 +537,7 @@ def fig3_romav2_grid(out_path, w, h, f_lin_norm, m_lin_aff_norm, f_norm, m_warp_
     # (a) Linear input — exactly what RoMaV2 receives
     axes[0].imshow(create_cyan_magenta_overlay(f_lin_norm, m_lin_aff_norm, mask_f, mask_m_aff),
                    extent=[0, w, h, 0])
-    axes[0].set_title('(a) RoMaV2 input (linear-normalised)\nwhat the model actually sees', fontsize=10, pad=8)
+    axes[0].set_title('(a) RoMaV2 input (linear-normalised)\nwhat the model actually sees', fontsize=32, pad=8)
 
     # (b) Confidence — overlap_AB, one of two tensors RoMaV2 returns
     axes[1].imshow(bg_faded, extent=[0, w, h, 0])
@@ -513,7 +546,7 @@ def fig3_romav2_grid(out_path, w, h, f_lin_norm, m_lin_aff_norm, f_norm, m_warp_
                               cmap='RdYlGn', vmin=0, vmax=1, alpha=0.85)
     plt.colorbar(im_conf, ax=axes[1], fraction=0.046, pad=0.04, label='overlap score')
     axes[1].set_title('(b) Match confidence (overlap_AB)\ngreen = certain, red = uncertain',
-                      fontsize=10, pad=8)
+                      fontsize=32, pad=8)
 
     # (c) Displacement magnitude — derived from warp_AB, the other RoMaV2 tensor
     axes[2].imshow(bg_faded, extent=[0, w, h, 0])
@@ -526,12 +559,12 @@ def fig3_romav2_grid(out_path, w, h, f_lin_norm, m_lin_aff_norm, f_norm, m_warp_
                              cmap='YlOrRd', vmin=0, vmax=vmax_val, alpha=0.85)
     plt.colorbar(im_mag, ax=axes[2], fraction=0.046, pad=0.04, label='pixels displaced')
     axes[2].set_title('(c) Displacement magnitude (from warp_AB)\npx of residual correction per location',
-                      fontsize=10, pad=8)
+                      fontsize=32, pad=8)
 
     # (d) Output
     axes[3].imshow(create_cyan_magenta_overlay(f_norm, m_warp_norm, mask_f, mask_m_warp),
                    extent=[0, w, h, 0])
-    axes[3].set_title('(d) RoMaV2 output\n(affine + dense warp applied)', fontsize=10, pad=8)
+    axes[3].set_title('(d) RoMaV2 output\n(affine + dense warp applied)', fontsize=32, pad=8)
 
     fig.tight_layout()
     fig.savefig(out_path, bbox_inches='tight')
@@ -553,10 +586,10 @@ def fig4_warp_field_anatomy(out_path, w, h,
       (b) RoMaV2 input:  Linear affine-aligned pair
       (c) After warp:    Linear warped pair
     """
-    fig, axes = plt.subplots(1, 3, figsize=(15, 5), dpi=DPI)
+    fig, axes = plt.subplots(1, 3, figsize=(40, 5), dpi=DPI)
     fig.suptitle('Registration Progression — Raw vs Affine vs Dense Warp\n'
                  '(all panels: linear-normalised, same image space)',
-                 fontsize=13, fontweight='bold', y=1.03)
+                 fontsize=32, fontweight='bold', y=1.03)
  
     for ax in axes:
         ax.set_xlim(0, w); ax.set_ylim(h, 0); ax.axis('off')
@@ -568,7 +601,7 @@ def fig4_warp_field_anatomy(out_path, w, h,
     )
     axes[0].set_title('(a) Raw Input (Unaligned)\n'
                       'Cyan=Fixed, Magenta=Moving',
-                      fontsize=11, pad=10)
+                      fontsize=32, pad=10)
 
     # (b) Input to RoMaV2 — Linear affine-aligned
     axes[1].imshow(
@@ -577,7 +610,7 @@ def fig4_warp_field_anatomy(out_path, w, h,
     )
     axes[1].set_title('(b) After Affine Alignment (RoMaV2 Input)\n'
                       'Cyan=Fixed, Magenta=Moving',
-                      fontsize=11, pad=10)
+                      fontsize=32, pad=10)
  
     # (c) Output of RoMaV2 — Linear warped
     axes[2].imshow(
@@ -586,7 +619,7 @@ def fig4_warp_field_anatomy(out_path, w, h,
     )
     axes[2].set_title('(c) After Dense Warp (RoMaV2 Output)\n'
                       'Cyan=Fixed, Magenta=Moving',
-                      fontsize=11, pad=10)
+                      fontsize=32, pad=10)
  
     plt.tight_layout()
     plt.savefig(out_path, bbox_inches='tight')
@@ -610,7 +643,7 @@ def fig5_fixed_all_channels(out_path, f_arr, channel_names, core_name=None, fixe
     title_lines = ['Multiplexed Channels — Fixed Image Reference']
     if core_name is not None:
         title_lines.append(f'Core: {core_name}   |   Slice: {fixed_id}')
-    fig.suptitle('\n'.join(title_lines), fontsize=16, fontweight='bold', y=1.02)
+    fig.suptitle('\n'.join(title_lines), fontsize=32, fontweight='bold', y=1.02)
 
     if num_channels == 1:
         axes = [axes]
@@ -652,7 +685,7 @@ def fig5_fixed_all_channels(out_path, f_arr, channel_names, core_name=None, fixe
 
             axes[i].imshow(rgb)
             name = channel_names[i] if i < len(channel_names) else f"Channel {i}"
-            axes[i].set_title(f"[{i}] {name}", fontsize=12, fontweight='bold')
+            axes[i].set_title(f"[{i}] {name}", fontsize=32, fontweight='bold')
         
         # Hide axes for all panels (including empty ones if the grid is larger than num_channels)
         axes[i].axis('off')
@@ -701,8 +734,13 @@ def main():
 
     f_lin, f_log = prepare_ck(f_ck)                        # lin → RoMaV2, log → AKAZE/NCC/mask
     m_lin, m_log = prepare_ck(m_ck)
-    mask_f  = build_tissue_mask(f_log)
-    mask_m  = build_tissue_mask(m_log)
+    
+    # --- NEW: Generate Summed Projection strictly for Tissue Masking ---
+    f_summed = get_summed_projection(f_arr)
+    m_summed = get_summed_projection(m_arr)
+    
+    mask_f  = build_tissue_mask(f_summed)
+    mask_m  = build_tissue_mask(m_summed)
 
     # Log-normalised (AKAZE, NCC, visual QC)
     f_norm      = norm01(f_log.astype(np.float32), mask_f)
@@ -756,7 +794,8 @@ def main():
 
     fig1_preprocessing_comparison(
         os.path.join(OUT_DIR, f"fig1_preprocessing_{base}.png"),
-        f_ck_raw, f_lin, f_log, mask_f
+        f_ck_raw, f_lin, f_log, mask_f,
+        core_name=args.core_name, fixed_id=args.fixed_id
     )
     print(" -> fig1_preprocessing_comparison saved.")
 

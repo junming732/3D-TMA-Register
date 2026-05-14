@@ -20,20 +20,49 @@ VENV_PATH="/home/junming/3D-TMA-Register/venv_312"
 # Channels to analyse. CD31 isolated for future testing.
 CELLPOSE_CHANNELS="DAPI"
 
+# =============================================================================
+# ARGUMENT GUIDE — what each flag controls and why they do NOT conflict
+# =============================================================================
+# These filters act at DIFFERENT stages of the pipeline:
+#
+#  Stage 1 — LINK ACCEPTANCE (per adjacent-slice pair):
+#    --min_overlap         : raw pixel count gate.  First rough filter.
+#    --min_overlap_frac    : overlap / smaller_area. Normalises for size diff.
+#    --min_iou             : overlap / union.  Stricter; penalises area mismatch.
+#    --min_intensity_frac  : mean DAPI of each slice >= fraction of cell peak.
+#                            Catches dark/empty mid-stack CellPose masks.
+#    -> These work TOGETHER. A link must pass ALL active thresholds.
+#       They are complementary, not contradictory.
+#
+#  Stage 2 — COMPONENT PRUNING (after graph is built):
+#    --max_slices          : severs weakest edge if z_max - z_min + 1 > limit.
+#                            Controls Z-SPAN (height of the 3D cell).
+#    --max_segments_per_z  : rejects cells with >N masks on a single Z-slice.
+#                            Catches CellPose over-segmentation (the "8-panel
+#                            but span=3" bug shown in cell_105412).
+#    -> These work on the component AFTER all links are accepted.
+#
+#  Stage 3 — OUTPUT FILTERING (keep / discard whole 3D cells):
+#    --min_slices          : minimum z_span to keep a cell (removes singletons).
+#    --min_area_px         : minimum peak 2D area.
+#    --min_confirmed       : minimum z_span to count as "confirmed" in QC.
+# =============================================================================
+
 # Global 3D analysis flags
 MIN_SLICES=1
 MIN_VOLUME=10
 MIN_CONFIRMED=2
+MIN_IOU=0.15
+MIN_INTENSITY_FRAC=0.3
 
 # Co-localisation: second channel to compare against, or leave empty to skip
 COLOC_CHANNEL=""
 COLOC_RADIUS_UM=50
-CH_MIN_OVERLAP_FRAC=0.10   # cuts the near-zero spike
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
-ANALYSIS_SCRIPT="${PROJECT_ROOT}/registration/analyse_3d_cells.py"
+ANALYSIS_SCRIPT="${PROJECT_ROOT}/registration/link_3d_cells.py"
 
 LOG_ROOT="${PROJECT_ROOT}/log/full_pipeline"
 LOG_3D="${LOG_ROOT}/3d_analysis"
@@ -142,7 +171,8 @@ for i in $(seq $START $END); do
             --min_overlap ${CH_MIN_OVERLAP} \
             --min_confirmed ${MIN_CONFIRMED} \
             --coloc_radius_um ${COLOC_RADIUS_UM} \
-            --min_overlap_frac ${CH_MIN_OVERLAP_FRAC} \
+            --min_iou ${MIN_IOU} \
+            --min_intensity_frac ${MIN_INTENSITY_FRAC} \
             ${COLOC_FLAG} \
             > "${LOG_3D}/${CORE_NAME}_${CH}.log" 2>&1
             

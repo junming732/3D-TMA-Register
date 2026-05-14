@@ -191,6 +191,48 @@ if not os.path.exists(INPUT_FOLDER):
     sys.exit(1)
 
 os.makedirs(OUTPUT_FOLDER, exist_ok=True)
+# ── Deformation map output ────────────────────────────────────────────────────
+DEFORM_FOLDER = os.path.join(OUTPUT_FOLDER, "deformation_maps")
+os.makedirs(DEFORM_FOLDER, exist_ok=True)
+
+def save_deformation_maps(slice_id, M_affine, map_x, map_y,
+                          akaze_ok, bspline_ok, orig_h, orig_w):
+    """
+    Save the composite deformation for one slice as a compressed .npz.
+    Identical layout to the RoMaV2 pipeline — the same
+    registration_accuracy_landmarks.py script works unchanged for both.
+
+        M_affine   : (2,3) float64  — AKAZE affine (identity if AKAZE failed)
+        map_x      : (H,W) float32  — cv2.remap X source map
+        map_y      : (H,W) float32  — cv2.remap Y source map
+        akaze_ok   : bool
+        bspline_ok : bool
+        orig_h/w   : int
+
+    To warp a point or mask — two steps, same as RoMaV2:
+        Step 1: cv2.warpAffine(src, M_affine, (orig_w, orig_h))
+        Step 2: cv2.remap(result, map_x, map_y, cv2.INTER_LINEAR)
+    """
+    if map_x is None or map_y is None:
+        # B-spline did not run or was reverted — store identity remap
+        grid_x = np.arange(orig_w, dtype=np.float32)[None, :]
+        grid_y = np.arange(orig_h, dtype=np.float32)[:, None]
+        map_x  = np.broadcast_to(grid_x, (orig_h, orig_w)).copy()
+        map_y  = np.broadcast_to(grid_y, (orig_h, orig_w)).copy()
+
+    out_path = os.path.join(DEFORM_FOLDER, f"{TARGET_CORE}_{slice_id}_deformation.npz")
+    np.savez_compressed(
+        out_path,
+        M_affine   = M_affine.astype(np.float64),
+        map_x      = map_x.astype(np.float32),
+        map_y      = map_y.astype(np.float32),
+        akaze_ok   = np.bool_(akaze_ok),
+        bspline_ok = np.bool_(bspline_ok),
+        orig_h     = np.int32(orig_h),
+        orig_w     = np.int32(orig_w),
+    )
+    logger.info(f"[{slice_id}] Deformation map saved → {out_path}")
+    return out_path
 
 
 # --- SLICE FILTER ---
@@ -549,7 +591,7 @@ def apply_bspline_l1(
                 mask_patch=mask_f32,
             )
             if not ok:
-                return None, 0.0, False, []
+                return None, 0.0, False, [], None, None
             tile_stats = []
             # ncc_value from _run_bspline_on_patch is already whole-image — no fix needed
         else:
@@ -643,7 +685,7 @@ def apply_bspline_l1(
 
             if n_failed == rows * cols:
                 logger.warning(f"[{slice_id}] All grid tiles failed — skipping elastic layer.")
-                return None, 0.0, False, []
+                return None, 0.0, False, [], None, None
 
             eps       = 1e-9
             disp_np   = disp_acc / (weight_acc[..., np.newaxis] + eps)
@@ -682,11 +724,11 @@ def apply_bspline_l1(
             mask_f32,
         )
         logger.info(f"[{slice_id}] B-spline elastic refinement complete (whole-image NCC={ncc_value:.6f}).")
-        return aligned_vol, ncc_value, True, tile_stats
+        return aligned_vol, ncc_value, True, tile_stats, map_x, map_y
 
     except Exception as exc:
         logger.warning(f"[{slice_id}] B-spline elastic failed ({exc}) — skipping elastic layer.")
-        return None, 0.0, False, []
+        return None, 0.0, False, [], None, None
 
 # --- MAIN REGISTRATION PIPELINE ---
 def register_slice(fixed_np, moving_np, slice_id=None):
@@ -746,6 +788,8 @@ def register_slice(fixed_np, moving_np, slice_id=None):
     ncc_value     = 0.0
     ncc_affine    = 0.0   # NCC of affine-prealigned images (baseline for acceptance)
     tile_stats    = []
+    bspline_map_x = None
+    bspline_map_y = None
     if akaze_ok:
         moving_log_affine = cv2.warpAffine(
             moving_log, M_affine, (w, h),
@@ -792,7 +836,7 @@ def register_slice(fixed_np, moving_np, slice_id=None):
                 ncc_affine        = ncc_raw   # B-spline acceptance is now vs raw NCC
                 aligned_np        = moving_affine_vol.astype(np.uint16)
             else:
-                aligned_np, ncc_value, elastic_ok, tile_stats = apply_bspline_l1(
+                aligned_np, ncc_value, elastic_ok, tile_stats, bspline_map_x, bspline_map_y = apply_bspline_l1(
                     fixed_log, moving_log_affine, moving_affine_vol, sid,
                     tissue_mask=tissue_mask,
                 )
@@ -873,7 +917,7 @@ def register_slice(fixed_np, moving_np, slice_id=None):
     # affine_np: the affine-only result (before B-spline), always uint16.
     # Used by main() to build the AKAZE-affine montage.
     affine_np = np.clip(moving_affine_vol, 0, 65535).astype(np.uint16)
-    return aligned_np, affine_np, mse, time.time() - start, stats, akaze_ok, M_affine
+    return aligned_np, affine_np, mse, time.time() - start, stats, akaze_ok, M_affine, bspline_map_x, bspline_map_y, h, w
 
 # --- PLOTTING ---
 def _draw_keypoint_marker(canvas, pt, color, radius=10):
@@ -1211,6 +1255,17 @@ def main():
     aligned_vol[center_idx] = center_raw
     affine_vol[center_idx]  = center_raw   # center is its own anchor
     del center_raw
+    center_sid = f"Z{center_idx:03d}_ID{slice_ids[center_idx]:03d}"
+    save_deformation_maps(
+        slice_id   = center_sid,
+        M_affine   = np.eye(2, 3, dtype=np.float64),
+        map_x      = None,
+        map_y      = None,
+        akaze_ok   = False,
+        bspline_ok = False,
+        orig_h     = target_h,
+        orig_w     = target_w,
+    )
     anchor_id               = get_slice_number(file_list[center_idx])
     logger.info(f"Volume anchored at slice index {center_idx} (ID {anchor_id})")
 
@@ -1226,8 +1281,19 @@ def main():
             moving_np = load_slice(i)   # read from disk, discard after use
             sid       = f"Z{i:03d}_ID{real_id:03d}"
 
-            aligned_np, affine_np, mse, runtime, stats, success, M_final = register_slice(
+            aligned_np, affine_np, mse, runtime, stats, success, M_final, bspline_map_x, bspline_map_y, orig_h, orig_w = register_slice(
                 fixed_np, moving_np, slice_id=sid,
+            )
+
+            save_deformation_maps(
+                slice_id   = sid,
+                M_affine   = M_final,
+                map_x      = bspline_map_x if stats['bspline_ok'] else None,
+                map_y      = bspline_map_y if stats['bspline_ok'] else None,
+                akaze_ok   = success,
+                bspline_ok = stats['bspline_ok'],
+                orig_h     = orig_h,
+                orig_w     = orig_w,
             )
 
             if success and transform_is_sane(M_final):

@@ -1,5 +1,5 @@
 """
-analyse_3d_cells.py
+link_3d_cells.py
 ===================
 Link CellPose segmentation masks across registered Z-slices to identify
 cells that span multiple sections using overlap-based 3D linking.
@@ -24,7 +24,7 @@ Approach
 
 Usage
 -----
-    python analyse_3d_cells.py \
+    python link_3d_cells.py \
         --core_name   Core_01   \
         --channel     DAPI      \
         [--min_overlap      30] \
@@ -61,37 +61,45 @@ logger = logging.getLogger(__name__)
 parser = argparse.ArgumentParser(
     description='Overlap-based 3D cell linking across registered CellPose masks.'
 )
-parser.add_argument('--core_name',       type=str,   required=True)
-parser.add_argument('--channel',         type=str,   default='DAPI',
+parser.add_argument('--core_name',          type=str,   required=True)
+parser.add_argument('--channel',            type=str,   default='DAPI',
                     help='Channel label used in mask filenames (default: DAPI)')
-parser.add_argument('--min_overlap',     type=int,   default=10,
+parser.add_argument('--min_overlap',        type=int,   default=10,
                     help='Min shared pixels for two 2D cells to be linked across Z.')
-parser.add_argument('--min_slices',      type=int,   default=1,
+parser.add_argument('--min_slices',         type=int,   default=1,
                     help='Min Z-slices a 3D cell must span to be kept (default: 1).')
-parser.add_argument('--max_slices',      type=int,   default=5,
+parser.add_argument('--max_slices',         type=int,   default=5,
                     help='Max Z-slices a 3D cell may span (default: 5).')
-parser.add_argument('--min_area_px',     type=int,   default=10,
+parser.add_argument('--min_area_px',        type=int,   default=10,
                     help='Min pixel area of a 2D cell to include in linking (default: 10).')
-parser.add_argument('--min_confirmed',   type=int,   default=2,
+parser.add_argument('--min_confirmed',      type=int,   default=2,
                     help='Min Z-span to count as a confirmed multi-slice cell (default: 2).')
-parser.add_argument('--coloc_channel',   type=str,   default=None,
+parser.add_argument('--coloc_channel',      type=str,   default=None,
                     help='Second channel for co-localisation e.g. CD163.')
-parser.add_argument('--coloc_radius_um', type=float, default=50.0,
+parser.add_argument('--coloc_radius_um',    type=float, default=50.0,
                     help='Max distance (um) to count as co-localised (default: 50).')
-parser.add_argument('--min_overlap_frac', type=float, default=0.0,
-                    help='Min overlap fraction (shared px / smaller area) to accept a link (default: 0.0).')
-# QC flags
-parser.add_argument('--plot_qc',         action='store_true',
+parser.add_argument('--min_iou',            type=float, default=0.0,
+                    help='Min IoU to accept a link between adjacent slices (default: 0.0).')
+parser.add_argument('--min_intensity_frac', type=float, default=0.0,
+                    help='Min mean DAPI intensity as fraction of per-cell peak to accept a link. '
+                         'Requires denoised OME-TIFF. (default: 0.0 = off)')
+parser.add_argument('--plot_qc',            action='store_true',
                     help='Save all QC plots and visual tile montages.')
-parser.add_argument('--n_tile_samples',  type=int,   default=50,
-                    help='Number of 3D cells to render as visual tile montages (default: 50).')
-parser.add_argument('--patch_size_px',   type=int,   default=80,
-                    help='Half-size of patch around each nucleus centroid in tiles (default: 80).')
-parser.add_argument('--flag_drift_px',   type=float, default=30.0,
-                    help='Centroid drift (px) above which a link is flagged (default: 30).')
-parser.add_argument('--flag_area_ratio', type=float, default=3.0,
-                    help='Area ratio above which a slice pair is flagged (default: 3.0).')
 args = parser.parse_args()
+
+# -----------------------------------------------------------------------------
+# INTERNAL CONSTANTS — not arguments because they are not tunable per-channel;
+# they are either biological facts or fixed QC display settings.
+# -----------------------------------------------------------------------------
+# A clean single-nucleus chain must contribute exactly 1 mask per Z-slice.
+# More than 1 means CellPose over-segmented that section → always reject.
+MAX_SEGMENTS_PER_Z = 1
+
+# QC display constants — thresholds used only for flagging/plotting, not filtering.
+FLAG_DRIFT_PX   = 30.0   # centroid drift above which a link is flagged in QC
+FLAG_AREA_RATIO = 3.0    # area ratio above which a link is flagged in QC
+N_TILE_SAMPLES  = 50     # number of 3D cells rendered as tile montages
+PATCH_SIZE_PX   = 80     # half-size of patch around each centroid in tiles
 
 PIXEL_SIZE_XY_UM     = 0.4961
 SECTION_THICKNESS_UM = 4.5
@@ -271,6 +279,65 @@ for z, mask in enumerate(masks_2d):
             cell_centroids[(z, cid)] = (sum_y[cid] / counts[cid],
                                         sum_x[cid] / counts[cid])
 
+# -----------------------------------------------------------------------------
+# EARLY LOAD OF DENOISED VOLUME (needed for intensity-gated linking)
+# Also used later in QC tile montages — loaded once here, reused there.
+# -----------------------------------------------------------------------------
+DENOISED_VOL_PATH = os.path.join(
+    config.DATASPACE, 'Denoised', TARGET_CORE,
+    f'{TARGET_CORE}_denoised.ome.tif',
+)
+dapi_vol_early = None   # memmap view (n_slices, H, W) — slices read on demand
+if args.min_intensity_frac > 0.0:
+    if os.path.exists(DENOISED_VOL_PATH):
+        try:
+            _raw = tifffile.memmap(DENOISED_VOL_PATH, mode='r')
+            _raw = np.squeeze(_raw)
+            if _raw.ndim == 4:
+                # (Z, C, Y, X) — keep as memmap view; slice into channel 0 per Z on demand
+                dapi_vol_early = _raw[:, 0, :, :]   # still memmap, no copy
+            elif _raw.ndim == 3:
+                dapi_vol_early = _raw               # (Z, Y, X), still memmap
+            else:
+                logger.warning(f"Denoised volume unexpected shape {_raw.shape}; intensity gating disabled.")
+            if dapi_vol_early is not None:
+                logger.info(f"Denoised DAPI mmap ready for intensity-gated linking: shape={dapi_vol_early.shape}")
+        except Exception as _e:
+            logger.warning(f"Could not load denoised volume for intensity gating: {_e}. Gating disabled.")
+    else:
+        logger.warning(
+            f"--min_intensity_frac set but denoised OME-TIFF not found at {DENOISED_VOL_PATH}. "
+            f"Intensity gating disabled."
+        )
+
+# Per-cell mean DAPI intensity (z, cid) -> float.
+# Computed only when intensity gating is requested AND volume is available.
+# Fast path: uses scipy.ndimage.mean which iterates the image only ONCE per
+# slice (O(H*W)) instead of once per cell (O(H*W*n_cells)).
+# The memmap is read one slice at a time so we never load the full volume
+# into RAM — critical for large TMA OME-TIFFs (19+ slices, full-core FOV).
+cell_mean_intensity: dict = {}
+if dapi_vol_early is not None and args.min_intensity_frac > 0.0:
+    logger.info("Computing per-cell mean DAPI intensity for intensity-gated linking...")
+    for z, mask in enumerate(masks_2d):
+        if z >= dapi_vol_early.shape[0]:
+            continue
+        # One-pass bincount approach: O(H*W) per slice regardless of cell count.
+        # sum_intensity[cid] = sum of pixel values inside cell cid
+        # count[cid]         = number of pixels (= area, already in cell_areas)
+        img_slice  = np.array(dapi_vol_early[z], dtype=np.float64)
+        flat_mask  = mask.ravel()
+        flat_img   = img_slice.ravel()
+        max_id     = int(flat_mask.max()) if flat_mask.max() > 0 else 0
+        if max_id == 0:
+            continue
+        sum_intens = np.bincount(flat_mask, weights=flat_img,  minlength=max_id + 1)
+        pix_count  = np.bincount(flat_mask,                    minlength=max_id + 1)
+        for cid in range(1, max_id + 1):
+            if pix_count[cid] > 0:
+                cell_mean_intensity[(z, cid)] = float(sum_intens[cid] / pix_count[cid])
+        logger.info(f"  Intensity Z{z} ({slice_ids[z]}): {int((pix_count[1:] > 0).sum())} cells")
+
 logger.info("Finding overlapping cell pairs between adjacent slices...")
 
 for z in range(n_slices - 1):
@@ -293,11 +360,39 @@ for z in range(n_slices - 1):
             continue
         cid_a = int(pair >> 32)
         cid_b = int(pair & 0xFFFFFFFF)
-        area_a = cell_areas.get((z, cid_a), 1)
+        area_a = cell_areas.get((z,     cid_a), 1)
         area_b = cell_areas.get((z + 1, cid_b), 1)
-        frac   = count / min(area_a, area_b)
-        if frac < args.min_overlap_frac:
-            continue
+
+        # ── Filter 1: IoU (Intersection over Union / Jaccard index) ───────────
+        # IoU = |A∩B| / |A∪B|.  Penalises large area mismatches between adjacent
+        # slices more robustly than raw overlap or overlap-fraction alone, because
+        # it grows the denominator when either mask is large relative to the overlap.
+        # Reference: Hirling et al. (2025) Commun. Biol. — IoU ≥ 0.5 as standard
+        # link quality threshold in multiplexed-IF nuclear segmentation benchmarks.
+        if args.min_iou > 0.0:
+            union = area_a + area_b - count
+            iou   = count / union if union > 0 else 0.0
+            if iou < args.min_iou:
+                continue
+
+        # ── Filter 2: intensity gate ───────────────────────────────────────────
+        # Reject a link if either nucleus slice has mean DAPI intensity below
+        # min_intensity_frac × the brighter of the two slices.
+        # Prevents dim / empty mid-stack CellPose masks from bridging two separate
+        # nuclei (e.g. cell 86223 Z12 dark slice).
+        # Reference: Mestre et al. Lab. Invest. (2022) — DAPI intensity as
+        # discriminative feature for nucleus classification in serial-section IF.
+        if args.min_intensity_frac > 0.0 and cell_mean_intensity:
+            int_a = cell_mean_intensity.get((z,     cid_a), None)
+            int_b = cell_mean_intensity.get((z + 1, cid_b), None)
+            if int_a is not None and int_b is not None:
+                peak = max(int_a, int_b)
+                if peak > 0:
+                    if (int_a / peak) < args.min_intensity_frac:
+                        continue
+                    if (int_b / peak) < args.min_intensity_frac:
+                        continue
+
         edges_uvw.append(((z, cid_a), (z + 1, cid_b), count))
         n_links += 1
 
@@ -335,6 +430,14 @@ for members in components:
     z_span    = z_max - z_min + 1
 
     if z_span < args.min_slices:
+        continue
+
+    # ── Reject over-segmented components ──────────────────────────────────────
+    # A single nucleus must contribute exactly 1 CellPose mask per Z-slice.
+    # More than 1 on any slice means CellPose split the nucleus → always reject.
+    from collections import Counter
+    z_counts = Counter(m[0] for m in members)
+    if max(z_counts.values()) > MAX_SEGMENTS_PER_Z:
         continue
 
     per_slice_areas = {node: cell_areas.get(node, 0) for node in members}
@@ -611,18 +714,18 @@ if args.plot_qc:
             cy_b, cx_b = cell_centroids.get((z_b, id_b), (0, 0))
             drift = float(np.sqrt((cx_b - cx_a)**2 + (cy_b - cy_a)**2))
             drifts.append(drift)
-            if drift > args.flag_drift_px:
+            if drift > FLAG_DRIFT_PX:
                 flagged_drifts.append((cid3d, z_a, id_a, z_b, id_b, round(drift, 2)))
 
     logger.info(f"  Median centroid drift : {np.median(drifts):.1f} px  "
                 f"({np.median(drifts)*PIXEL_SIZE_XY_UM:.2f} um)")
-    logger.info(f"  High-drift pairs (> {args.flag_drift_px} px) : {len(flagged_drifts)}")
+    logger.info(f"  High-drift pairs (> {FLAG_DRIFT_PX} px) : {len(flagged_drifts)}")
 
     fig, ax = plt.subplots(figsize=(7, 4))
     ax.hist(drifts, bins=50, color='mediumpurple', edgecolor='white', linewidth=0.4)
-    ax.axvline(args.flag_drift_px, color='red', linestyle='--', linewidth=1.2,
-               label=f'Flag threshold ({args.flag_drift_px:.0f} px ≈ '
-                     f'{args.flag_drift_px*PIXEL_SIZE_XY_UM:.1f} µm)')
+    ax.axvline(FLAG_DRIFT_PX, color='red', linestyle='--', linewidth=1.2,
+               label=f'Flag threshold ({FLAG_DRIFT_PX:.0f} px ≈ '
+                     f'{FLAG_DRIFT_PX*PIXEL_SIZE_XY_UM:.1f} µm)')
     ax.set_xlabel('XY centroid drift between consecutive slices (px)', fontsize=10)
     ax.set_ylabel('Number of linked pairs', fontsize=10)
     ax.set_title(
@@ -664,18 +767,18 @@ if args.plot_qc:
                 continue
             ratio = max(area_a, area_b) / min(area_a, area_b)
             area_ratios.append(ratio)
-            if ratio > args.flag_area_ratio:
+            if ratio > FLAG_AREA_RATIO:
                 flagged_area_ratios.append(
                     (cid3d, z_a, id_a, area_a, z_b, id_b, area_b, round(ratio, 2))
                 )
 
     logger.info(f"  Median area ratio : {np.median(area_ratios):.2f}")
-    logger.info(f"  High-ratio pairs (> {args.flag_area_ratio}) : {len(flagged_area_ratios)}")
+    logger.info(f"  High-ratio pairs (> {FLAG_AREA_RATIO}) : {len(flagged_area_ratios)}")
 
     fig, ax = plt.subplots(figsize=(7, 4))
     ax.hist(area_ratios, bins=50, color='darkorange', edgecolor='white', linewidth=0.4)
-    ax.axvline(args.flag_area_ratio, color='red', linestyle='--', linewidth=1.2,
-               label=f'Flag threshold (ratio = {args.flag_area_ratio})')
+    ax.axvline(FLAG_AREA_RATIO, color='red', linestyle='--', linewidth=1.2,
+               label=f'Flag threshold (ratio = {FLAG_AREA_RATIO})')
     ax.set_xlabel('Area ratio between consecutive slices (larger / smaller)', fontsize=10)
     ax.set_ylabel('Number of linked pairs', fontsize=10)
     ax.set_title(
@@ -701,45 +804,13 @@ if args.plot_qc:
     # judge whether the highlighted nucleus is the same cell across Z.
     # Source: denoised OME-TIFF (Z, C, Y, X); DAPI is channel index 0.
     # Falls back silently to binary mask patches if the OME-TIFF is missing.
-    logger.info(f"QC: generating visual tile montages (n={args.n_tile_samples})...")
+    logger.info(f"QC: generating visual tile montages (n={N_TILE_SAMPLES})...")
 
-    PATCH = args.patch_size_px
+    PATCH = PATCH_SIZE_PX
 
-    # -- load denoised volume lazily (memmap avoids reading all of RAM) --------
-    DENOISED_VOL = os.path.join(
-        config.DATASPACE, 'Denoised', TARGET_CORE,
-        f'{TARGET_CORE}_denoised.ome.tif',
-    )
-    dapi_vol = None   # (n_slices, H, W) float32 array or None
-    if os.path.exists(DENOISED_VOL):
-        try:
-            raw = tifffile.memmap(DENOISED_VOL, mode='r')
-            # Expected axes: ZCYX.  Squeeze any length-1 dimensions first.
-            raw = np.squeeze(raw)
-            if raw.ndim == 4:
-                # (Z, C, Y, X) → take channel 0 (DAPI)
-                dapi_vol = raw[:, 0, :, :].astype(np.float32)
-            elif raw.ndim == 3:
-                # Already (Z, Y, X) — single-channel or pre-extracted
-                dapi_vol = raw.astype(np.float32)
-            else:
-                logger.warning(
-                    f"Denoised OME-TIFF has unexpected shape {raw.shape} — "
-                    f"falling back to mask patches."
-                )
-            if dapi_vol is not None:
-                logger.info(
-                    f"  Denoised DAPI volume loaded: shape={dapi_vol.shape}  "
-                    f"(memmap, DAPI channel 0)"
-                )
-        except Exception as e:
-            logger.warning(f"Could not memmap denoised volume: {e} — falling back to mask patches.")
-            dapi_vol = None
-    else:
-        logger.warning(
-            f"Denoised OME-TIFF not found at {DENOISED_VOL} — "
-            f"falling back to binary mask patches."
-        )
+    # -- reuse denoised volume loaded for intensity gating (or load now if not done) --
+    DENOISED_VOL = DENOISED_VOL_PATH
+    dapi_vol = dapi_vol_early   # may be None — falls back to binary mask patches below
 
     def extract_patch(img: np.ndarray, cy: float, cx: float, half: int) -> np.ndarray:
         """Extract a (2*half x 2*half) patch centred on (cy, cx), padding at borders."""
@@ -763,7 +834,7 @@ if args.plot_qc:
         rng_tile   = np.random.default_rng(seed=0)
         sample_ids = rng_tile.choice(
             multi_slice_ids,
-            size=min(args.n_tile_samples, len(multi_slice_ids)),
+            size=min(N_TILE_SAMPLES, len(multi_slice_ids)),
             replace=False,
         )
 
