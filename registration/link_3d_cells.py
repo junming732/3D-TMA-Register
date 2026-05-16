@@ -133,6 +133,18 @@ def build_3d_components(all_nodes, edges_uvw, max_slices):
     thousands of edges.  Components exceeding max_slices are pruned by
     iteratively severing the weakest edge using numpy sub-matrix operations,
     with connected components re-checked via scipy after each cut.
+
+    Performance notes
+    -----------------
+    * eliminate_zeros() is deferred and called in batches every
+      ELIM_BATCH cuts rather than on every single cut, avoiding
+      an O(nnz) scan of the full 500k-node matrix each iteration.
+    * Sub-matrix extraction uses a single fancy-index slice
+      (mat[comp_idx[:, None], comp_idx]) which produces a CSR view
+      in one step, avoiding the intermediate COO allocation of the
+      previous double-slice pattern.
+    * Per-component z_vals are computed with a vectorised numpy
+      take rather than a Python list comprehension.
     """
     import scipy.sparse as sp
     from scipy.sparse.csgraph import connected_components as sp_cc
@@ -146,10 +158,16 @@ def build_3d_components(all_nodes, edges_uvw, max_slices):
     vs = [node_to_idx[v] for u, v, w in edges_uvw]
     ws = [w               for u, v, w in edges_uvw]
 
+    # Use lil_matrix for efficient in-place edge removal, then convert to
+    # CSR for fast sp_cc calls.  The toggle between formats is cheap
+    # relative to the cost of repeated eliminate_zeros on a huge CSR.
     mat = sp.csr_matrix(
         (ws + ws, (us + vs, vs + us)),
         shape=(n, n), dtype=np.int32,
     )
+
+    # Pre-extract node Z-indices as a numpy array for fast vectorised lookup
+    node_z = np.array([node[0] for node in all_nodes], dtype=np.int32)
 
     n_comp, labels = sp_cc(mat, directed=False)
     logger.info(f"  Initial connected components: {n_comp}")
@@ -159,19 +177,25 @@ def build_3d_components(all_nodes, edges_uvw, max_slices):
     for comp_id in range(n_comp):
         pending.append(np.where(labels == comp_id)[0])
 
-    severed_total = 0
+    # Batch eliminate_zeros every N cuts to avoid O(nnz) scan on each iteration
+    ELIM_BATCH   = 500
+    cuts_since_elim = 0
+    severed_total   = 0
+
     while pending:
         comp_idx = pending.pop()
-        z_vals = np.array([all_nodes[i][0] for i in comp_idx])
+
+        # Vectorised z-span check — no Python loop over comp_idx
+        z_vals = node_z[comp_idx]
         z_span = int(z_vals.max() - z_vals.min() + 1)
 
         if z_span <= max_slices:
             valid_components.append({all_nodes[i] for i in comp_idx})
             continue
 
-        # Use sequential slicing to prevent MemoryError on massive subgraphs
-        sub = mat[comp_idx, :][:, comp_idx].tocoo()
-        
+        # Single fancy-index slice (one CSR extraction, no intermediate COO)
+        sub = mat[comp_idx[:, None], comp_idx].tocoo()
+
         if sub.nnz == 0:
             valid_components.append({all_nodes[i] for i in comp_idx})
             continue
@@ -182,32 +206,39 @@ def build_3d_components(all_nodes, edges_uvw, max_slices):
             continue
 
         # --- BATCHED GLOBAL CUT ---
-        # 1. Find the minimum overlap weight in this specific component
+        # 1. Find the minimum overlap weight in this component
         min_weight = sub.data[upper].min()
-        
+
         # 2. Find ALL edges sharing this minimum weight
         cut_mask = sub.data[upper] == min_weight
-        
+
         # 3. Map local sub-matrix coordinates back to global matrix coordinates
-        local_u = sub.row[upper][cut_mask]
-        local_v = sub.col[upper][cut_mask]
-        
+        local_u  = sub.row[upper][cut_mask]
+        local_v  = sub.col[upper][cut_mask]
         global_u = comp_idx[local_u]
         global_v = comp_idx[local_v]
-        
-        # 4. Mutate the global matrix in one fast, batched operation
+
+        # 4. Mutate the global matrix (zero out cut edges)
         mat[global_u, global_v] = 0
         mat[global_v, global_u] = 0
-        mat.eliminate_zeros()
-        
-        severed_total += len(global_u)
 
-        # 5. Re-extract the true severed subgraph and evaluate
-        sub2 = mat[comp_idx, :][:, comp_idx]
+        severed_total   += len(global_u)
+        cuts_since_elim += len(global_u)
+
+        # Defer eliminate_zeros — only pay O(nnz) scan every ELIM_BATCH cuts
+        if cuts_since_elim >= ELIM_BATCH:
+            mat.eliminate_zeros()
+            cuts_since_elim = 0
+
+        # 5. Re-extract the sub-matrix (now with zeroed edges) and re-evaluate
+        sub2 = mat[comp_idx[:, None], comp_idx]
         n_sub, sub_labels = sp_cc(sub2, directed=False)
-        
+
         for sub_id in range(n_sub):
             pending.append(comp_idx[sub_labels == sub_id])
+
+    # Final cleanup of any residual explicit zeros
+    mat.eliminate_zeros()
 
     logger.info(f"  Edges severed during Z-span pruning: {severed_total}")
     logger.info(f"  Final component count: {len(valid_components)}")
@@ -838,19 +869,65 @@ if args.plot_qc:
             replace=False,
         )
 
+        # Build two lookups used during neighbour rendering:
+        #   z_to_multislice_2d : z -> set of 2D IDs belonging to any confirmed
+        #                        multi-slice 3D cell (for fast crop filtering)
+        #   id2d_to_cid3d      : (z, id_2d) -> cid3d  (to map 2D crop hit back
+        #                        to its 3D cell so colours stay consistent)
+        z_to_multislice_2d: dict = defaultdict(set)
+        id2d_to_cid3d:      dict = {}
+        for cid3d_ms in multi_slice_ids:
+            for z_ms, id_2d_ms in cell_members[cid3d_ms]:
+                z_to_multislice_2d[z_ms].add(id_2d_ms)
+                id2d_to_cid3d[(z_ms, id_2d_ms)] = cid3d_ms
+
+        # Visually distinct colours for neighbour pairs (RGBA, alpha=0.7).
+        # Green is reserved for the primary cell; these are used for neighbours.
+        NEIGHBOUR_COLOURS = [
+            [1.0, 0.2, 0.2, 0.7],   # red
+            [1.0, 0.8, 0.0, 0.7],   # yellow
+            [0.6, 0.2, 1.0, 0.7],   # purple
+            [1.0, 0.5, 0.0, 0.7],   # orange
+        ]
+        MAX_NEIGHBOURS = len(NEIGHBOUR_COLOURS)  # show at most 4 pairs
+
         for cid3d in sample_ids:
             members       = cell_members[cid3d]
             n_slices_cell = len(members)
             patches, mask_patches, labels = [], [], []
+            # per-slice list of dicts: {cid3d_neighbour: boundary_patch}
+            neighbour_patches_per_slice = []
 
+            # --- Pass 1: find which neighbour 3D cells are visible in ANY
+            #     slice of this primary cell, then pick up to MAX_NEIGHBOURS
+            #     by the order they are first encountered. ——————————————————
+            neighbour_cids_seen = {}   # cid3d -> colour index, insertion-ordered
+            for z, id_2d in members:
+                cy, cx = cell_centroids.get((z, id_2d), (H // 2, W // 2))
+                y0 = max(0, int(cy) - PATCH);  y1 = min(H, int(cy) + PATCH)
+                x0 = max(0, int(cx) - PATCH);  x1 = min(W, int(cx) + PATCH)
+                mask_crop = masks_2d[z][y0:y1, x0:x1]
+                present_2d = (set(np.unique(mask_crop))
+                              & z_to_multislice_2d.get(z, set()))
+                present_2d.discard(id_2d)
+                present_2d.discard(0)
+                for nb_2d in present_2d:
+                    nb_cid = id2d_to_cid3d.get((z, nb_2d))
+                    if nb_cid is None or nb_cid == cid3d:
+                        continue
+                    if nb_cid not in neighbour_cids_seen:
+                        if len(neighbour_cids_seen) >= MAX_NEIGHBOURS:
+                            break
+                        neighbour_cids_seen[nb_cid] = len(neighbour_cids_seen)
+
+            # --- Pass 2: build patches slice by slice ————————————————————
             for z, id_2d in members:
                 cy, cx = cell_centroids.get((z, id_2d), (H // 2, W // 2))
                 area   = cell_areas.get((z, id_2d), 0)
 
-                # Intensity patch —————————————————————————————————————————————
+                # Intensity patch ————————————————————————————————————————
                 if dapi_vol is not None and z < dapi_vol.shape[0]:
                     raw_patch = extract_patch(dapi_vol[z], cy, cx, PATCH)
-                    # Robust percentile normalisation ignoring background zeros
                     fg = raw_patch[raw_patch > 0]
                     if fg.size > 10:
                         p2, p98 = np.percentile(fg, (2, 98))
@@ -859,24 +936,47 @@ if args.plot_qc:
                         norm = raw_patch / max(raw_patch.max(), 1e-6)
                     source = 'intensity'
                 else:
-                    # Fallback: binary mask as grey patch
                     norm   = extract_patch(
                         (masks_2d[z] == id_2d).astype(np.float32), cy, cx, PATCH
                     )
                     source = 'mask'
 
-                # Mask contour patch (for overlay) ————————————————————————————
-                # Erode the binary mask to get a 1-px ring at the boundary
+                # Primary cell boundary ———————————————————————————————————
                 binary     = (masks_2d[z] == id_2d)
                 from scipy.ndimage import binary_erosion
                 boundary   = binary & ~binary_erosion(binary)
                 mask_patch = extract_patch(boundary.astype(np.float32), cy, cx, PATCH)
 
+                # Neighbour boundary patches (one per selected 3D neighbour) —
+                y0 = max(0, int(cy) - PATCH);  y1 = min(H, int(cy) + PATCH)
+                x0 = max(0, int(cx) - PATCH);  x1 = min(W, int(cx) + PATCH)
+                mask_crop  = masks_2d[z][y0:y1, x0:x1]
+                pad_t = max(0, PATCH - int(cy));  pad_b = max(0, int(cy) + PATCH - H)
+                pad_l = max(0, PATCH - int(cx));  pad_r = max(0, int(cx) + PATCH - W)
+
+                nb_patches_this_slice = {}
+                for nb_cid, col_idx in neighbour_cids_seen.items():
+                    # find the 2D id for this neighbour on this Z (may be absent)
+                    nb_2d = next(
+                        (iid for (zz, iid) in cell_members[nb_cid] if zz == z),
+                        None,
+                    )
+                    if nb_2d is None:
+                        nb_patches_this_slice[nb_cid] = None
+                        continue
+                    nb_bin  = mask_crop == nb_2d
+                    nb_ring = nb_bin & ~binary_erosion(nb_bin)
+                    nb_pad  = np.pad(nb_ring.astype(np.float32),
+                                     ((pad_t, pad_b), (pad_l, pad_r)),
+                                     mode='constant')
+                    nb_patches_this_slice[nb_cid] = nb_pad
+
                 patches.append(norm)
                 mask_patches.append(mask_patch)
+                neighbour_patches_per_slice.append(nb_patches_this_slice)
                 labels.append(f'Z{z} / s{slice_ids[z]}\narea={area}px\n({source})')
 
-            # Pad all patches to the same size ————————————————————————————————
+            # Pad all patches to the same size ————————————————————————————
             target_h = max(p.shape[0] for p in patches)
             target_w = max(p.shape[1] for p in patches)
 
@@ -899,11 +999,20 @@ if args.plot_qc:
                 f'3D cell {cid3d}  |  span={span} slices  |  vol={vol:.0f} µm³',
                 fontsize=9, y=1.02,
             )
-            for ax, patch, mpatch, label in zip(axes, patches, mask_patches, labels):
+            for ax, patch, mpatch, nb_patches_slice, label in zip(
+                    axes, patches, mask_patches, neighbour_patches_per_slice, labels):
                 ax.imshow(patch, cmap='gray', vmin=0, vmax=1, interpolation='nearest')
-                # Overlay mask boundary in green
                 overlay = np.zeros((*patch.shape, 4), dtype=np.float32)
-                overlay[mpatch > 0] = [0.0, 1.0, 0.0, 0.8]   # RGBA green
+                # Draw neighbours first so primary cell green always wins on top
+                for nb_cid, col_idx in neighbour_cids_seen.items():
+                    nb_pad = nb_patches_slice.get(nb_cid)
+                    if nb_pad is None:
+                        continue
+                    nb_pad = pad_to(nb_pad, target_h, target_w)
+                    colour = NEIGHBOUR_COLOURS[col_idx]
+                    overlay[nb_pad > 0] = colour
+                # Primary cell boundary — always green
+                overlay[mpatch > 0] = [0.0, 1.0, 0.0, 0.8]
                 ax.imshow(overlay, interpolation='nearest')
                 ax.set_title(label, fontsize=6)
                 ax.axis('off')

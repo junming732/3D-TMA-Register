@@ -74,10 +74,10 @@ logger = logging.getLogger(__name__)
 # ─── PATHS — mirrors registration script ──────────────────────────────────────
 DATA_BASE_PATH = os.path.join(config.DATASPACE, "TMA_Cores_Grouped_Rotate_Conformed")
 INPUT_FOLDER   = os.path.join(DATA_BASE_PATH, TARGET_CORE)
-WORK_OUTPUT    = os.path.join(config.DATASPACE, "Filter_AKAZE_RoMaV2_Linear_Warp_map")
+WORK_OUTPUT    = os.path.join(config.DATASPACE, "Filter_AKAZE_TissueMask_BSpline")
 OUTPUT_FOLDER  = os.path.join(WORK_OUTPUT, TARGET_CORE)
 DEFORM_FOLDER  = os.path.join(OUTPUT_FOLDER, "deformation_maps")
-VERIFY_OUTPUT  = os.path.join(OUTPUT_FOLDER, "annotation_verification_Romav2")
+VERIFY_OUTPUT  = os.path.join(OUTPUT_FOLDER, "annotation_verification_bspline")
 os.makedirs(VERIFY_OUTPUT, exist_ok=True)
 
 logger.info(f"Core         : {TARGET_CORE}")
@@ -273,7 +273,6 @@ df_summary.to_csv(summary_csv, index=False)
 logger.info(f"Detail CSV  → {detail_csv}")
 logger.info(f"Summary CSV → {summary_csv}")
 
-# ─── PLOTS ────────────────────────────────────────────────────────────────────
 # ─── PLOTS ────────────────────────────────────────────────────────────────────
 from matplotlib.colors import TABLEAU_COLORS
 colour_list   = list(TABLEAU_COLORS.values())

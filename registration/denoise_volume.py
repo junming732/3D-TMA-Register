@@ -657,7 +657,8 @@ def denoise_channel(raw: np.ndarray, cfg: dict, ch_name: str) -> dict:
         dog_mask=dog_mask,
         tophat=tophat_display,
         bg=bg,
-        removed=raw - cleaned
+        removed=raw - cleaned,
+        inpainted=med_inpainted  # Added to expose Stage 1 results to QC plot
     )
 
 
@@ -697,15 +698,27 @@ _CH_LABELS = ['DAPI', 'CD31', 'GAP43', 'NFP', 'CD3', 'CD163', 'CK', 'AF']
 
 
 def _stretch(img: np.ndarray, lo_pct: float = 1.0, hi_pct: float = 99.9) -> np.ndarray:
-    """Percentile stretch to [0, 1] for display."""
-    flat = img[img > 0]
+    """Log-normalize and percentile stretch to [0, 1] for display."""
+    # 1. Apply log1p transform (log(1 + x)) to compress the dynamic range.
+    #    Clipping at 0.0 prevents passing negative values to log1p, 
+    #    though image arrays here are natively expected to be >= 0.
+    img_log = np.log1p(np.clip(img, 0.0, None))
+    
+    # 2. Extract valid positive pixels for percentile calculation
+    flat = img_log[img_log > 0]
+    
     if flat.size == 0 or flat.max() == flat.min():
-        return np.zeros_like(img, dtype=np.float32)
+        return np.zeros_like(img_log, dtype=np.float32)
+        
+    # 3. Calculate percentiles on the log-transformed data
     lo = float(np.percentile(flat, lo_pct))
     hi = float(np.percentile(flat, hi_pct))
+    
     if hi == lo:
-        return np.zeros_like(img, dtype=np.float32)
-    return np.clip((img.astype(np.float32) - lo) / (hi - lo), 0.0, 1.0)
+        return np.zeros_like(img_log, dtype=np.float32)
+        
+    # 4. Stretch the log-transformed array to [0, 1]
+    return np.clip((img_log.astype(np.float32) - lo) / (hi - lo), 0.0, 1.0)
 
 
 def save_qc_slice_plot(
@@ -717,7 +730,9 @@ def save_qc_slice_plot(
 ) -> None:
     """
     Save one PNG per channel for a given Z-slice.
-    Layout (5 columns): Raw | BG-corrected | Dust mask | Cleaned | Histogram
+    Layout (2 rows x 3 columns):
+      Row 1: Raw | BG-corrected | Dust mask
+      Row 2: Cleaned | Histogram | (Empty)
     """
     os.makedirs(out_dir, exist_ok=True)
 
@@ -746,45 +761,56 @@ def save_qc_slice_plot(
         else:
             mode_str = 'median only'
 
-        fig, axes = plt.subplots(1, 5, figsize=(32, 7))
+        # Shrink figsize so standard fonts look proportionally larger
+        # Extract the new inpainted array
+        inpainted = res['inpainted']
+
+        fig, axes = plt.subplots(2, 3, figsize=(15, 10))
+        axs = axes.flat
+
         fig.suptitle(
-            f'{TARGET_CORE}  |  Z={z_idx:03d}  |  Ch {c:02d}: {ch_label}  '
-            f'|  mode: {mode_str}  '
-            f'|  artifact px removed: {n_dust_px:,}  '
+            f'{TARGET_CORE}  |  Z={z_idx:03d}  |  Ch {c:02d}: {ch_label}\n'
+            f'mode: {mode_str}  |  artifact px removed: {n_dust_px:,}\n'
             f'(large-blob: {n_large_px:,}  DoG: {n_dog_px:,}  small: {n_small_px:,})',
-            fontsize=13, fontweight='bold', fontfamily='monospace',
+            fontsize=20, fontweight='bold', fontfamily='monospace',
         )
 
-        # ── Col 0: Raw ────────────────────────────────────────────────────
-        axes[0].imshow(_stretch(raw), cmap='gray', interpolation='nearest')
+        # Col 0: Raw Input
+        axs[0].imshow(_stretch(raw), cmap='gray', interpolation='nearest')
         raw_max = float(raw.max())
-        axes[0].set_title(f'Raw\n(max={raw_max:.0f})', fontsize=11)
-        axes[0].axis('off')
+        axs[0].set_title(f'Raw Input\n(max={raw_max:.0f})', fontsize=16)
+        axs[0].axis('off')
 
-        # ── Col 1: Background-corrected ───────────────────────────────────
-        axes[1].imshow(_stretch(tophat), cmap='gray', interpolation='nearest')
-        axes[1].set_title(f'BG-corrected\n({mode_str})', fontsize=11)
-        axes[1].axis('off')
-
-        # ── Col 2: Dust mask overlaid ─────────────────────────────────────
-        rgb_dust = np.stack([_stretch(tophat)] * 3, axis=-1)
+        # Col 1: Stage 1 - Artifact Detection
+        # Col 1: Stage 1 - Artifact Detection
+        rgb_raw = np.stack([_stretch(raw)] * 3, axis=-1)
         if n_dust_px > 0:
-            rgb_dust[dust, 0] = 1.0
-            rgb_dust[dust, 1] = 0.0
-            rgb_dust[dust, 2] = 0.0
-        axes[2].imshow(rgb_dust, interpolation='nearest')
+            rgb_raw[dust, 0] = 1.0
+            rgb_raw[dust, 1] = 0.0
+            rgb_raw[dust, 2] = 0.0
+        axs[1].imshow(rgb_raw, interpolation='nearest')
         dust_pct_px = 100.0 * n_dust_px / raw.size
-        axes[2].set_title(f'Dust mask\n({n_dust_px:,} px, {dust_pct_px:.2f}% of image)', fontsize=11)
-        axes[2].axis('off')
+        axs[1].set_title(f'Stage 1: Detection Mask\n({n_dust_px:,} px, {dust_pct_px:.2f}%)', fontsize=16)
+        axs[1].axis('off')
 
-        # ── Col 3: Cleaned ────────────────────────────────────────────────
-        axes[3].imshow(_stretch(cleaned), cmap='gray', interpolation='nearest')
+        # Col 2: Intermediate - Inpainted
+        axs[2].imshow(_stretch(inpainted), cmap='gray', interpolation='nearest')
+        axs[2].set_title('Intermediate: Inpainted\n(Topography filled)', fontsize=16)
+        axs[2].axis('off')
+
+        # Col 3: Stage 2 - Background Corrected
+        axs[3].imshow(_stretch(tophat), cmap='gray', interpolation='nearest')
+        axs[3].set_title(f'Stage 2: BG-Corrected\n({mode_str})', fontsize=16)
+        axs[3].axis('off')
+
+        # Col 4: Final - Cleaned
+        axs[4].imshow(_stretch(cleaned), cmap='gray', interpolation='nearest')
         signal_px = int((cleaned > 0).sum())
-        axes[3].set_title(f'Cleaned\n({signal_px:,} signal px retained)', fontsize=11)
-        axes[3].axis('off')
+        axs[4].set_title(f'Final: Cleaned\n({signal_px:,} signal px retained)', fontsize=16)
+        axs[4].axis('off')
 
-        # ── Col 4: Histogram ──────────────────────────────────────────────
-        ax_h = axes[4]
+        # Col 5: Histogram
+        ax_h = axs[5]
         raw_pos     = raw[raw > 0].ravel()
         cleaned_pos = cleaned[cleaned > 0].ravel()
 
@@ -798,21 +824,23 @@ def save_qc_slice_plot(
                       label=f'Cleaned  (n={cleaned_pos.size:,})', density=True)
 
         ax_h.set_yscale('log')
-        ax_h.set_xlabel('Pixel intensity', fontsize=10)
-        ax_h.set_ylabel('Density (log)', fontsize=10)
-        ax_h.set_title('Intensity distribution\nRaw vs Cleaned', fontsize=11)
-        ax_h.legend(fontsize=9)
-        ax_h.tick_params(labelsize=9)
+        ax_h.set_xlabel('Pixel intensity', fontsize=14)
+        ax_h.set_ylabel('Density (log)', fontsize=14)
+        ax_h.set_title('Intensity distribution\nRaw vs Cleaned', fontsize=16)
+        ax_h.legend(fontsize=12)
+        ax_h.tick_params(labelsize=12)
 
-        fig.tight_layout(rect=[0, 0, 1, 0.95])
+        # Adjust top boundary to 0.88 to leave room for the enlarged suptitle
+        fig.tight_layout(rect=[0, 0, 1, 0.88])
 
         fname = f'{TARGET_CORE}_Z{z_idx:03d}_Ch{c:02d}_{ch_label}.png'
         out_path = os.path.join(out_dir, fname)
-        fig.savefig(out_path, dpi=80, bbox_inches='tight')
+        
+        # High DPI compensates for the smaller physical figsize, keeping the image sharp
+        fig.savefig(out_path, dpi=250, bbox_inches='tight')
         plt.close(fig)
 
     logger.info(f'  QC plots saved: Z={z_idx:03d}  ({n_channels} channels → {out_dir})')
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # PREVIEW MODE

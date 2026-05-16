@@ -1,6 +1,6 @@
 """
-compare_2d_3d_tme.py
-====================
+compare_2d_3d_tme.py  (entropy edition)
+========================================
 Compares 2D and 3D representations of the tumour microenvironment (TME)
 for a single TMA core using three spatial analysis modules:
 
@@ -13,11 +13,17 @@ for a single TMA core using three spatial analysis modules:
      - Summarise as mean ± std per type-pair
      - Computed in 2D (XY only, averaged across slices) and 3D (XYZ)
 
-  3. Permutation-based spatial interaction scores
-     - Build a radius neighbourhood graph per type-pair
-     - Count observed co-localisation vs permuted null (n=1000)
-     - Output z-score per type-pair: positive = co-localised, negative = avoided
-     - Computed in 2D and 3D separately
+  3. Neighbourhood alpha diversity + log2 enrichment ratio
+     - For each cell, collect all neighbours within radius_um
+     - Compute Shannon entropy of the neighbour cell-type composition
+     - Summarise per-cell entropy distributions for 2D vs 3D
+     - Statistical comparison: KS test + Mann-Whitney U (2D vs 3D)
+     - Also compute log2(observed/expected) enrichment ratio per type-pair
+       as a count-invariant interaction metric (replaces the permutation z-score)
+     - Positive log2 ratio = co-localised; negative = avoided; 0 = random
+     - Reference: Pentimalli et al., Cell Systems 2025 (NSCLC 3D atlas, Chao/
+       Shannon neighbourhood diversity comparison); Bull & Byrne, PLOS Comp Bio
+       2023 (weighted PCF / neighbourhood entropy framework)
 
 Inputs
 ------
@@ -31,19 +37,22 @@ Outputs
     cell_density_3d.csv
     nn_distances_2d.csv
     nn_distances_3d.csv
-    interaction_scores_2d.csv
-    interaction_scores_3d.csv
+    neighbourhood_entropy_2d.csv   ← per-cell entropy, 2D
+    neighbourhood_entropy_3d.csv   ← per-cell entropy, 3D
+    entropy_summary.csv            ← mean/std/median entropy + KS/MWU p-values
+    interaction_log2ratio_2d.csv   ← log2(obs/exp) per type-pair, 2D
+    interaction_log2ratio_3d.csv   ← log2(obs/exp) per type-pair, 3D
     summary_comparison.csv         — wide table for direct 2D vs 3D comparison
     figures/
-      cell_density_comparison.png
-      nn_distance_comparison.png
-      interaction_heatmap_2d.png
-      interaction_heatmap_3d.png
+      fig_A_cell_composition.png
+      fig_B_nn_distances.png
+      fig_C_entropy_comparison.png          ← replaces interaction z-score scatter
+      fig_D_tumour_log2ratio_profile.png    ← replaces tumour co-localisation bar
 
 Usage
 -----
     python compare_2d_3d_tme.py --core_name Core_01
-    python compare_2d_3d_tme.py --core_name Core_01 --radius_um 50 --n_perm 1000
+    python compare_2d_3d_tme.py --core_name Core_01 --radius_um 50
 """
 
 import os
@@ -55,7 +64,8 @@ import pandas as pd
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
-from scipy.spatial import cKDTree
+from scipy.spatial import cKDTree, ConvexHull
+from scipy.stats import ks_2samp, mannwhitneyu
 
 current_dir = os.path.dirname(os.path.abspath(__file__))
 parent_dir  = os.path.dirname(current_dir)
@@ -70,24 +80,22 @@ logger = logging.getLogger(__name__)
 # CLI
 # ─────────────────────────────────────────────────────────────────────────────
 parser = argparse.ArgumentParser(
-    description='2D vs 3D TME spatial analysis: density, NN distances, interaction scores.'
+    description='2D vs 3D TME spatial analysis: density, NN distances, '
+                'neighbourhood entropy & log2 enrichment ratio.'
 )
 parser.add_argument('--core_name',   type=str,   required=True)
 parser.add_argument('--radius_um',   type=float, default=50.0,
-                    help='Neighbourhood radius in µm for interaction scoring (default: 50).')
-parser.add_argument('--n_perm',      type=int,   default=1000,
-                    help='Number of permutations for interaction score null (default: 1000).')
+                    help='Neighbourhood radius in µm (default: 50).')
 parser.add_argument('--pixel_um',    type=float, default=0.4961,
                     help='Pixel size in µm (default: 0.4961).')
 parser.add_argument('--section_um',  type=float, default=4.5,
                     help='Section thickness in µm (default: 4.5).')
 parser.add_argument('--min_cells',   type=int,   default=10,
-                    help='Min cells of a type required to include in analysis (default: 10).')
+                    help='Min cells of a type required for analysis (default: 10).')
 args = parser.parse_args()
 
 TARGET_CORE  = args.core_name
 RADIUS_UM    = args.radius_um
-N_PERM       = args.n_perm
 PIXEL_UM     = args.pixel_um
 SECTION_UM   = args.section_um
 MIN_CELLS    = args.min_cells
@@ -122,53 +130,38 @@ logger.info(f'  3D cells   : {len(df3d):,}')
 # ─────────────────────────────────────────────────────────────────────────────
 # COORDINATE PREPARATION
 # ─────────────────────────────────────────────────────────────────────────────
-
-# 2D: convert pixel centroids to µm, keep per-slice
-# centroid_x / centroid_y are in pixels in the phenotype CSV
 df2d['x_um'] = df2d['centroid_x'] * PIXEL_UM
 df2d['y_um'] = df2d['centroid_y'] * PIXEL_UM
 
-# 3D: centroids already in µm from analyse_3d_cells.py
-# columns: centroid_x_um, centroid_y_um, centroid_z_um
 df3d = df3d.rename(columns={
     'centroid_x_um': 'x_um',
     'centroid_y_um': 'y_um',
     'centroid_z_um': 'z_um',
 })
 
-# Cell types present in both representations
 all_types_2d = set(df2d['cell_type'].unique())
 all_types_3d = set(df3d['cell_type'].unique())
 all_types    = sorted(all_types_2d | all_types_3d)
 logger.info(f'  Cell types : {all_types}')
 
-# Filter to types with enough cells in 3D (2D will be filtered per-metric)
-valid_types_3d = [t for t in all_types
-                  if (df3d['cell_type'] == t).sum() >= MIN_CELLS]
-valid_types_2d_global = [t for t in all_types
-                         if (df2d['cell_type'] == t).sum() >= MIN_CELLS]
+valid_types_3d        = [t for t in all_types if (df3d['cell_type'] == t).sum() >= MIN_CELLS]
+valid_types_2d_global = [t for t in all_types if (df2d['cell_type'] == t).sum() >= MIN_CELLS]
 logger.info(f'  Valid types (3D, >= {MIN_CELLS} cells) : {valid_types_3d}')
 
+slice_ids = df2d['slice_id'].unique()
 
 # ─────────────────────────────────────────────────────────────────────────────
-# MODULE 1 — CELL DENSITIES
+# MODULE 1 — CELL DENSITIES  (unchanged)
 # ─────────────────────────────────────────────────────────────────────────────
 logger.info('=' * 60)
 logger.info('MODULE 1: Cell densities')
 
-# ── 2D density ───────────────────────────────────────────────────────────────
-# Per slice: count cells of each type, divide by slice area (µm²)
-# Slice area estimated from the convex hull of all cell centroids in that slice.
-# Average across slices for the core-level estimate.
-from scipy.spatial import ConvexHull
-
 def slice_area_um2(df_slice):
-    """Convex hull area of cell centroids in µm²."""
     coords = df_slice[['x_um', 'y_um']].values
     if len(coords) < 3:
         return np.nan
     try:
-        return ConvexHull(coords).volume   # .volume = area in 2D
+        return ConvexHull(coords).volume
     except Exception:
         return np.nan
 
@@ -177,20 +170,18 @@ for sid, grp in df2d.groupby('slice_id'):
     area = slice_area_um2(grp)
     if np.isnan(area) or area == 0:
         continue
-    area_mm2 = area / 1e6   # µm² → mm²
+    area_mm2 = area / 1e6
     for ct in all_types:
         n = (grp['cell_type'] == ct).sum()
         density_2d_rows.append({
-            'slice_id':    sid,
-            'cell_type':   ct,
-            'n_cells':     n,
-            'area_mm2':    round(area_mm2, 4),
-            'density_per_mm2': round(n / area_mm2, 4),
+            'slice_id':          sid,
+            'cell_type':         ct,
+            'n_cells':           n,
+            'area_mm2':          round(area_mm2, 4),
+            'density_per_mm2':   round(n / area_mm2, 4),
         })
 
 df_density_2d_per_slice = pd.DataFrame(density_2d_rows)
-
-# Average across slices
 df_density_2d = (df_density_2d_per_slice
                  .groupby('cell_type')
                  .agg(
@@ -200,24 +191,22 @@ df_density_2d = (df_density_2d_per_slice
                  )
                  .reset_index())
 
-# ── 3D density ───────────────────────────────────────────────────────────────
-# Core volume estimated as convex hull of 3D centroids in µm³
 coords_3d = df3d[['x_um', 'y_um', 'z_um']].values
 try:
-    hull_3d  = ConvexHull(coords_3d)
-    vol_mm3  = hull_3d.volume / 1e9   # µm³ → mm³
+    hull_3d = ConvexHull(coords_3d)
+    vol_mm3 = hull_3d.volume / 1e9
 except Exception:
-    vol_mm3  = np.nan
+    vol_mm3 = np.nan
     logger.warning('Could not compute 3D convex hull — density will be NaN.')
 
 density_3d_rows = []
 for ct in all_types:
     n = (df3d['cell_type'] == ct).sum()
     density_3d_rows.append({
-        'cell_type':          ct,
-        'n_cells':            n,
-        'volume_mm3':         round(vol_mm3, 6) if not np.isnan(vol_mm3) else np.nan,
-        'density_per_mm3':    round(n / vol_mm3, 4) if not np.isnan(vol_mm3) else np.nan,
+        'cell_type':       ct,
+        'n_cells':         n,
+        'volume_mm3':      round(vol_mm3, 6) if not np.isnan(vol_mm3) else np.nan,
+        'density_per_mm3': round(n / vol_mm3, 4) if not np.isnan(vol_mm3) else np.nan,
     })
 df_density_3d = pd.DataFrame(density_3d_rows)
 
@@ -228,17 +217,12 @@ logger.info(f'  3D core volume estimate: {vol_mm3:.4f} mm³')
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# MODULE 2 — NEAREST-NEIGHBOUR DISTANCES
+# MODULE 2 — NEAREST-NEIGHBOUR DISTANCES  (unchanged)
 # ─────────────────────────────────────────────────────────────────────────────
 logger.info('=' * 60)
 logger.info('MODULE 2: Nearest-neighbour distances')
 
 def nn_distances(coords_src, coords_tgt):
-    """
-    For each point in coords_src, find the distance to the nearest point
-    in coords_tgt. Returns array of distances (µm).
-    Excludes self-matches when src == tgt by using k=2 and taking second NN.
-    """
     if len(coords_tgt) == 0 or len(coords_src) == 0:
         return np.array([np.nan])
     same = np.array_equal(coords_src, coords_tgt)
@@ -246,16 +230,12 @@ def nn_distances(coords_src, coords_tgt):
     tree = cKDTree(coords_tgt)
     dists, _ = tree.query(coords_src, k=k, workers=-1)
     if same:
-        dists = dists[:, 1]   # skip self (dist=0)
+        dists = dists[:, 1]
     else:
         dists = dists.ravel()
     return dists[np.isfinite(dists)]
 
-
-# ── 2D NN distances (averaged across slices) ─────────────────────────────────
 nn_2d_rows = []
-slice_ids  = df2d['slice_id'].unique()
-
 for sid in slice_ids:
     grp = df2d[df2d['slice_id'] == sid]
     types_present = [t for t in valid_types_2d_global
@@ -266,18 +246,15 @@ for sid in slice_ids:
             tgt_coords = grp[grp['cell_type'] == tgt_type][['x_um', 'y_um']].values
             dists = nn_distances(src_coords, tgt_coords)
             nn_2d_rows.append({
-                'slice_id':    sid,
-                'src_type':    src_type,
-                'tgt_type':    tgt_type,
+                'slice_id':     sid,
+                'src_type':     src_type,
+                'tgt_type':     tgt_type,
                 'mean_dist_um': np.mean(dists),
                 'std_dist_um':  np.std(dists),
                 'n_src_cells':  len(src_coords),
             })
 
-df_nn_2d_per_slice = pd.DataFrame(nn_2d_rows)
-
-# Average across slices
-df_nn_2d = (df_nn_2d_per_slice
+df_nn_2d = (pd.DataFrame(nn_2d_rows)
             .groupby(['src_type', 'tgt_type'])
             .agg(
                 mean_dist_um     =('mean_dist_um', 'mean'),
@@ -286,7 +263,6 @@ df_nn_2d = (df_nn_2d_per_slice
             )
             .reset_index())
 
-# ── 3D NN distances ───────────────────────────────────────────────────────────
 nn_3d_rows = []
 for src_type in valid_types_3d:
     src_coords = df3d[df3d['cell_type'] == src_type][['x_um', 'y_um', 'z_um']].values
@@ -300,7 +276,6 @@ for src_type in valid_types_3d:
             'std_dist_um':  round(np.std(dists),  3),
             'n_src_cells':  len(src_coords),
         })
-
 df_nn_3d = pd.DataFrame(nn_3d_rows)
 
 df_nn_2d.to_csv(os.path.join(OUT_DIR, 'nn_distances_2d.csv'), index=False)
@@ -309,125 +284,144 @@ logger.info('  NN distance CSVs saved.')
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# MODULE 3 — PERMUTATION-BASED SPATIAL INTERACTION SCORES
+# MODULE 3 — NEIGHBOURHOOD ALPHA DIVERSITY + LOG2 ENRICHMENT RATIO
+# ─────────────────────────────────────────────────────────────────────────────
+# Replaces permutation z-score with two count-invariant metrics:
+#
+#   A) Per-cell Shannon entropy of neighbour composition (alpha diversity)
+#      H(cell_i) = -sum_t [ p_t * log(p_t) ]
+#      where p_t = fraction of neighbours within radius_um that are type t.
+#      An isolated cell or one with no neighbours gets H = NaN.
+#      Following Pentimalli et al. 2025 (Cell Systems) who validated this
+#      approach for 2D vs 3D neighbourhood diversity comparison in NSCLC.
+#
+#   B) Log2 enrichment ratio per type-pair (A→B)
+#      obs_AB  = mean number of type-B cells within radius_um of type-A cells
+#      exp_AB  = (total type-B cells / total cells) * mean neighbourhood size
+#              = global frequency of B * E[|N_i|]
+#      log2_ratio = log2(obs_AB / exp_AB)   [0 = random, >0 = co-localised]
+#      This is directly comparable across 2D and 3D because it normalises
+#      by expected density rather than by a permutation std, so it does not
+#      inflate with cell count.
 # ─────────────────────────────────────────────────────────────────────────────
 logger.info('=' * 60)
-logger.info(f'MODULE 3: Spatial interaction scores (radius={RADIUS_UM} µm, n_perm={N_PERM})')
+logger.info(f'MODULE 3: Neighbourhood entropy & log2 enrichment ratio '
+            f'(radius={RADIUS_UM} µm)')
 
-rng = np.random.default_rng(seed=42)
 
-def interaction_scores(coords_all, labels_all, valid_types, radius_um, n_perm, rng):
+def shannon_entropy(counts_array):
     """
-    Permutation-based spatial interaction score for all type pairs.
+    Shannon entropy H = -sum(p * log(p)) in nats.
+    counts_array : 1D array of counts per cell type (integers >= 0).
+    Returns NaN if total == 0.
+    """
+    total = counts_array.sum()
+    if total == 0:
+        return np.nan
+    p = counts_array / total
+    # only non-zero terms contribute
+    p_nz = p[p > 0]
+    return -np.sum(p_nz * np.log(p_nz))
 
-    For each ordered pair (A, B):
-      observed  = mean number of type-B neighbours within radius_um of type-A cells
-      null      = same quantity under n_perm random shuffles of cell type labels
-      z_score   = (observed - mean(null)) / std(null)
 
-    Positive z: A and B co-localise more than expected by chance.
-    Negative z: A and B are spatially avoided relative to chance.
-
-    Vectorised implementation: the neighbour list is converted to a CSR sparse
-    adjacency matrix once; each permutation is then a single sparse matrix
-    multiply (A @ indicator) rather than a Python loop over cells.  This reduces
-    the per-permutation cost from O(N_cells) Python iterations to one C-level
-    sparse-dense matmul, giving ~100–300× speedup for large cell counts.
+def neighbourhood_entropy_and_log2ratio(coords, labels, valid_types, radius_um):
+    """
+    Compute per-cell Shannon entropy and per-type-pair log2 enrichment ratio.
 
     Parameters
     ----------
-    coords_all  : (N, D) array of cell coordinates in µm
-    labels_all  : (N,) array of cell type strings
-    valid_types : list of cell types to include
-    radius_um   : float, neighbourhood radius
-    n_perm      : int, number of permutations
-    rng         : numpy random generator
+    coords      : (N, D) array of cell positions in µm
+    labels      : (N,) array of cell type strings
+    valid_types : list of types to include
+    radius_um   : neighbourhood radius in µm
 
     Returns
     -------
-    DataFrame with columns: src_type, tgt_type, observed, null_mean, null_std, z_score, p_value
+    df_entropy  : DataFrame with columns [cell_idx, cell_type, n_neighbours,
+                                          entropy, <type>_count for each type]
+    df_log2     : DataFrame with columns [src_type, tgt_type, obs_mean,
+                                          exp_mean, log2_ratio]
     """
-    from scipy.sparse import csr_matrix
+    labels = np.array(labels)
+    N      = len(labels)
+    T      = len(valid_types)
+    type_set = set(valid_types)
 
-    labels_all = np.array(labels_all)
-    N          = len(labels_all)
-    T          = len(valid_types)
-    type_to_idx = {t: k for k, t in enumerate(valid_types)}
+    tree       = cKDTree(coords)
+    neighbours = tree.query_ball_point(coords, r=radius_um, workers=-1)
 
-    # ── Build KD-tree and neighbour list once ─────────────────────────────────
-    tree       = cKDTree(coords_all)
-    neighbours = tree.query_ball_point(coords_all, r=radius_um, workers=-1)
+    # ── Per-cell entropy ──────────────────────────────────────────────────────
+    entropy_rows = []
+    # count matrix: rows = cells, cols = valid_types
+    count_matrix = np.zeros((N, T), dtype=np.int32)
 
-    # ── Convert neighbour list to CSR adjacency matrix (self-loops excluded) ──
-    rows_idx, cols_idx = [], []
     for i, nbs in enumerate(neighbours):
-        for j in nbs:
-            if j != i:
-                rows_idx.append(i)
-                cols_idx.append(j)
-    data = np.ones(len(rows_idx), dtype=np.float32)
-    A    = csr_matrix((data, (rows_idx, cols_idx)), shape=(N, N))
+        nb_labels = labels[nbs]
+        for k, ct in enumerate(valid_types):
+            count_matrix[i, k] = np.sum(nb_labels == ct)
 
-    # ── Vectorised count: for a given label array return (T × T) matrix ──────
-    # result[i, j] = mean neighbours of type j per cell of type i
-    def count_interactions_fast(label_arr):
-        label_idx  = np.array([type_to_idx.get(l, -1) for l in label_arr])
-        valid_mask = label_idx >= 0
-        indicator  = np.zeros((N, T), dtype=np.float32)
-        indicator[valid_mask, label_idx[valid_mask]] = 1.0
-        nb_counts  = A @ indicator            # (N × T): sparse × dense matmul
-        result     = np.zeros((T, T), dtype=np.float64)
-        for i, src in enumerate(valid_types):
-            src_mask = label_arr == src
-            n_src    = src_mask.sum()
-            if n_src == 0:
-                continue
-            result[i, :] = nb_counts[src_mask, :].sum(axis=0) / n_src
-        return result
+    # subtract self contribution for same-type
+    for i in range(N):
+        own_type = labels[i]
+        if own_type in type_set:
+            k = valid_types.index(own_type)
+            count_matrix[i, k] = max(0, count_matrix[i, k] - 1)
 
-    # ── Observed counts ───────────────────────────────────────────────────────
-    logger.info('    Computing observed interaction counts ...')
-    observed_mat = count_interactions_fast(labels_all)
+    for i in range(N):
+        if labels[i] not in type_set:
+            continue
+        row = count_matrix[i]
+        h   = shannon_entropy(row)
+        n_nb = int(row.sum())
+        rec  = {'cell_idx':    i,
+                'cell_type':   labels[i],
+                'n_neighbours': n_nb,
+                'entropy':      h}
+        for k, ct in enumerate(valid_types):
+            rec[f'n_{ct}'] = int(row[k])
+        entropy_rows.append(rec)
 
-    # ── Permutations — running stats (no large null array stored) ────────────
-    logger.info(f'    Running {n_perm} permutations ...')
-    null_sum  = np.zeros((T, T), dtype=np.float64)
-    null_sum2 = np.zeros((T, T), dtype=np.float64)
-    null_ge   = np.zeros((T, T), dtype=np.int32)   # count(perm >= observed)
+    df_entropy = pd.DataFrame(entropy_rows)
 
-    for _ in range(n_perm):
-        perm_mat   = count_interactions_fast(rng.permutation(labels_all))
-        null_sum  += perm_mat
-        null_sum2 += perm_mat ** 2
-        null_ge   += (perm_mat >= observed_mat).astype(np.int32)
+    # ── Log2 enrichment ratio ─────────────────────────────────────────────────
+    # global frequency of each target type (among valid-type cells only)
+    valid_mask    = np.isin(labels, valid_types)
+    labels_valid  = labels[valid_mask]
+    global_freq   = {ct: np.sum(labels_valid == ct) / len(labels_valid)
+                     for ct in valid_types}
 
-    null_mean = null_sum  / n_perm
-    null_std  = np.sqrt(np.maximum(null_sum2 / n_perm - null_mean ** 2, 0.0))
+    # mean neighbourhood size (excluding self, among valid types)
+    mean_nb_size  = count_matrix[valid_mask].sum(axis=1).mean()
 
-    # ── Assemble output DataFrame ─────────────────────────────────────────────
-    rows = []
-    for i, src in enumerate(valid_types):
-        for j, tgt in enumerate(valid_types):
-            obs  = observed_mat[i, j]
-            nmn  = null_mean[i, j]
-            nstd = null_std[i, j]
-            z    = (obs - nmn) / nstd if nstd > 0 else 0.0
-            p    = (null_ge[i, j] + 1) / (n_perm + 1)
-            rows.append({
-                'src_type':  src,
-                'tgt_type':  tgt,
-                'observed':  round(float(obs),  4),
-                'null_mean': round(float(nmn),  4),
-                'null_std':  round(float(nstd), 4),
-                'z_score':   round(float(z),    4),
-                'p_value':   round(float(p),    4),
+    log2_rows = []
+    for ki, src in enumerate(valid_types):
+        src_mask = (labels == src)
+        if src_mask.sum() == 0:
+            continue
+        src_counts = count_matrix[src_mask]   # rows = src cells, cols = types
+        for kj, tgt in enumerate(valid_types):
+            obs_mean = src_counts[:, kj].mean()
+            exp_mean = global_freq[tgt] * mean_nb_size
+            if exp_mean > 0:
+                log2_ratio = np.log2(obs_mean / exp_mean) if obs_mean > 0 else -np.inf
+            else:
+                log2_ratio = np.nan
+            log2_rows.append({
+                'src_type':   src,
+                'tgt_type':   tgt,
+                'obs_mean':   round(float(obs_mean),   4),
+                'exp_mean':   round(float(exp_mean),   4),
+                'log2_ratio': round(float(log2_ratio), 4),
             })
-    return pd.DataFrame(rows)
+
+    df_log2 = pd.DataFrame(log2_rows)
+    return df_entropy, df_log2
 
 
-# ── 2D interaction scores (per slice, then average z-scores) ─────────────────
-logger.info('  Computing 2D interaction scores ...')
-int_2d_per_slice = []
+# ── 2D entropy + log2 ratio (per slice, then aggregate) ──────────────────────
+logger.info('  Computing 2D neighbourhood entropy ...')
+entropy_2d_all    = []
+log2_2d_per_slice = []
 
 for sid in slice_ids:
     grp = df2d[df2d['slice_id'] == sid]
@@ -437,39 +431,101 @@ for sid in slice_ids:
         continue
     coords = grp[['x_um', 'y_um']].values
     labels = grp['cell_type'].values
-    # Filter to valid types only
     mask   = np.isin(labels, types_here)
-    df_s   = interaction_scores(coords[mask], labels[mask],
-                                types_here, RADIUS_UM, N_PERM, rng)
-    df_s['slice_id'] = sid
-    int_2d_per_slice.append(df_s)
-    logger.info(f'    Slice {sid} done.')
 
-df_int_2d_all = pd.concat(int_2d_per_slice, ignore_index=True)
+    df_ent_s, df_l2_s = neighbourhood_entropy_and_log2ratio(
+        coords[mask], labels[mask], types_here, RADIUS_UM
+    )
+    df_ent_s['slice_id'] = sid
+    df_l2_s['slice_id']  = sid
+    entropy_2d_all.append(df_ent_s)
+    log2_2d_per_slice.append(df_l2_s)
+    logger.info(f'    Slice {sid}: {mask.sum()} cells, '
+                f'mean H={df_ent_s["entropy"].mean():.3f} nats')
 
-# Average z-scores across slices
-df_int_2d = (df_int_2d_all
-             .groupby(['src_type', 'tgt_type'])
-             .agg(
-                 mean_z_score   =('z_score',  'mean'),
-                 std_z_score    =('z_score',  'std'),
-                 mean_observed  =('observed', 'mean'),
-                 n_slices       =('slice_id', 'nunique'),
-             )
-             .reset_index())
+df_entropy_2d = pd.concat(entropy_2d_all, ignore_index=True)
 
-# ── 3D interaction scores ─────────────────────────────────────────────────────
-logger.info('  Computing 3D interaction scores ...')
-mask_3d   = df3d['cell_type'].isin(valid_types_3d)
-coords_3d_valid = df3d[mask_3d][['x_um', 'y_um', 'z_um']].values
-labels_3d_valid = df3d[mask_3d]['cell_type'].values
+# Per-type-pair log2 ratio: average across slices
+df_log2_2d = (pd.concat(log2_2d_per_slice, ignore_index=True)
+              .groupby(['src_type', 'tgt_type'])
+              .agg(
+                  log2_ratio =('log2_ratio', 'mean'),
+                  obs_mean   =('obs_mean',   'mean'),
+                  exp_mean   =('exp_mean',   'mean'),
+                  n_slices   =('slice_id',   'nunique'),
+              )
+              .reset_index())
 
-df_int_3d = interaction_scores(coords_3d_valid, labels_3d_valid,
-                               valid_types_3d, RADIUS_UM, N_PERM, rng)
+# ── 3D entropy + log2 ratio ───────────────────────────────────────────────────
+logger.info('  Computing 3D neighbourhood entropy ...')
+mask_3d = df3d['cell_type'].isin(valid_types_3d)
+coords_3d_v = df3d[mask_3d][['x_um', 'y_um', 'z_um']].values
+labels_3d_v = df3d[mask_3d]['cell_type'].values
 
-df_int_2d.to_csv(os.path.join(OUT_DIR, 'interaction_scores_2d.csv'), index=False)
-df_int_3d.to_csv(os.path.join(OUT_DIR, 'interaction_scores_3d.csv'), index=False)
-logger.info('  Interaction score CSVs saved.')
+df_entropy_3d, df_log2_3d = neighbourhood_entropy_and_log2ratio(
+    coords_3d_v, labels_3d_v, valid_types_3d, RADIUS_UM
+)
+logger.info(f'    3D: {len(df_entropy_3d)} cells, '
+            f'mean H={df_entropy_3d["entropy"].mean():.3f} nats')
+
+# ── Entropy summary table with statistical tests ──────────────────────────────
+logger.info('  Building entropy summary with KS and Mann-Whitney U tests ...')
+
+entropy_summary_rows = []
+all_types_entropy = sorted(
+    set(df_entropy_2d['cell_type'].unique()) |
+    set(df_entropy_3d['cell_type'].unique())
+)
+
+for ct in all_types_entropy:
+    h2d = df_entropy_2d[df_entropy_2d['cell_type'] == ct]['entropy'].dropna().values
+    h3d = df_entropy_3d[df_entropy_3d['cell_type'] == ct]['entropy'].dropna().values
+    if len(h2d) < 5 or len(h3d) < 5:
+        continue
+
+    ks_stat, ks_p   = ks_2samp(h2d, h3d)
+    mwu_stat, mwu_p = mannwhitneyu(h2d, h3d, alternative='two-sided')
+
+    entropy_summary_rows.append({
+        'cell_type':        ct,
+        # 2D stats
+        'mean_H_2d':        round(np.mean(h2d),   4),
+        'std_H_2d':         round(np.std(h2d),    4),
+        'median_H_2d':      round(np.median(h2d), 4),
+        'n_cells_2d':       len(h2d),
+        # 3D stats
+        'mean_H_3d':        round(np.mean(h3d),   4),
+        'std_H_3d':         round(np.std(h3d),    4),
+        'median_H_3d':      round(np.median(h3d), 4),
+        'n_cells_3d':       len(h3d),
+        # delta
+        'delta_mean_H':     round(np.mean(h3d) - np.mean(h2d), 4),
+        # tests
+        'ks_stat':          round(ks_stat,  4),
+        'ks_p':             round(ks_p,     4),
+        'mwu_stat':         round(mwu_stat, 4),
+        'mwu_p':            round(mwu_p,    4),
+        # interpretation flag
+        'H_increased_in_3D': np.mean(h3d) > np.mean(h2d),
+    })
+
+df_entropy_summary = pd.DataFrame(entropy_summary_rows)
+
+# Save all Module 3 outputs
+df_entropy_2d.to_csv(os.path.join(OUT_DIR, 'neighbourhood_entropy_2d.csv'), index=False)
+df_entropy_3d.to_csv(os.path.join(OUT_DIR, 'neighbourhood_entropy_3d.csv'), index=False)
+df_entropy_summary.to_csv(os.path.join(OUT_DIR, 'entropy_summary.csv'), index=False)
+df_log2_2d.to_csv(os.path.join(OUT_DIR, 'interaction_log2ratio_2d.csv'), index=False)
+df_log2_3d.to_csv(os.path.join(OUT_DIR, 'interaction_log2ratio_3d.csv'), index=False)
+logger.info('  Module 3 CSVs saved.')
+
+# Print summary to log
+for _, row in df_entropy_summary.iterrows():
+    direction = '↑' if row['H_increased_in_3D'] else '↓'
+    logger.info(f"    {row['cell_type']:15s}  "
+                f"H_2D={row['mean_H_2d']:.3f}  "
+                f"H_3D={row['mean_H_3d']:.3f}  "
+                f"{direction}  KS p={row['ks_p']:.3e}  MWU p={row['mwu_p']:.3e}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -477,43 +533,37 @@ logger.info('  Interaction score CSVs saved.')
 # ─────────────────────────────────────────────────────────────────────────────
 logger.info('Building summary comparison table ...')
 
-# NN distance comparison
-nn_merge = df_nn_2d[['src_type', 'tgt_type', 'mean_dist_um']].rename(
-    columns={'mean_dist_um': 'nn_dist_2d_um'}
-).merge(
-    df_nn_3d[['src_type', 'tgt_type', 'mean_dist_um']].rename(
-        columns={'mean_dist_um': 'nn_dist_3d_um'}),
-    on=['src_type', 'tgt_type'], how='outer'
-)
+nn_merge = (df_nn_2d[['src_type', 'tgt_type', 'mean_dist_um']]
+            .rename(columns={'mean_dist_um': 'nn_dist_2d_um'})
+            .merge(
+                df_nn_3d[['src_type', 'tgt_type', 'mean_dist_um']]
+                .rename(columns={'mean_dist_um': 'nn_dist_3d_um'}),
+                on=['src_type', 'tgt_type'], how='outer'))
 nn_merge['nn_dist_delta_um'] = (nn_merge['nn_dist_3d_um']
                                  - nn_merge['nn_dist_2d_um']).round(3)
 
-# Interaction score comparison
-int_merge = df_int_2d[['src_type', 'tgt_type', 'mean_z_score']].rename(
-    columns={'mean_z_score': 'z_score_2d'}
-).merge(
-    df_int_3d[['src_type', 'tgt_type', 'z_score']].rename(
-        columns={'z_score': 'z_score_3d'}),
-    on=['src_type', 'tgt_type'], how='outer'
-)
-int_merge['z_score_delta'] = (int_merge['z_score_3d']
-                               - int_merge['z_score_2d']).round(3)
+log2_merge = (df_log2_2d[['src_type', 'tgt_type', 'log2_ratio']]
+              .rename(columns={'log2_ratio': 'log2_ratio_2d'})
+              .merge(
+                  df_log2_3d[['src_type', 'tgt_type', 'log2_ratio']]
+                  .rename(columns={'log2_ratio': 'log2_ratio_3d'}),
+                  on=['src_type', 'tgt_type'], how='outer'))
+log2_merge['log2_ratio_delta'] = (log2_merge['log2_ratio_3d']
+                                   - log2_merge['log2_ratio_2d']).round(3)
 
-summary = nn_merge.merge(int_merge, on=['src_type', 'tgt_type'], how='outer')
+summary = nn_merge.merge(log2_merge, on=['src_type', 'tgt_type'], how='outer')
 summary.to_csv(os.path.join(OUT_DIR, 'summary_comparison.csv'), index=False)
 logger.info(f'  Summary table saved ({len(summary)} type-pairs).')
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# FIGURES — four separate publication-quality panels
+# FIGURES
 # ─────────────────────────────────────────────────────────────────────────────
 logger.info('Generating figures ...')
 
 import matplotlib.patches as mpatches
 
 BG = '#F7F9FA'
-
-# Consistent colour per cell type across all panels
 _ALL_TYPES_SORTED = ['Tumour', 'Macrophage', 'T_cell', 'Endothelial',
                      'Neural', 'Ambiguous', 'Unknown']
 _PALETTE = {
@@ -531,16 +581,14 @@ def _type_color(ct):
     return _PALETTE.get(ct, '#888888')
 
 def _finish_ax(ax):
-    """Common spine/background cleanup."""
     ax.set_facecolor(BG)
     ax.spines[['top', 'right']].set_visible(False)
 
-bh = 0.35   # bar half-height used in composition panels
+bh = 0.35
 
-# ── Pre-compute shared data that multiple figures reference ───────────────────
+# ── Pre-compute shared data ───────────────────────────────────────────────────
 total_2d_dens = df_density_2d['mean_density_per_mm2'].sum()
 total_3d_dens = df_density_3d['density_per_mm3'].sum()
-
 pct_2d = {r['cell_type']: r['mean_density_per_mm2'] / total_2d_dens * 100
           for _, r in df_density_2d.iterrows()}
 pct_3d = {r['cell_type']: r['density_per_mm3'] / total_3d_dens * 100
@@ -552,96 +600,113 @@ nn_merge_fig = (df_nn_2d[['src_type', 'tgt_type', 'mean_dist_um']]
                        .rename(columns={'mean_dist_um': 'd3d'}),
                        on=['src_type', 'tgt_type']))
 
-int_merge_fig = (df_int_2d[['src_type', 'tgt_type', 'mean_z_score']]
-                 .rename(columns={'mean_z_score': 'z2d'})
-                 .merge(df_int_3d[['src_type', 'tgt_type', 'z_score']]
-                        .rename(columns={'z_score': 'z3d'}),
-                        on=['src_type', 'tgt_type']))
+log2_merge_fig = (df_log2_2d[['src_type', 'tgt_type', 'log2_ratio']]
+                  .rename(columns={'log2_ratio': 'l2d'})
+                  .merge(df_log2_3d[['src_type', 'tgt_type', 'log2_ratio']]
+                         .rename(columns={'log2_ratio': 'l3d'}),
+                         on=['src_type', 'tgt_type']))
 
-tgt_tum_2d = df_int_2d[df_int_2d['tgt_type'] == 'Tumour'].set_index('src_type')['mean_z_score']
-tgt_tum_3d = df_int_3d[df_int_3d['tgt_type'] == 'Tumour'].set_index('src_type')['z_score']
+tgt_tum_log2_2d = (df_log2_2d[df_log2_2d['tgt_type'] == 'Tumour']
+                   .set_index('src_type')['log2_ratio'])
+tgt_tum_log2_3d = (df_log2_3d[df_log2_3d['tgt_type'] == 'Tumour']
+                   .set_index('src_type')['log2_ratio'])
+
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Figure A — Cell-type composition
+# Figure A — Cell-type composition  (unchanged)
 # ─────────────────────────────────────────────────────────────────────────────
 fig_a, ax_comp = plt.subplots(figsize=(8, 5.5), facecolor=BG)
 _finish_ax(ax_comp)
-
 types_comp = [t for t in _ALL_TYPES_SORTED if t in pct_2d or t in pct_3d]
 y_comp = np.arange(len(types_comp))
 
 for k, ct in enumerate(types_comp):
-    v2  = pct_2d.get(ct, 0)
-    v3  = pct_3d.get(ct, 0)
+    v2 = pct_2d.get(ct, 0); v3 = pct_3d.get(ct, 0)
     col = _type_color(ct)
-    ax_comp.barh(y_comp[k] + bh/2, v2, height=bh, color=col, alpha=0.45,
-                 edgecolor='none')
-    ax_comp.barh(y_comp[k] - bh/2, v3, height=bh, color=col, alpha=1.00,
-                 edgecolor='none')
+    ax_comp.barh(y_comp[k] + bh/2, v2, height=bh, color=col, alpha=0.45, edgecolor='none')
+    ax_comp.barh(y_comp[k] - bh/2, v3, height=bh, color=col, alpha=1.00, edgecolor='none')
     delta = v3 - v2
-    sign  = '+' if delta >= 0 else ''
     ax_comp.text(max(v2, v3) + 0.5, y_comp[k],
-                 f'{sign}{delta:.1f}%', va='center', fontsize=9, color='#444')
+                 f'{("+" if delta >= 0 else "")}{delta:.1f}%',
+                 va='center', fontsize=9, color='#444')
 
-ax_comp.set_yticks(y_comp)
-ax_comp.set_yticklabels(types_comp, fontsize=11)
+ax_comp.set_yticks(y_comp);  ax_comp.set_yticklabels(types_comp, fontsize=11)
 ax_comp.set_xlabel('% of all cells', fontsize=11)
 ax_comp.set_title(f'{TARGET_CORE} — Cell-type composition: 2D vs 3D',
                   fontsize=12, fontweight='bold', color='#1A1A2E', pad=10)
 ax_comp.axvline(0, color='#ccc', lw=0.8)
-
-h_2d_leg = mpatches.Patch(facecolor='#888', alpha=0.45, label='2D (mean density/mm²)')
-h_3d_leg = mpatches.Patch(facecolor='#888', alpha=1.0,  label='3D (density/mm³)')
-ax_comp.legend(handles=[h_2d_leg, h_3d_leg], fontsize=9, frameon=False,
-               loc='upper right')
-ax_comp.text(0.98, 0.22,
-             'Tumour dominates in both\nrepresentations (~60%)',
-             transform=ax_comp.transAxes, ha='right', va='bottom', fontsize=9,
-             color='#C62828',
-             bbox=dict(boxstyle='round,pad=0.35', fc='#FFEBEE', ec='#C62828', lw=0.9))
-
+ax_comp.legend(handles=[
+    mpatches.Patch(facecolor='#888', alpha=0.45, label='2D (mean density/mm²)'),
+    mpatches.Patch(facecolor='#888', alpha=1.0,  label='3D (density/mm³)'),
+], fontsize=9, frameon=False, loc='upper right')
 fig_a.tight_layout()
 path_a = os.path.join(FIG_DIR, 'fig_A_cell_composition.png')
 fig_a.savefig(path_a, dpi=200, bbox_inches='tight', facecolor=BG)
 plt.close(fig_a)
 logger.info(f'  Figure A saved: {path_a}')
 
+
 # ─────────────────────────────────────────────────────────────────────────────
-# Figure B — Nearest-neighbour distances scatter
+# Figure B — NN distances scatter
+#
+# Colour  = source cell type
+# Marker  = target cell type
+# This dual encoding resolves the overlap problem where multiple same-colour
+# dots land on top of each other (one per target type per source type).
+# Two separate legends are placed without overlapping data points.
 # ─────────────────────────────────────────────────────────────────────────────
-fig_b, ax_nn = plt.subplots(figsize=(7.5, 7), facecolor=BG)
+_MARKERS = ['o', 's', '^', 'D', 'v', 'P', '*']   # one per type, up to 7
+_marker_for = {ct: _MARKERS[i % len(_MARKERS)]
+               for i, ct in enumerate(_ALL_TYPES_SORTED)}
+
+fig_b, ax_nn = plt.subplots(figsize=(8, 7.5), facecolor=BG)
 _finish_ax(ax_nn)
 
 for _, row in nn_merge_fig.iterrows():
     ax_nn.scatter(row['d2d'], row['d3d'],
                   color=_type_color(row['src_type']),
-                  s=70, alpha=0.85, edgecolors='white', linewidths=0.6, zorder=3)
+                  marker=_marker_for.get(row['tgt_type'], 'o'),
+                  s=90, alpha=0.88, edgecolors='white', linewidths=0.5, zorder=3)
 
-nn_lim = max(nn_merge_fig['d2d'].max(), nn_merge_fig['d3d'].max()) * 1.1
-ax_nn.plot([0, nn_lim], [0, nn_lim], '--', color=GRAY, lw=1.3, zorder=1)
+nn_lim = max(nn_merge_fig['d2d'].max(), nn_merge_fig['d3d'].max()) * 1.12
+ax_nn.plot([0, nn_lim], [0, nn_lim], '--', color=GRAY, lw=1.2, zorder=1)
 
-# No per-point arrow annotations — colour encodes source type via legend
+# Label the diagonal
+mid = nn_lim * 0.52
+ax_nn.text(mid * 1.07, mid * 0.90, '2D = 3D',
+           fontsize=8.5, color=GRAY, rotation=42, ha='center', style='italic')
+
+# Quadrant annotation
+ax_nn.text(nn_lim * 0.05, nn_lim * 0.92,
+           'Points above diagonal:\n3D distance > 2D distance',
+           fontsize=8, color='#444', va='top',
+           bbox=dict(boxstyle='round,pad=0.3', fc='white', ec='#ccc', lw=0.7))
+
+ax_nn.set_xlim(0, nn_lim); ax_nn.set_ylim(0, nn_lim)
 ax_nn.set_xlabel('2D mean NN distance (µm)', fontsize=11)
 ax_nn.set_ylabel('3D mean NN distance (µm)', fontsize=11)
-ax_nn.set_title(
-    f'{TARGET_CORE} — Nearest-neighbour distances: 2D vs 3D\n'
-    'Each dot = one cell-type pair  |  colour = source type',
-    fontsize=12, fontweight='bold', color='#1A1A2E', pad=10)
+ax_nn.set_title(f'{TARGET_CORE} — Nearest-neighbour distances: 2D vs 3D\n'
+                'Colour = source type   Marker = target type',
+                fontsize=12, fontweight='bold', color='#1A1A2E', pad=10)
 
-# Diagonal guide label
-mid = nn_lim * 0.55
-ax_nn.text(mid * 0.88, mid * 1.10, '2D > 3D  (2D projection inflates distance)',
-           fontsize=8, color=GRAY, ha='center', rotation=38, style='italic')
-
+# Legend 1: colour = source type  (top-left, inside axes)
 src_in_nn = [t for t in _ALL_TYPES_SORTED if t in nn_merge_fig['src_type'].values]
-ax_nn.legend(handles=[mpatches.Patch(fc=_type_color(t), label=t) for t in src_in_nn],
-             fontsize=9, frameon=True, framealpha=0.85, edgecolor='#ccc',
-             loc='upper left', ncol=1)
-ax_nn.text(0.97, 0.05,
-           '3D distances shorter overall:\n2D projection inflates separation',
-           transform=ax_nn.transAxes, ha='right', va='bottom', fontsize=9,
-           color='#1A237E',
-           bbox=dict(boxstyle='round,pad=0.35', fc='#E8EAF6', ec='#3949AB', lw=0.9))
+leg_src = ax_nn.legend(
+    handles=[mpatches.Patch(fc=_type_color(t), label=t) for t in src_in_nn],
+    title='Source type', title_fontsize=8.5,
+    fontsize=8.5, frameon=True, framealpha=0.9, edgecolor='#ccc',
+    loc='upper left')
+ax_nn.add_artist(leg_src)
+
+# Legend 2: marker = target type  (bottom-right, inside axes)
+tgt_in_nn = [t for t in _ALL_TYPES_SORTED if t in nn_merge_fig['tgt_type'].values]
+leg_tgt = ax_nn.legend(
+    handles=[plt.Line2D([0], [0], marker=_marker_for.get(t, 'o'),
+                        color='#555', linestyle='none',
+                        markersize=7, label=t) for t in tgt_in_nn],
+    title='Target type', title_fontsize=8.5,
+    fontsize=8.5, frameon=True, framealpha=0.9, edgecolor='#ccc',
+    loc='lower right')
 
 fig_b.tight_layout()
 path_b = os.path.join(FIG_DIR, 'fig_B_nn_distances.png')
@@ -649,117 +714,194 @@ fig_b.savefig(path_b, dpi=200, bbox_inches='tight', facecolor=BG)
 plt.close(fig_b)
 logger.info(f'  Figure B saved: {path_b}')
 
+
 # ─────────────────────────────────────────────────────────────────────────────
-# Figure C — Spatial interaction z-score concordance
+# Figure C — Neighbourhood entropy comparison
+#
+# Layout: two horizontal panels
+#   Left  — paired violins per cell type (2D pale, 3D solid), vertical layout
+#            so cell-type labels sit on a clean y-axis without rotation
+#   Right — horizontal bars mean H ± std with delta and KS significance star
+#
+# Legend labels corrected to entropy units (not density units).
 # ─────────────────────────────────────────────────────────────────────────────
-fig_c, ax_int = plt.subplots(figsize=(7.5, 7), facecolor=BG)
-_finish_ax(ax_int)
+types_ent = [t for t in _ALL_TYPES_SORTED
+             if t in df_entropy_summary['cell_type'].values]
+n_types   = len(types_ent)
+y_ent     = np.arange(n_types)
 
-for _, row in int_merge_fig.iterrows():
-    ax_int.scatter(row['z2d'], row['z3d'],
-                   color=_type_color(row['src_type']),
-                   s=70, alpha=0.85, edgecolors='white', linewidths=0.6, zorder=3)
+fig_c, (ax_vio, ax_bar) = plt.subplots(1, 2, figsize=(14, 6), facecolor=BG)
+for ax in (ax_vio, ax_bar):
+    _finish_ax(ax)
 
-zlim = np.abs(int_merge_fig[['z2d', 'z3d']].values).max() * 1.12
-ax_int.plot([-zlim, zlim], [-zlim, zlim], '--', color=GRAY, lw=1.3, zorder=1)
-ax_int.axhline(0, color='#ccc', lw=0.9)
-ax_int.axvline(0, color='#ccc', lw=0.9)
-ax_int.fill_between([-zlim, 0], [0, 0], [zlim, zlim],
-                    color='#E3F2FD', alpha=0.4, zorder=0)
-ax_int.fill_between([0, zlim], [-zlim, -zlim], [0, 0],
-                    color='#FCE4EC', alpha=0.4, zorder=0)
-ax_int.text(-zlim * 0.96, zlim * 0.88, 'Avoided 2D\nCo-localised 3D',
-            fontsize=8.5, color='#1565C0', va='top')
-ax_int.text(zlim * 0.04, -zlim * 0.88, 'Co-localised 2D\nAvoided 3D',
-            fontsize=8.5, color='#C62828')
-ax_int.set_xlim(-zlim, zlim)
-ax_int.set_ylim(-zlim, zlim)
-ax_int.set_xlabel('2D interaction z-score', fontsize=11)
-ax_int.set_ylabel('3D interaction z-score', fontsize=11)
-ax_int.set_title(f'{TARGET_CORE} — Spatial interaction scores: 2D vs 3D concordance',
-                 fontsize=12, fontweight='bold', color='#1A1A2E', pad=10)
+# ── Left: horizontal violin pairs (y = cell type, x = entropy value) ─────────
+# Using a rotated layout: violins drawn along the x-axis per cell type,
+# with 2D (pale) below and 3D (solid) above the cell-type tick.
+violin_offset = 0.22
+for k, ct in enumerate(types_ent):
+    h2d = df_entropy_2d[df_entropy_2d['cell_type'] == ct]['entropy'].dropna().values
+    h3d = df_entropy_3d[df_entropy_3d['cell_type'] == ct]['entropy'].dropna().values
+    col = _type_color(ct)
 
-src_in_int = [t for t in _ALL_TYPES_SORTED if t in int_merge_fig['src_type'].values]
-ax_int.legend(handles=[mpatches.Patch(fc=_type_color(t), label=t) for t in src_in_int],
-              fontsize=9, frameon=False, loc='lower right', ncol=2)
-ax_int.text(0.03, 0.97,
-            'Sign preserved across all pairs:\navoidance/co-localisation\npatterns consistent 2D↔3D',
-            transform=ax_int.transAxes, ha='left', va='top', fontsize=9,
-            color='#2E7D32',
-            bbox=dict(boxstyle='round,pad=0.35', fc='#E8F5E9', ec='#388E3C', lw=0.9))
+    for offset, hvals, alpha_val in [
+        (-violin_offset, h2d, 0.38),
+        (+violin_offset, h3d, 0.90),
+    ]:
+        if len(hvals) < 5:
+            continue
+        vp = ax_vio.violinplot(hvals, positions=[k + offset],
+                               widths=0.36, showmedians=True,
+                               showextrema=False, vert=True)
+        for body in vp['bodies']:
+            body.set_facecolor(col)
+            body.set_alpha(alpha_val)
+            body.set_edgecolor('none')
+        vp['cmedians'].set_color('white')
+        vp['cmedians'].set_linewidth(1.6)
+
+ax_vio.set_xticks(y_ent)
+ax_vio.set_xticklabels(types_ent, rotation=28, ha='right', fontsize=10)
+ax_vio.set_ylabel('Shannon entropy H (nats)', fontsize=11)
+ax_vio.set_title('Per-cell neighbourhood entropy distributions\n'
+                 f'Radius = {RADIUS_UM:.0f} µm',
+                 fontsize=11, fontweight='bold', color='#1A1A2E')
+ax_vio.legend(handles=[
+    mpatches.Patch(facecolor='#888', alpha=0.38, label='2D (per section)'),
+    mpatches.Patch(facecolor='#888', alpha=0.90, label='3D (reconstructed volume)'),
+], fontsize=9, frameon=False, loc='upper left')
+
+# ── Right: mean ± std horizontal bars, y = cell type ─────────────────────────
+bar_w = 0.32
+for k, ct in enumerate(types_ent):
+    row = df_entropy_summary[df_entropy_summary['cell_type'] == ct].iloc[0]
+    col = _type_color(ct)
+    sig = row['ks_p'] < 0.05
+
+    ax_bar.barh(k + bar_w / 2, row['mean_H_2d'], height=bar_w,
+                xerr=row['std_H_2d'], color=col, alpha=0.38,
+                edgecolor='none', capsize=3)
+    ax_bar.barh(k - bar_w / 2, row['mean_H_3d'], height=bar_w,
+                xerr=row['std_H_3d'], color=col, alpha=0.90,
+                edgecolor='none', capsize=3)
+
+    x_ann = max(row['mean_H_2d'] + row['std_H_2d'],
+                row['mean_H_3d'] + row['std_H_3d']) + 0.03
+    label = f"$\Delta${row['delta_mean_H']:+.2f}"
+    if sig:
+        label += '  ★'
+    ax_bar.text(x_ann, k, label, va='center', fontsize=8.5,
+                color='#1A237E' if sig else '#777')
+
+ax_bar.set_yticks(y_ent)
+ax_bar.set_yticklabels(types_ent, fontsize=10)
+ax_bar.set_xlabel('Mean Shannon entropy H (nats)', fontsize=11)
+ax_bar.set_title('Mean H ± std per cell type\n'
+                 '★ = KS test p < 0.05',
+                 fontsize=11, fontweight='bold', color='#1A1A2E')
+ax_bar.legend(handles=[
+    mpatches.Patch(facecolor='#888', alpha=0.38, label='2D (per section)'),
+    mpatches.Patch(facecolor='#888', alpha=0.90, label='3D (reconstructed volume)'),
+], fontsize=9, frameon=False, loc='lower right')
+
+fig_c.suptitle(
+    f'{TARGET_CORE}  —  Neighbourhood alpha diversity: 2D vs 3D\n'
+    f'Shannon entropy H of cell-type composition within {RADIUS_UM:.0f} µm radius',
+    fontsize=12, fontweight='bold', color='#1A1A2E', y=1.01)
 
 fig_c.tight_layout()
-path_c = os.path.join(FIG_DIR, 'fig_C_interaction_concordance.png')
+path_c = os.path.join(FIG_DIR, 'fig_C_entropy_comparison.png')
 fig_c.savefig(path_c, dpi=200, bbox_inches='tight', facecolor=BG)
 plt.close(fig_c)
 logger.info(f'  Figure C saved: {path_c}')
 
+
 # ─────────────────────────────────────────────────────────────────────────────
-# Figure D — Tumour co-localisation profile
+# Figure D — Tumour log2 enrichment ratio profile
+#
+# Horizontal bars: log2(obs/exp) toward Tumour, pale = 2D, solid = 3D.
+# X-axis clipped to the actual data range (typically all-negative) so bars
+# fill the plot area rather than leaving a large empty positive half.
+# Title uses no pipe separators.
+# An annotation box highlights the all-depleted finding when applicable.
 # ─────────────────────────────────────────────────────────────────────────────
 fig_d, ax_tum = plt.subplots(figsize=(8, 5.5), facecolor=BG)
 _finish_ax(ax_tum)
 
 non_tum = [t for t in _ALL_TYPES_SORTED
-           if t != 'Tumour' and t in tgt_tum_2d.index and t in tgt_tum_3d.index]
+           if t != 'Tumour'
+           and t in tgt_tum_log2_2d.index
+           and t in tgt_tum_log2_3d.index]
 y_tum = np.arange(len(non_tum))
 
 for k, ct in enumerate(non_tum):
     col = _type_color(ct)
-    ax_tum.barh(y_tum[k] + bh/2, tgt_tum_2d.get(ct, 0), height=bh,
+    v2d = tgt_tum_log2_2d.get(ct, 0)
+    v3d = tgt_tum_log2_3d.get(ct, 0)
+    ax_tum.barh(y_tum[k] + bh / 2, v2d, height=bh,
                 color=col, alpha=0.45, edgecolor='none')
-    ax_tum.barh(y_tum[k] - bh/2, tgt_tum_3d.get(ct, 0), height=bh,
+    ax_tum.barh(y_tum[k] - bh / 2, v3d, height=bh,
                 color=col, alpha=1.00, edgecolor='none')
 
-ax_tum.axvline(0, color='#555', lw=1.3)
+ax_tum.axvline(0, color='#555', lw=1.5, zorder=3)
+
+# ── Clip x-axis to data range with a small margin ────────────────────────────
+all_vals = [v for v in list(tgt_tum_log2_2d.values) +
+            list(tgt_tum_log2_3d.values) if np.isfinite(v)]
+x_min = min(all_vals) * 1.20
+x_max = max(max(all_vals) * 1.20, 0.15)   # always show a sliver of positive
+ax_tum.set_xlim(x_min, x_max)
+
+# Shade zones
+ax_tum.axvspan(0, x_max, color='#E8F5E9', alpha=0.4, zorder=0)
+ax_tum.axvspan(x_min, 0, color='#FCE4EC', alpha=0.4, zorder=0)
+
 ax_tum.set_yticks(y_tum)
 ax_tum.set_yticklabels(non_tum, fontsize=11)
-ax_tum.set_xlabel('Spatial proximity z-score toward Tumour\n'
-                  '(negative = spatially segregated, positive = spatially enriched near tumour)',
-                  fontsize=10)
+ax_tum.set_xlabel(
+    'log\u2082(observed / expected) neighbours within '
+    f'{int(RADIUS_UM)} µm of Tumour cells\n'
+    'Negative = depleted near Tumour   '
+    'Positive = enriched near Tumour   '
+    'Zero = random',
+    fontsize=9.5)
 ax_tum.set_title(
-    f'{TARGET_CORE} — Spatial proximity of each cell type to Tumour\n'
-    'Pale = 2D  |  Solid = 3D  |  Each bar = permutation z-score',
+    f'{TARGET_CORE}  —  Spatial enrichment toward Tumour\n'
+    f'Pale = 2D (per section)   Solid = 3D (reconstructed volume)',
     fontsize=12, fontweight='bold', color='#1A1A2E', pad=10)
 
-# Shade the positive zone to highlight co-localisation
-ax_tum.axvspan(0, ax_tum.get_xlim()[1] if ax_tum.get_xlim()[1] > 0 else 5,
-               color='#E8F5E9', alpha=0.4, zorder=0)
+# Highlight all-depleted finding if every value is negative
+all_negative = all(v < 0 for v in all_vals)
+if all_negative:
+    ax_tum.text(0.98, 0.97,
+                'All cell types depleted\nnear Tumour in both\n2D and 3D',
+                transform=ax_tum.transAxes, ha='right', va='top', fontsize=8.5,
+                color='#B71C1C',
+                bbox=dict(boxstyle='round,pad=0.35', fc='#FFEBEE',
+                          ec='#C62828', lw=0.9))
 
-# Axis region labels instead of floating text box
-xlims = [tgt_tum_2d.min(), tgt_tum_2d.max(), tgt_tum_3d.min(), tgt_tum_3d.max()]
-xmax_d = max(abs(v) for v in xlims) * 1.15
-ax_tum.set_xlim(-xmax_d, xmax_d)
-ax_tum.text(-xmax_d * 0.97, -0.6,
-            'Spatially segregated\nfrom Tumour',
-            fontsize=8.5, color='#B71C1C', va='top', ha='left', style='italic')
-ax_tum.text(xmax_d * 0.03, -0.6,
-            'Spatially enriched\nnear Tumour',
-            fontsize=8.5, color='#2E7D32', va='top', ha='left', style='italic')
-# Highlight T_cell 3D bar as the notable sign-discordant case
-if 'T_cell' in tgt_tum_3d.index and tgt_tum_3d.get('T_cell', 0) > 0:
-    tcell_idx = non_tum.index('T_cell') if 'T_cell' in non_tum else None
-    if tcell_idx is not None:
-        ax_tum.annotate('3D: spatially enriched\nnear Tumour ★',
-                        xy=(tgt_tum_3d['T_cell'], tcell_idx - bh/2),
-                        xytext=(tgt_tum_3d['T_cell'] + xmax_d * 0.08, tcell_idx + 0.5),
-                        fontsize=8.5, color='#1565C0',
-                        arrowprops=dict(arrowstyle='->', color='#1565C0', lw=1.0))
-# No legend — 2D/3D encoded by bar opacity, labelled in title
+# Annotate sign-flip cases if any exist
+for ct in non_tum:
+    v2d = tgt_tum_log2_2d.get(ct, 0)
+    v3d = tgt_tum_log2_3d.get(ct, 0)
+    if np.sign(v2d) != np.sign(v3d) and np.isfinite(v2d) and np.isfinite(v3d):
+        idx = non_tum.index(ct)
+        ax_tum.annotate('sign flip 2D / 3D',
+                        xy=(v3d, idx - bh / 2),
+                        xytext=(v3d + np.sign(v3d) * abs(x_min) * 0.12, idx + 0.5),
+                        fontsize=8, color='#1565C0',
+                        arrowprops=dict(arrowstyle='->', color='#1565C0', lw=0.9))
+
+ax_tum.legend(handles=[
+    mpatches.Patch(facecolor='#888', alpha=0.45, label='2D (per section)'),
+    mpatches.Patch(facecolor='#888', alpha=1.00, label='3D (reconstructed volume)'),
+], fontsize=9, frameon=False, loc='lower right')
 
 fig_d.tight_layout()
-path_d = os.path.join(FIG_DIR, 'fig_D_tumour_colocalisation.png')
+path_d = os.path.join(FIG_DIR, 'fig_D_tumour_log2ratio_profile.png')
 fig_d.savefig(path_d, dpi=200, bbox_inches='tight', facecolor=BG)
 plt.close(fig_d)
 logger.info(f'  Figure D saved: {path_d}')
 
-# Legacy combined figure path (kept for backward compatibility)
-summary_fig_path = os.path.join(FIG_DIR, 'summary_2d_vs_3d.png')
-logger.info(f'  All 4 figures saved to: {FIG_DIR}')
-logger.info(f'    fig_A_cell_composition.png')
-logger.info(f'    fig_B_nn_distances.png')
-logger.info(f'    fig_C_interaction_concordance.png')
-logger.info(f'    fig_D_tumour_colocalisation.png')
 
 # ─────────────────────────────────────────────────────────────────────────────
 # FINAL SUMMARY LOG
@@ -767,7 +909,16 @@ logger.info(f'    fig_D_tumour_colocalisation.png')
 logger.info('=' * 60)
 logger.info(f'DONE — {TARGET_CORE}')
 logger.info(f'  Output directory : {OUT_DIR}')
-logger.info(f'  CSVs written     : cell_density_2d/3d, nn_distances_2d/3d, '
-            f'interaction_scores_2d/3d, summary_comparison')
-logger.info(f'  Figure written   : {FIG_DIR}/summary_2d_vs_3d.png')
+logger.info('  CSVs written:')
+logger.info('    cell_density_2d/3d.csv')
+logger.info('    nn_distances_2d/3d.csv')
+logger.info('    neighbourhood_entropy_2d/3d.csv')
+logger.info('    entropy_summary.csv  (KS + MWU tests)')
+logger.info('    interaction_log2ratio_2d/3d.csv')
+logger.info('    summary_comparison.csv')
+logger.info('  Figures written:')
+logger.info('    fig_A_cell_composition.png')
+logger.info('    fig_B_nn_distances.png')
+logger.info('    fig_C_entropy_comparison.png   (violin + bar, 2D vs 3D)')
+logger.info('    fig_D_tumour_log2ratio_profile.png')
 logger.info('=' * 60)

@@ -642,8 +642,8 @@ def fig5_fixed_all_channels(out_path, f_arr, channel_names, core_name=None, fixe
 
     title_lines = ['Multiplexed Channels — Fixed Image Reference']
     if core_name is not None:
-        title_lines.append(f'Core: {core_name}   |   Slice: {fixed_id}')
-    fig.suptitle('\n'.join(title_lines), fontsize=32, fontweight='bold', y=1.02)
+        title_lines.append(f'{core_name}   |   Slice: {fixed_id}')
+    fig.suptitle('\n'.join(title_lines), fontsize=16, fontweight='bold', y=1.02)
 
     if num_channels == 1:
         axes = [axes]
@@ -685,7 +685,7 @@ def fig5_fixed_all_channels(out_path, f_arr, channel_names, core_name=None, fixe
 
             axes[i].imshow(rgb)
             name = channel_names[i] if i < len(channel_names) else f"Channel {i}"
-            axes[i].set_title(f"[{i}] {name}", fontsize=32, fontweight='bold')
+            axes[i].set_title(f"[{i}] {name}", fontsize=16, fontweight='bold')
         
         # Hide axes for all panels (including empty ones if the grid is larger than num_channels)
         axes[i].axis('off')
@@ -693,6 +693,109 @@ def fig5_fixed_all_channels(out_path, f_arr, channel_names, core_name=None, fixe
     fig.tight_layout()
     fig.savefig(out_path, bbox_inches='tight')
     plt.close(fig)
+
+
+def fig6_zoomed_patches(out_path, f_arr, channel_names, x_start, y_start, patch_size=150, core_name=None, fixed_id=None):
+    """
+    Generates a zoomed-in patch view of all channels from identical spatial coordinates
+    to highlight marker morphology (punctate cells vs. continuous structural networks).
+    """
+    num_channels = f_arr.shape[0]
+    cols = min(4, num_channels)
+    rows = int(np.ceil(num_channels / cols))
+
+    fig, axes = plt.subplots(rows, cols, figsize=(4 * cols, 4 * rows), dpi=DPI)
+
+    title_lines = [f'Zoomed ROI ({patch_size}x{patch_size} px) — Marker Morphology']
+    if core_name is not None:
+        title_lines.append(f'{core_name}   |   Slice: {fixed_id}')
+    fig.suptitle('\n'.join(title_lines), fontsize=16, fontweight='bold', y=1.02)
+
+    if num_channels == 1:
+        axes = [axes]
+    else:
+        axes = axes.flatten()
+
+    # Shared color palette from Fig 5
+    colors = [
+        (0.0, 0.5, 1.0), (0.2, 1.0, 0.2), (1.0, 0.2, 0.2), (0.0, 1.0, 1.0),
+        (1.0, 0.0, 1.0), (1.0, 1.0, 0.0), (1.0, 0.5, 0.0), (0.7, 0.7, 0.7)
+    ]
+
+    for i in range(len(axes)):
+        if i < num_channels:
+            # Extract the specific patch from the channel
+            ch_full = f_arr[i].astype(np.float32)
+            ch_patch = ch_full[y_start:y_start+patch_size, x_start:x_start+patch_size]
+
+            # Normalise based on the patch statistics to ensure high contrast in the zoom
+            p_lo, p_hi = np.percentile(ch_patch, (1.0, 99.0))
+            if p_hi > p_lo:
+                ch_norm = np.clip((ch_patch - p_lo) / (p_hi - p_lo), 0, 1)
+            else:
+                ch_norm = np.zeros_like(ch_patch)
+
+            rgb = np.zeros((*ch_norm.shape, 3), dtype=np.float32)
+            color = colors[i % len(colors)]
+
+            rgb[..., 0] = ch_norm * color[0]
+            rgb[..., 1] = ch_norm * color[1]
+            rgb[..., 2] = ch_norm * color[2]
+
+            axes[i].imshow(rgb)
+            name = channel_names[i] if i < len(channel_names) else f"Channel {i}"
+            axes[i].set_title(f"[{i}] {name}", fontsize=16, fontweight='bold')
+        
+        axes[i].axis('off')
+
+    fig.tight_layout()
+    fig.savefig(out_path, bbox_inches='tight')
+    plt.close(fig)
+
+
+def get_diverse_patch_coordinates(f_arr: np.ndarray, mask: np.ndarray, patch_size: int) -> tuple:
+    """
+    Identifies optimal patch coordinates by maximizing marker co-occurrence.
+    Computes local density for each channel independently, normalizes them 
+    to ensure equal weighting, and finds the region with the highest cumulative signal.
+    """
+    c, h, w = f_arr.shape
+    combined_score = np.zeros((h, w), dtype=np.float32)
+    margin = patch_size // 2
+
+    # 1. Evaluate each channel independently
+    for i in range(c):
+        ch_data = f_arr[i].astype(np.float32)
+        
+        # Calculate local signal density for this specific channel
+        density = cv2.boxFilter(ch_data, -1, (patch_size, patch_size), normalize=True)
+        
+        # 2. Normalize to 0-1 so abundant channels do not overpower sparse channels
+        if np.any(mask > 0):
+            p_max = np.percentile(density[mask > 0], 99.5)
+        else:
+            p_max = density.max()
+            
+        if p_max > 0:
+            norm_density = np.clip(density / p_max, 0, 1)
+            combined_score += norm_density
+
+    # 3. Constrain search strictly to valid bounds to prevent array edge overflow
+    valid_map = np.zeros_like(combined_score)
+    valid_map[margin:h-margin, margin:w-margin] = combined_score[margin:h-margin, margin:w-margin]
+    
+    # Ensure the chosen center point is valid tissue
+    if mask is not None:
+        valid_map[mask == 0] = 0.0
+
+    # 4. Extract the coordinate with the highest diversity score
+    _, _, _, max_loc = cv2.minMaxLoc(valid_map)
+    center_x, center_y = max_loc
+
+    x_start = max(0, center_x - margin)
+    y_start = max(0, center_y - margin)
+
+    return x_start, y_start
 
 # ─────────────────────────────────────────────────────────────────────────────
 # EXECUTION SCRIPT
@@ -829,6 +932,17 @@ def main():
     )
     print(" -> fig5_all_channels saved.")
 
+    # ── NEW: Figure 6 - Zoomed ROI ───────────────────────────────────────────
+    PATCH_SIZE = 300
+    x_start, y_start = get_diverse_patch_coordinates(f_arr, mask_f, PATCH_SIZE)
+    
+    fig6_zoomed_patches(
+        os.path.join(OUT_DIR, f"fig6_zoomed_patches_{base}.png"),
+        f_arr, CHANNEL_NAMES,
+        x_start, y_start, patch_size=PATCH_SIZE,
+        core_name=args.core_name, fixed_id=args.fixed_id
+    )
+    print(" -> fig6_zoomed_patches saved.")
     print(f"\nSuccess. All plots saved to: {OUT_DIR}")
 
 if __name__ == "__main__":

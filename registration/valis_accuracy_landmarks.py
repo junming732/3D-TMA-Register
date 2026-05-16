@@ -1,5 +1,5 @@
 """
-valis_registration_accuracy_landmarks.py
+valis_accuracy_landmarks.py
 ─────────────────────────────────────────
 Compute landmark-based TRE for the VALIS pipeline.
 
@@ -65,19 +65,16 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(levelname)s | %(
 logger = logging.getLogger(__name__)
 
 # ─── PATHS — mirrors valis_register_core2.py exactly ─────────────────────────
-DATA_BASE_PATH = os.path.join(config.DATASPACE, "TMA_Cores_Grouped_Rotate")
-INPUT_FOLDER   = os.path.join(DATA_BASE_PATH, TARGET_CORE)
-
-WORK_OUTPUT    = os.path.join(config.DATASPACE, "VALIS_Baseline_Eval")
-OUTPUT_FOLDER  = os.path.join(WORK_OUTPUT, TARGET_CORE)
-VERIFY_OUTPUT  = os.path.join(OUTPUT_FOLDER, "annotation_verification")
+WORK_OUTPUT   = os.path.join(config.DATASPACE, "VALIS_Baseline_Eval")
+# VALIS creates <dst_dir>/<name>/ internally, so the actual output is one level deeper
+OUTPUT_FOLDER = os.path.join(WORK_OUTPUT, TARGET_CORE, TARGET_CORE)
+VERIFY_OUTPUT = os.path.join(OUTPUT_FOLDER, "annotation_verification_valis")
 os.makedirs(VERIFY_OUTPUT, exist_ok=True)
 
 # VALIS saves the pickled registrar in <output_dir>/data/<name>.pickle
 PICKLE_PATH = os.path.join(OUTPUT_FOLDER, "data", f"{TARGET_CORE}.pickle")
 
 logger.info(f"Core         : {TARGET_CORE}")
-logger.info(f"Input folder : {INPUT_FOLDER}")
 logger.info(f"Pickle       : {PICKLE_PATH}")
 logger.info(f"Output       : {VERIFY_OUTPUT}")
 
@@ -85,25 +82,14 @@ logger.info(f"Output       : {VERIFY_OUTPUT}")
 def z_json_to_slice_idx(z_json):
     return z_json + 10
 
-# ─── FILE LIST — mirrors valis_register_core2.py ─────────────────────────────
-def get_slice_number(filename):
-    match = re.search(r"TMA_(\d+)_", os.path.basename(filename))
+# ─── SLICE INDEX → SLIDE NAME MAPPING ────────────────────────────────────────
+# Built after loading the registrar from registrar.slide_dict, which maps
+# slide name → Slide object for every file VALIS registered.
+# We sort slide names by TMA number (same sort as the raw file list) so that
+# position in that sorted order == slice_idx.
+def get_slice_number(name):
+    match = re.search(r"TMA_(\d+)_", name)
     return int(match.group(1)) if match else 0
-
-raw_files = sorted(
-    glob.glob(os.path.join(INPUT_FOLDER, "*.tif")) +
-    glob.glob(os.path.join(INPUT_FOLDER, "*.tiff")),
-    key=get_slice_number
-)
-raw_files = [f for f in raw_files if "_thumb" not in os.path.basename(f)]
-
-if not raw_files:
-    logger.error(f"No TIFF files in {INPUT_FOLDER}")
-    sys.exit(1)
-
-# Build slice_idx → filename mapping
-idx_to_file = {i: f for i, f in enumerate(raw_files)}
-logger.info(f"Found {len(raw_files)} slices")
 
 # ─── LOAD PICKLED REGISTRAR ───────────────────────────────────────────────────
 if not os.path.isfile(PICKLE_PATH):
@@ -126,6 +112,16 @@ except Exception as e:
     logger.error(f"Failed to load registrar: {e}")
     sys.exit(1)
 
+# Build slice_idx → Slide mapping from the registrar itself — no file scanning needed.
+# registrar.slide_dict maps slide name → Slide object.
+# Sort by TMA number so position == slice_idx, same as other pipelines.
+slide_names_sorted = sorted(registrar.slide_dict.keys(), key=get_slice_number)
+idx_to_slide = {i: registrar.slide_dict[name]
+                for i, name in enumerate(slide_names_sorted)}
+logger.info(f"Registrar contains {len(idx_to_slide)} slides:")
+for i, name in enumerate(slide_names_sorted):
+    logger.info(f"  slice_idx={i:02d}  ->  {name}")
+
 # ─── LOAD ANNOTATIONS ─────────────────────────────────────────────────────────
 with open(args.annotation_json) as fh:
     ann_data = json.load(fh)
@@ -139,12 +135,8 @@ if args.mclass.lower() != 'all':
     logger.info(f"After mclass filter: {len(annotations)} annotations.")
 
 # ─── WARP EVERY LANDMARK USING VALIS ─────────────────────────────────────────
-# VALIS warp_xy signature:
-#   slide_obj.warp_xy(xy, M=None, non_rigid=True)
-#   xy : (N, 2) array of (x, y) coordinates in original image space
-#   Returns (N, 2) array in registered space
-#
-# We get the Slide object by passing the source filename to registrar.get_slide()
+# warp_xy(xy): xy is (N,2) float64 in original full-res image space
+#              returns (N,2) in registered space
 
 records = []
 
@@ -156,22 +148,14 @@ for ann in annotations:
     mc        = ann['mclass']
     ann_id    = ann['id']
 
-    if slice_idx not in idx_to_file:
+    if slice_idx not in idx_to_slide:
         logger.warning(f"  id={ann_id} z_json={z_json}: slice_idx={slice_idx} "
-                       f"out of range — skipping.")
+                       f"not in registrar ({len(idx_to_slide)} slides) — skipping.")
         continue
 
-    src_file = idx_to_file[slice_idx]
+    slide_obj = idx_to_slide[slice_idx]
 
     try:
-        slide_obj = registrar.get_slide(src_file)
-    except Exception as e:
-        logger.warning(f"  id={ann_id}: could not get Slide for "
-                       f"{os.path.basename(src_file)}: {e} — skipping.")
-        continue
-
-    try:
-        # warp_xy expects shape (N, 2): [[x, y], ...]
         xy_raw    = np.array([[x_raw, y_raw]], dtype=np.float64)
         xy_warped = slide_obj.warp_xy(xy_raw)
         wx, wy    = float(xy_warped[0, 0]), float(xy_warped[0, 1])
@@ -269,62 +253,63 @@ df_summary.to_csv(summary_csv, index=False)
 logger.info(f"Detail CSV  → {detail_csv}")
 logger.info(f"Summary CSV → {summary_csv}")
 
-# ─── PLOTS — same layout as registration_accuracy_landmarks.py ───────────────
+# ─── PLOTS ────────────────────────────────────────────────────────────────────
+from matplotlib.colors import TABLEAU_COLORS
 colour_list   = list(TABLEAU_COLORS.values())
 all_mclasses  = sorted(df_detail['mclass'].unique())
 mclass_colour = {mc: colour_list[i % len(colour_list)] for i, mc in enumerate(all_mclasses)}
 
-fig, axes = plt.subplots(1, 3, figsize=(18, 6))
-fig.suptitle(f"{TARGET_CORE} — VALIS Landmark Registration Accuracy  "
+# 1 row, 2 columns. Increased figsize to accommodate larger fonts.
+fig, axes = plt.subplots(1, 2, figsize=(16, 7))
+fig.suptitle(f"{TARGET_CORE} — Landmark Registration Accuracy  "
              f"(pixel size = {PIXEL_SIZE_UM} µm)",
-             fontsize=13, fontweight='bold')
+             fontsize=18, fontweight='bold')
 
-# Panel 1: warped positions
+# ── Panel 1: TRE per landmark vs slice ──────────
 ax = axes[0]
 for mc in all_mclasses:
-    grp = df_detail[df_detail['mclass'] == mc]
-    ax.scatter(grp['x_warped'], grp['y_warped'],
-               color=mclass_colour[mc], label=f"mclass {mc}", s=60, zorder=3)
-    cx = df_summary.loc[df_summary['mclass'] == mc, 'centroid_x'].values[0]
-    cy = df_summary.loc[df_summary['mclass'] == mc, 'centroid_y'].values[0]
-    ax.scatter(cx, cy, color=mclass_colour[mc], marker='+', s=200, linewidths=2, zorder=4)
-    for _, row in grp.iterrows():
-        ax.plot([cx, row['x_warped']], [cy, row['y_warped']],
-                color=mclass_colour[mc], alpha=0.4, lw=1)
-ax.set_title("Warped landmark positions\n(+ = centroid, lines = TRE)")
-ax.set_xlabel("x (px)");  ax.set_ylabel("y (px)")
-ax.invert_yaxis();  ax.legend(fontsize=7, ncol=2);  ax.set_aspect('equal')
+    grp = df_detail[df_detail['mclass'] == mc].sort_values('slice_idx')
+    ax.plot(grp['slice_idx'], grp['TRE_um'], 'o-',
+            color=mclass_colour[mc], label=f"mclass {mc}", markersize=8)
 
-# Panel 2: TRE vs z
-ax = axes[1]
-for mc in all_mclasses:
-    grp = df_detail[df_detail['mclass'] == mc].sort_values('z_json')
-    ax.plot(grp['z_json'], grp['TRE_um'], 'o-',
-            color=mclass_colour[mc], label=f"mclass {mc}", markersize=6)
-ax.axhline(all_tre_um.mean(), color='black', linestyle='--', lw=1.5,
+ax.axhline(all_tre_um.mean(), color='black', linestyle='--', lw=2,
            label=f"global mean {all_tre_um.mean():.1f} µm")
-ax.set_title("TRE per landmark vs z-level");  ax.set_xlabel("z_json");  ax.set_ylabel("TRE (µm)")
-ax.legend(fontsize=7, ncol=2);  ax.grid(True, alpha=0.3)
+ax.set_title("TRE per landmark vs slice", fontsize=15)
+ax.set_xlabel("slice index", fontsize=13)
+ax.set_ylabel("TRE (µm)", fontsize=13)
+ax.tick_params(axis='both', labelsize=11)
+ax.legend(fontsize=11, ncol=2)
+ax.grid(True, alpha=0.3)
 
-# Panel 3: boxplot per mclass
-ax = axes[2]
+# ── Panel 2: boxplot of TRE per mclass ───────────────────────────────────────
+ax = axes[1]
 data_per_class = [df_detail.loc[df_detail['mclass'] == mc, 'TRE_um'].values
                   for mc in all_mclasses]
-bp = ax.boxplot(data_per_class, patch_artist=True)
+bp = ax.boxplot(data_per_class, patch_artist=True, notch=False)
 for patch, mc in zip(bp['boxes'], all_mclasses):
-    patch.set_facecolor(mclass_colour[mc]);  patch.set_alpha(0.7)
+    patch.set_facecolor(mclass_colour[mc])
+    patch.set_alpha(0.7)
+
 ax.set_xticks(range(1, len(all_mclasses) + 1))
-ax.set_xticklabels([f"mclass {mc}" for mc in all_mclasses], rotation=30, ha='right')
-ax.set_ylabel("TRE (µm)");  ax.set_title("TRE distribution per structure (VALIS)")
-ax.axhline(all_tre_um.mean(), color='black', linestyle='--', lw=1.5,
+ax.set_xticklabels([f"mclass {mc}" for mc in all_mclasses], rotation=30, ha='right', fontsize=12)
+ax.set_ylabel("TRE (µm)", fontsize=13)
+ax.set_title("TRE distribution per structure (mclass)", fontsize=15)
+ax.axhline(all_tre_um.mean(), color='black', linestyle='--', lw=2,
            label=f"global mean {all_tre_um.mean():.1f} µm")
-ax.legend(fontsize=8);  ax.grid(True, alpha=0.3, axis='y')
+ax.tick_params(axis='y', labelsize=11)
+ax.legend(fontsize=11)
+ax.grid(True, alpha=0.3, axis='y')
+
+# Annotate each box with mean value
 for i, (mc, vals) in enumerate(zip(all_mclasses, data_per_class)):
     ax.text(i + 1, vals.max() + 0.5, f"{vals.mean():.1f}",
-            ha='center', va='bottom', fontsize=7, color=mclass_colour[mc])
+            ha='center', va='bottom', fontsize=10, fontweight='bold', color=mclass_colour[mc])
 
 plt.tight_layout()
-plot_path = os.path.join(VERIFY_OUTPUT, f"{TARGET_CORE}_VALIS_landmark_accuracy_plot.png")
+# Provide a slight buffer at the top so the main title doesn't overlap the subplots
+plt.subplots_adjust(top=0.88)
+
+plot_path = os.path.join(VERIFY_OUTPUT, f"{TARGET_CORE}_landmark_accuracy_plot.png")
 fig.savefig(plot_path, dpi=150, bbox_inches='tight')
 plt.close(fig)
 logger.info(f"Plot → {plot_path}")
@@ -339,5 +324,183 @@ print(f"  GLOBAL  mean TRE = {all_tre_um.mean():.2f} µm  |  "
       f"median = {np.median(all_tre_um):.2f} µm  |  "
       f"max = {all_tre_um.max():.2f} µm")
 print("="*70 + "\n")
+
+# ─── ADJACENT-SLICE OVERLAYS ──────────────────────────────────────────────────
+# Layout: 2 rows × N columns per figure.
+#   Row 0 — DAPI overlay  (channel 0)
+#   Row 1 — CK overlay    (channel CK_CHANNEL_IDX)
+
+DAPI_CHANNEL_IDX = 0
+CK_CHANNEL_IDX   = 6
+
+
+def load_slice_channel_valis(slice_idx, channel_idx):
+    """
+    Load a single channel from the C,Y,X .ome.tif for a VALIS slide.
+    Uses slide_obj.src_f (the original source file recorded in the registrar).
+    Returns a contrast-stretched float32 array in [0,1], or None on failure.
+    """
+    slide_obj = idx_to_slide.get(slice_idx)
+    if slide_obj is None:
+        return None
+    src = getattr(slide_obj, 'src_f', None)
+    if src is None or not os.path.isfile(src):
+        return None
+    try:
+        import tifffile
+        img = tifffile.imread(src)           # expected shape: (C, Y, X)
+        if img.ndim == 2:
+            ch = img
+        elif img.ndim == 3:
+            ch = img[channel_idx]
+        else:
+            ch = img[0, channel_idx]         # Z,C,Y,X fallback
+        ch = ch.astype(np.float32)
+        p2, p98 = np.percentile(ch, 2), np.percentile(ch, 98)
+        if p98 > p2:
+            ch = np.clip((ch - p2) / (p98 - p2), 0, 1)
+        return ch
+    except Exception as e:
+        logger.warning(f"Could not load slice_idx={slice_idx} ch={channel_idx}: {e}")
+        return None
+
+
+def make_two_channel_rgb(img_a, img_b):
+    """
+    Blend two greyscale images into a cyan (A = lower z) / magenta (B = upper z) overlay.
+    White/grey pixels indicate agreement between the two slices.
+    """
+    h = max(img_a.shape[0] if img_a is not None else 0,
+            img_b.shape[0] if img_b is not None else 0)
+    w = max(img_a.shape[1] if img_a is not None else 0,
+            img_b.shape[1] if img_b is not None else 0)
+    a = img_a if img_a is not None else np.zeros((h, w), np.float32)
+    b = img_b if img_b is not None else np.zeros((h, w), np.float32)
+    if a.shape != b.shape:
+        from skimage.transform import resize as sk_resize
+        b = sk_resize(b, a.shape, anti_aliasing=True).astype(np.float32)
+    r  = np.clip(b, 0, 1)   # red   — upper slice
+    g  = np.clip(a, 0, 1)   # green — lower slice
+    bl = np.zeros_like(r)   # no blue: overlap → yellow, single → red or green
+    return np.stack([r, g, bl], axis=2)
+
+
+def _annotate_overlay_ax(ax, rgb, wx_a, wy_a, wx_b, wy_b,
+                         x0, x1, y0, y1, z_a, z_b,
+                         dist_px, dist_um, row_label):
+    """Shared helper: imshow + markers + arrow + label for one overlay panel."""
+    mid_x = (wx_a + wx_b) / 2
+    mid_y = (wy_a + wy_b) / 2
+
+    ax.imshow(rgb, origin='upper', extent=[x0, x1, y1, y0])
+
+    ax.scatter(wx_a, wy_a, c='#00ff00', s=80, zorder=5,
+               edgecolors='white', linewidths=0.8, label=f"slice {z_a}")
+    ax.scatter(wx_b, wy_b, c='#ff0000', s=80, zorder=5,
+               edgecolors='white', linewidths=0.8, label=f"slice {z_b}")
+
+    ax.annotate('', xy=(wx_b, wy_b), xytext=(wx_a, wy_a),
+                arrowprops=dict(arrowstyle='->', color='yellow', lw=1.8))
+
+    ax.text(mid_x, mid_y - 5,
+            f"{dist_px:.1f} px / {dist_um:.1f} µm",
+            ha='center', va='bottom', fontsize=8,
+            color='yellow', fontweight='bold',
+            bbox=dict(boxstyle='round,pad=0.2', fc='black', alpha=0.55, lw=0))
+
+    ax.set_xlim(x0, x1)
+    ax.set_ylim(y1, y0)
+    ax.set_title(f"{row_label}  |  slice {z_a} → slice {z_b}  |  Δ = {dist_um:.1f} µm",
+                 fontsize=9)
+    ax.set_xlabel("x (px)", fontsize=8)
+    ax.set_ylabel("y (px)", fontsize=8)
+    ax.legend(fontsize=7, loc='lower right',
+              facecolor='black', labelcolor='white', framealpha=0.6)
+
+
+def plot_adjacent_slice_overlays_valis(df_detail,
+                                       dapi_crop_half=50,
+                                       ck_crop_half=150,
+                                       dpi=120):
+    """
+    For each mclass with ≥2 z-levels, produce one PNG with:
+      Row 0 — DAPI (ch 0) cyan/magenta overlay — tighter crop (dapi_crop_half=50)
+      Row 1 — CK   (ch 6) cyan/magenta overlay — wider crop  (ck_crop_half=150)
+    """
+    try:
+        import tifffile  # noqa
+    except ImportError:
+        logger.warning("tifffile not installed — skipping adjacent-slice overlays.")
+        return
+
+    for mc, grp in df_detail.groupby('mclass'):
+        grp_sorted = grp.sort_values('z_json').reset_index(drop=True)
+        if len(grp_sorted) < 2:
+            continue
+
+        pairs   = [(i, i + 1) for i in range(len(grp_sorted) - 1)]
+        n_pairs = len(pairs)
+
+        fig, axes = plt.subplots(2, n_pairs,
+                                 figsize=(5 * n_pairs, 10),
+                                 squeeze=False)
+
+        fig.suptitle(
+            f"{TARGET_CORE}  —  VALIS adjacent-slice overlay  |  mclass {mc}\n"
+            f"Green = lower slice, Red = upper slice  |  pixel size = {PIXEL_SIZE_UM} µm",
+            fontsize=10, fontweight='bold'
+        )
+
+        for col, (ia, ib) in enumerate(pairs):
+            row_a   = grp_sorted.iloc[ia]
+            row_b   = grp_sorted.iloc[ib]
+            sidx_a, sidx_b  = int(row_a['slice_idx']), int(row_b['slice_idx'])
+            z_a,    z_b     = sidx_a, sidx_b   # display as original slice numbers
+            wx_a,   wy_a    = float(row_a['x_warped']), float(row_a['y_warped'])
+            wx_b,   wy_b    = float(row_b['x_warped']), float(row_b['y_warped'])
+
+            dist_px = np.hypot(wx_b - wx_a, wy_b - wy_a)
+            dist_um = dist_px * PIXEL_SIZE_UM
+            mid_x   = (wx_a + wx_b) / 2
+            mid_y   = (wy_a + wy_b) / 2
+
+            for row_idx, (ch_idx, ch_label, ch_crop) in enumerate([
+                    (DAPI_CHANNEL_IDX, "DAPI", dapi_crop_half),
+                    (CK_CHANNEL_IDX,   "CK",   ck_crop_half)]):
+
+                ax    = axes[row_idx][col]
+                img_a = load_slice_channel_valis(sidx_a, ch_idx)
+                img_b = load_slice_channel_valis(sidx_b, ch_idx)
+
+                if img_a is None and img_b is None:
+                    ax.set_title(f"{ch_label}  z {z_a}→{z_b}\n(unavailable)")
+                    ax.axis('off')
+                    continue
+
+                ref  = img_a if img_a is not None else img_b
+                H, W = ref.shape
+                x0 = max(0, int(mid_x) - ch_crop)
+                x1 = min(W, int(mid_x) + ch_crop)
+                y0 = max(0, int(mid_y) - ch_crop)
+                y1 = min(H, int(mid_y) + ch_crop)
+
+                def crop(img, _y0=y0, _y1=y1, _x0=x0, _x1=x1):
+                    return img[_y0:_y1, _x0:_x1] if img is not None else None
+
+                rgb = make_two_channel_rgb(crop(img_a), crop(img_b))
+                _annotate_overlay_ax(ax, rgb, wx_a, wy_a, wx_b, wy_b,
+                                     x0, x1, y0, y1, z_a, z_b,
+                                     dist_px, dist_um, ch_label)
+
+        plt.tight_layout()
+        overlay_path = os.path.join(
+            VERIFY_OUTPUT, f"{TARGET_CORE}_VALIS_adjacent_overlay_mclass{mc}.png"
+        )
+        fig.savefig(overlay_path, dpi=dpi, bbox_inches='tight')
+        plt.close(fig)
+        logger.info(f"Adjacent overlay (mclass {mc}) → {overlay_path}")
+
+
+plot_adjacent_slice_overlays_valis(df_detail)
 
 logger.info("Done.")
