@@ -15,7 +15,9 @@ import time
 import argparse
 import shutil
 import glob
+import re
 import logging
+import yaml
 
 logging.basicConfig(
     level=logging.INFO,
@@ -36,6 +38,30 @@ except ImportError:
     sys.exit(1)
 
 
+def load_slice_filter(yaml_path, core_name):
+    if not os.path.exists(yaml_path):
+        return None
+    with open(yaml_path) as fh:
+        data = yaml.safe_load(fh) or {}
+    raw = data.get(core_name)
+    if raw is None:
+        return None
+    allowed = set()
+    for part in str(raw).split(","):
+        part = part.strip()
+        if "-" in part:
+            lo, hi = part.split("-", 1)
+            allowed.update(range(int(lo.strip()), int(hi.strip()) + 1))
+        else:
+            allowed.add(int(part))
+    return allowed
+
+
+def get_slice_number(filename):
+    match = re.search(r"TMA_(\d+)_", os.path.basename(filename))
+    return int(match.group(1)) if match else 0
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Baseline VALIS registration for TMA cores."
@@ -48,11 +74,12 @@ def main():
     # 1. Path Definitions & I/O Setup
     # -------------------------------------------------------------------------
     # Restored exact path routing from the original script
-    DATA_BASE_PATH = os.path.join(config.DATASPACE, "TMA_Cores_Grouped_Rotate_Conformed")
-    input_dir      = os.path.join(DATA_BASE_PATH, args.core_name)
-    WORK_OUTPUT    = os.path.join(config.DATASPACE, "VALIS_Baseline_Eval")
-    output_dir     = os.path.join(WORK_OUTPUT, args.core_name)
-    reg_slides_dir = os.path.join(output_dir, "registered_slides")
+    DATA_BASE_PATH    = os.path.join(config.DATASPACE, "TMA_Cores_Grouped_Rotate_Conformed")
+    input_dir         = os.path.join(DATA_BASE_PATH, args.core_name)
+    WORK_OUTPUT       = os.path.join(config.DATASPACE, "VALIS_Filter_Eval")
+    output_dir        = os.path.join(WORK_OUTPUT, args.core_name)
+    reg_slides_dir    = os.path.join(output_dir, "registered_slides")
+    SLICE_FILTER_YAML = os.path.join(config.DATASPACE, "slice_filter.yaml")
 
     logger.info("=" * 60)
     logger.info(f"Baseline VALIS Registration | Core: {args.core_name}")
@@ -71,13 +98,29 @@ def main():
     # -------------------------------------------------------------------------
     sample_files = sorted(
         glob.glob(os.path.join(input_dir, "*.tif")) +
-        glob.glob(os.path.join(input_dir, "*.tiff"))
+        glob.glob(os.path.join(input_dir, "*.tiff")),
+        key=get_slice_number
     )
     if not sample_files:
         logger.error("No TIFF files found.")
         sys.exit(1)
 
     valid_files = [f for f in sample_files if "_thumb" not in os.path.basename(f)]
+
+    allowed_positions = load_slice_filter(SLICE_FILTER_YAML, args.core_name)
+    if allowed_positions is not None:
+        original_count = len(valid_files)
+        valid_files    = [f for f in valid_files if get_slice_number(f) in allowed_positions]
+        excluded       = original_count - len(valid_files)
+        logger.info(
+            f"Slice filter active: keeping {len(valid_files)}/{original_count} slices "
+            f"(positions {sorted(allowed_positions)}), {excluded} excluded."
+        )
+        if len(valid_files) == 0:
+            logger.error("Slice filter excluded all slices.")
+            sys.exit(1)
+    else:
+        logger.info(f"No slice filter — using all {len(valid_files)} slices.")
     
     # Staging directory logic preserved to protect I/O 
     staging_dir = os.path.join(WORK_OUTPUT, args.core_name, "staging")

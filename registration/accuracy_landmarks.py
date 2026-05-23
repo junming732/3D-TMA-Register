@@ -37,9 +37,21 @@ Usage
         --annotation_json /path/to/rough_annotation_core_09.json \
         [--pixel_size_um 0.4961]   # physical pixel size (default from registration script)
         [--mclass all]             # 'all' or comma-separated ints
+
+Fixes vs original
+─────────────────
+  1. warp_point: affine was applied in forward direction; now uses cv2.invertAffineTransform
+     so the point is correctly transformed moving→fixed before indexing the remap.
+  2. warp_point: remap was inverted via nearest-neighbour search; now indexes map_x/map_y
+     directly at the affine-transformed coordinate (the maps ARE the forward warp).
+  3. Overlay images: were loaded from raw unregistered FILE_LIST; now loaded from the
+     registered output volume so the image content matches the warped landmark coordinates.
+  4. Slice index mapping: registered volume Z-axis indices correspond to the filtered slice
+     list, not the original full file list.  SLICE_IDX_TO_VOL_Z maps TMA slice numbers to
+     the correct Z position in the registered volume.
 """
 
-import os, re, sys, json, glob, argparse
+import os, re, sys, json, glob, argparse, yaml
 import numpy as np
 import pandas as pd
 import matplotlib
@@ -72,12 +84,13 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(levelname)s | %(
 logger = logging.getLogger(__name__)
 
 # ─── PATHS — mirrors registration script ──────────────────────────────────────
-DATA_BASE_PATH = os.path.join(config.DATASPACE, "TMA_Cores_Grouped_Rotate_Conformed")
-INPUT_FOLDER   = os.path.join(DATA_BASE_PATH, TARGET_CORE)
-WORK_OUTPUT    = os.path.join(config.DATASPACE, "Filter_AKAZE_RoMaV2_Linear_Warp_map")
-OUTPUT_FOLDER  = os.path.join(WORK_OUTPUT, TARGET_CORE)
-DEFORM_FOLDER  = os.path.join(OUTPUT_FOLDER, "deformation_maps")
-VERIFY_OUTPUT  = os.path.join(OUTPUT_FOLDER, "annotation_verification_Romav2")
+DATA_BASE_PATH    = os.path.join(config.DATASPACE, "TMA_Cores_Grouped_Rotate_Conformed")
+INPUT_FOLDER      = os.path.join(DATA_BASE_PATH, TARGET_CORE)
+WORK_OUTPUT       = os.path.join(config.DATASPACE, "Filter_AKAZE_RoMaV2_Linear_Warp_map")
+OUTPUT_FOLDER     = os.path.join(WORK_OUTPUT, TARGET_CORE)
+DEFORM_FOLDER     = os.path.join(OUTPUT_FOLDER, "deformation_maps")
+VERIFY_OUTPUT     = os.path.join(OUTPUT_FOLDER, "annotation_verification_Romav2")
+SLICE_FILTER_YAML = os.path.join(config.DATASPACE, "slice_filter.yaml")
 os.makedirs(VERIFY_OUTPUT, exist_ok=True)
 
 logger.info(f"Core         : {TARGET_CORE}")
@@ -99,6 +112,46 @@ if not FILE_LIST:
     sys.exit(1)
 logger.info(f"Found {len(FILE_LIST)} slices")
 
+# ─── FILTERED SLICE LIST — mirrors registration script ────────────────────────
+# FIX 4: the registered volume only contains filtered slices, so Z indices in
+# the volume correspond to positions in FILTERED_FILE_LIST, not FILE_LIST.
+
+def load_slice_filter(yaml_path, core_name):
+    if not os.path.exists(yaml_path):
+        return None
+    with open(yaml_path) as fh:
+        data = yaml.safe_load(fh) or {}
+    raw = data.get(core_name)
+    if raw is None:
+        return None
+    allowed = set()
+    for part in str(raw).split(","):
+        part = part.strip()
+        if "-" in part:
+            lo, hi = part.split("-", 1)
+            allowed.update(range(int(lo.strip()), int(hi.strip()) + 1))
+        else:
+            allowed.add(int(part))
+    return allowed
+
+allowed_positions = load_slice_filter(SLICE_FILTER_YAML, TARGET_CORE)
+
+if allowed_positions is not None:
+    FILTERED_FILE_LIST = [f for i, f in enumerate(FILE_LIST) if i in allowed_positions]
+    logger.info(f"Slice filter active: {len(FILTERED_FILE_LIST)}/{len(FILE_LIST)} slices kept.")
+else:
+    FILTERED_FILE_LIST = FILE_LIST
+    logger.info("No slice filter — using all slices.")
+
+# slice_idx = z_json + 10 is a 0-based position into FILE_LIST.
+# Key by each file's original 0-based position, not its TMA number.
+file_to_orig_pos = {f: i for i, f in enumerate(FILE_LIST)}
+SLICE_IDX_TO_VOL_Z = {
+    file_to_orig_pos[f]: vol_z
+    for vol_z, f in enumerate(FILTERED_FILE_LIST)
+}
+logger.info(f"Slice→vol_z map: {SLICE_IDX_TO_VOL_Z}")
+
 # ─── DEFORMATION HELPERS ──────────────────────────────────────────────────────
 
 def find_deform_npz(slice_idx):
@@ -112,24 +165,37 @@ def find_deform_npz(slice_idx):
 
 def warp_point(x, y, npz_path):
     """
-    Forward-warp (x,y) from original moving-slice space → registered space.
-    Mirrors apply_deformation_to_mask() two-step logic:
-      Step 1: affine via M_affine
-      Step 2: dense remap inversion (nearest-neighbour search)
+    Forward-warp (x, y) from original moving-slice space → registered space.
+
+    The saved deformation is a two-step pipeline (mirrors register_slice):
+      Step 1 — affine:  M_affine maps moving → fixed (applied directly to the point).
+      Step 2 — remap:   map_x/map_y are BACKWARD maps (output→source in affine space).
+                        We search for the output pixel whose source coordinate is
+                        closest to (ax, ay) — the affine-transformed point.
+
+    M_affine convention:
+      cv2.warpAffine(image, M_affine, ...) uses M as output→source for images,
+      which means M_affine @ [x, y, 1] transforms a point moving → fixed.
+      Do NOT invert it for point-space transformation.
+
     Returns (wx, wy) in registered space.
     """
+    import cv2 as _cv2
     d        = np.load(npz_path)
-    M_affine = d['M_affine'].astype(np.float64)
-    map_x    = d['map_x'].astype(np.float32)
-    map_y    = d['map_y'].astype(np.float32)
+    M_affine = d['M_affine'].astype(np.float64)   # (2, 3)
+    map_x    = d['map_x'].astype(np.float32)       # (H, W)
+    map_y    = d['map_y'].astype(np.float32)       # (H, W)
+    H, W     = map_x.shape
 
-    # Step 1: affine
+    # Step 1: apply affine directly (moving → fixed).
     pt     = np.array([x, y, 1.0], dtype=np.float64)
     xy_aff = M_affine @ pt
     ax, ay = float(xy_aff[0]), float(xy_aff[1])
 
-    # Step 2: invert remap
-    H, W     = map_x.shape
+    # Step 2: NN search — find output pixel (wx, wy) whose backward-map
+    # source coordinate is closest to (ax, ay).
+    # The maps store source coords in affine-prealigned moving space,
+    # so we compare against (ax, ay), not the original (x, y).
     search_r = 150
     x0 = max(0, int(ax) - search_r);  x1 = min(W, int(ax) + search_r)
     y0 = max(0, int(ay) - search_r);  y1 = min(H, int(ay) + search_r)
@@ -193,10 +259,6 @@ if df.empty:
     sys.exit(1)
 
 # ─── COMPUTE ACCURACY METRICS ─────────────────────────────────────────────────
-# For each mclass, compute:
-#   centroid of warped points → TRE = distance from each point to centroid
-#   pairwise distances between all warped points within the class
-
 summary_rows = []
 detail_rows  = []
 
@@ -274,15 +336,13 @@ logger.info(f"Detail CSV  → {detail_csv}")
 logger.info(f"Summary CSV → {summary_csv}")
 
 # ─── PLOTS ────────────────────────────────────────────────────────────────────
-# ─── PLOTS ────────────────────────────────────────────────────────────────────
 from matplotlib.colors import TABLEAU_COLORS
 colour_list   = list(TABLEAU_COLORS.values())
 all_mclasses  = sorted(df_detail['mclass'].unique())
 mclass_colour = {mc: colour_list[i % len(colour_list)] for i, mc in enumerate(all_mclasses)}
 
-# 1 row, 2 columns. Increased figsize to accommodate larger fonts.
 fig, axes = plt.subplots(1, 2, figsize=(16, 7))
-fig.suptitle(f"{TARGET_CORE} — Landmark Registration Accuracy  "
+fig.suptitle(f"Pipeline C: {TARGET_CORE} — Landmark Registration Accuracy  "
              f"(pixel size = {PIXEL_SIZE_UM} µm)",
              fontsize=18, fontweight='bold')
 
@@ -321,16 +381,14 @@ ax.tick_params(axis='y', labelsize=11)
 ax.legend(fontsize=11)
 ax.grid(True, alpha=0.3, axis='y')
 
-# Annotate each box with mean value
 for i, (mc, vals) in enumerate(zip(all_mclasses, data_per_class)):
     ax.text(i + 1, vals.max() + 0.5, f"{vals.mean():.1f}",
             ha='center', va='bottom', fontsize=10, fontweight='bold', color=mclass_colour[mc])
 
 plt.tight_layout()
-# Provide a slight buffer at the top so the main title doesn't overlap the subplots
 plt.subplots_adjust(top=0.88)
 
-plot_path = os.path.join(VERIFY_OUTPUT, f"{TARGET_CORE}_landmark_accuracy_plot.png")
+plot_path = os.path.join(VERIFY_OUTPUT, f"{TARGET_CORE}_landmark_accuracy_plot_Romav2.png")
 fig.savefig(plot_path, dpi=150, bbox_inches='tight')
 plt.close(fig)
 logger.info(f"Plot → {plot_path}")
@@ -350,44 +408,39 @@ print("="*70 + "\n")
 # Layout: 2 rows × N columns per figure.
 #   Row 0 — DAPI overlay  (channel 0)
 #   Row 1 — CK overlay    (channel CK_CHANNEL_IDX)
-# Both rows use the same cyan/magenta blend and identical annotations so the
-# error vector is visible against both stains.
 
 DAPI_CHANNEL_IDX = 0
 CK_CHANNEL_IDX   = 6
 
 
-def load_slice_channel(slice_idx, channel_idx):
+def load_slice_channel_from_vol(vol, slice_idx, channel_idx):
     """
-    Load a single channel from the C,Y,X .ome.tif for slice_idx.
-    Returns a contrast-stretched float32 array in [0,1], or None on failure.
+    Load and contrast-stretch a single channel from the registered volume.
+
+    FIX 3 + 4: loads from the already-opened registered volume (Z, C, H, W)
+    using SLICE_IDX_TO_VOL_Z to map TMA slice numbers to the correct Z index.
+    Previously this read from the raw unregistered FILE_LIST which caused the
+    image content to be misaligned with the warped landmark coordinates.
     """
-    import tifffile
-    path = FILE_LIST[slice_idx] if slice_idx < len(FILE_LIST) else None
-    if path is None or not os.path.isfile(path):
+    vol_z = SLICE_IDX_TO_VOL_Z.get(slice_idx)
+    if vol_z is None:
+        logger.warning(f"slice_idx={slice_idx} not found in filtered slice list — skipping.")
         return None
     try:
-        img = tifffile.imread(path)           # expected shape: (C, Y, X)
-        if img.ndim == 2:
-            ch = img                           # single-channel file
-        elif img.ndim == 3:
-            ch = img[channel_idx]              # C,Y,X — index on first axis
-        else:
-            ch = img[0, channel_idx]           # Z,C,Y,X fallback
-        ch = ch.astype(np.float32)
+        ch = vol[vol_z, channel_idx].astype(np.float32)
         p2, p98 = np.percentile(ch, 2), np.percentile(ch, 98)
         if p98 > p2:
             ch = np.clip((ch - p2) / (p98 - p2), 0, 1)
         return ch
     except Exception as e:
-        logger.warning(f"Could not load slice_idx={slice_idx} ch={channel_idx}: {e}")
+        logger.warning(f"Could not load vol_z={vol_z} ch={channel_idx}: {e}")
         return None
 
 
 def make_two_channel_rgb(img_a, img_b):
     """
-    Blend two greyscale images into a cyan (A = lower z) / magenta (B = upper z) overlay.
-    White/grey pixels indicate agreement between the two slices.
+    Blend two greyscale images into a red (B = upper z) / green (A = lower z) overlay.
+    Yellow pixels indicate agreement between the two slices.
     """
     h = max(img_a.shape[0] if img_a is not None else 0,
             img_b.shape[0] if img_b is not None else 0)
@@ -400,7 +453,7 @@ def make_two_channel_rgb(img_a, img_b):
         b = sk_resize(b, a.shape, anti_aliasing=True).astype(np.float32)
     r  = np.clip(b, 0, 1)   # red   — upper slice
     g  = np.clip(a, 0, 1)   # green — lower slice
-    bl = np.zeros_like(r)   # no blue: overlap → yellow, single → red or green
+    bl = np.zeros_like(r)
     return np.stack([r, g, bl], axis=2)
 
 
@@ -443,14 +496,29 @@ def plot_adjacent_slice_overlays(df_detail,
                                  dpi=120):
     """
     For each mclass with ≥2 z-levels, produce one PNG with:
-      Row 0 — DAPI (ch 0) cyan/magenta overlay — tighter crop (dapi_crop_half=50)
-      Row 1 — CK   (ch 6) cyan/magenta overlay — wider crop  (ck_crop_half=150)
+      Row 0 — DAPI (ch 0) overlay — tighter crop (dapi_crop_half=50)
+      Row 1 — CK   (ch 6) overlay — wider crop  (ck_crop_half=150)
+
+    FIX 3: loads from the registered output volume so image content is
+    aligned with the warped landmark coordinates.
+    FIX 4: uses SLICE_IDX_TO_VOL_Z for correct Z-axis indexing.
     """
     try:
-        import tifffile  # noqa
+        import tifffile
     except ImportError:
         logger.warning("tifffile not installed — skipping adjacent-slice overlays.")
         return
+
+    # Load registered volume once — avoids re-reading the TIFF for every pair
+    reg_path = os.path.join(OUTPUT_FOLDER,
+                            f"{TARGET_CORE}_AKAZE_RoMaV2_Linear_Aligned.ome.tif")
+    if not os.path.isfile(reg_path):
+        logger.warning(f"Registered volume not found at {reg_path} — skipping overlays.")
+        return
+
+    logger.info(f"Loading registered volume from {reg_path} ...")
+    reg_vol = tifffile.imread(reg_path)   # expected shape: (Z, C, H, W)
+    logger.info(f"Registered volume shape: {reg_vol.shape}")
 
     for mc, grp in df_detail.groupby('mclass'):
         grp_sorted = grp.sort_values('z_json').reset_index(drop=True)
@@ -466,7 +534,7 @@ def plot_adjacent_slice_overlays(df_detail,
                                  squeeze=False)
 
         fig.suptitle(
-            f"{TARGET_CORE}  —  Adjacent-slice overlay  |  mclass {mc}\n"
+            f"Pipeline C: {TARGET_CORE}  —  Adjacent-slice overlay  |  mclass {mc}\n"
             f"Green = lower slice, Red = upper slice  |  pixel size = {PIXEL_SIZE_UM} µm",
             fontsize=10, fontweight='bold'
         )
@@ -475,7 +543,7 @@ def plot_adjacent_slice_overlays(df_detail,
             row_a  = grp_sorted.iloc[ia]
             row_b  = grp_sorted.iloc[ib]
             sidx_a, sidx_b = int(row_a['slice_idx']), int(row_b['slice_idx'])
-            z_a,    z_b    = sidx_a, sidx_b   # display as original slice numbers
+            z_a,    z_b    = sidx_a, sidx_b
             wx_a,  wy_a   = float(row_a['x_warped']), float(row_a['y_warped'])
             wx_b,  wy_b   = float(row_b['x_warped']), float(row_b['y_warped'])
 
@@ -488,17 +556,18 @@ def plot_adjacent_slice_overlays(df_detail,
                     (DAPI_CHANNEL_IDX, "DAPI", dapi_crop_half),
                     (CK_CHANNEL_IDX,   "CK",   ck_crop_half)]):
 
-                ax      = axes[row_idx][col]
-                img_a   = load_slice_channel(sidx_a, ch_idx)
-                img_b   = load_slice_channel(sidx_b, ch_idx)
+                ax    = axes[row_idx][col]
+                # FIX 3+4: load from registered volume using correct Z mapping
+                img_a = load_slice_channel_from_vol(reg_vol, sidx_a, ch_idx)
+                img_b = load_slice_channel_from_vol(reg_vol, sidx_b, ch_idx)
 
                 if img_a is None and img_b is None:
                     ax.set_title(f"{ch_label}  z {z_a}→{z_b}\n(unavailable)")
                     ax.axis('off')
                     continue
 
-                ref     = img_a if img_a is not None else img_b
-                H, W    = ref.shape
+                ref  = img_a if img_a is not None else img_b
+                H, W = ref.shape
                 x0 = max(0, int(mid_x) - ch_crop)
                 x1 = min(W, int(mid_x) + ch_crop)
                 y0 = max(0, int(mid_y) - ch_crop)

@@ -21,10 +21,6 @@ VENV_PATH="/home/junming/3D-TMA-Register/venv_312"
 # Neighbourhood radius for spatial interaction scoring (µm)
 RADIUS_UM=50
 
-# Number of permutations for interaction score null distribution.
-# Use 100 for a quick first-pass check, 1000 for final results.
-N_PERM=1000
-
 # Minimum number of cells of a type required to include it in analysis.
 # Types below this threshold are skipped for that core.
 MIN_CELLS=10
@@ -67,7 +63,6 @@ echo "============================================================"
 echo "  2D vs 3D TME Comparison Pipeline"
 echo "  Cores          : Core_$(printf "%02d" $START) -> Core_$(printf "%02d" $END)"
 echo "  Radius         : ${RADIUS_UM} um"
-echo "  Permutations   : ${N_PERM}"
 echo "  Min cells/type : ${MIN_CELLS}"
 echo "  Start time     : $(date)"
 echo "============================================================"
@@ -110,12 +105,11 @@ for i in $(seq $START $END); do
     fi
 
     echo "  [RUN] TME spatial analysis for ${CORE_NAME} ..."
-    echo "        (n_perm=${N_PERM} -- this may take 20-40 min per core)"
+    echo "        (Entropy & log2 ratio mode -- should execute rapidly)"
 
     python "${ANALYSIS_SCRIPT}" \
         --core_name  "${CORE_NAME}" \
         --radius_um  "${RADIUS_UM}" \
-        --n_perm     "${N_PERM}"    \
         --min_cells  "${MIN_CELLS}" \
         > "${LOG_TME}/${CORE_NAME}.log" 2>&1
 

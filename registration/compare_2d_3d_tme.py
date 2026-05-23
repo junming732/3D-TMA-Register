@@ -786,7 +786,7 @@ for k, ct in enumerate(types_ent):
 
     x_ann = max(row['mean_H_2d'] + row['std_H_2d'],
                 row['mean_H_3d'] + row['std_H_3d']) + 0.03
-    label = f"$\Delta${row['delta_mean_H']:+.2f}"
+    label = rf"$\Delta${row['delta_mean_H']:+.2f}"
     if sig:
         label += '  ★'
     ax_bar.text(x_ann, k, label, va='center', fontsize=8.5,

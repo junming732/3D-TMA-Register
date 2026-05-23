@@ -73,6 +73,8 @@ os.makedirs(VERIFY_OUTPUT, exist_ok=True)
 
 # VALIS saves the pickled registrar in <output_dir>/data/<name>.pickle
 PICKLE_PATH = os.path.join(OUTPUT_FOLDER, "data", f"{TARGET_CORE}.pickle")
+REG_SLIDES_DIR = os.path.join(OUTPUT_FOLDER, "..", "registered_slides")
+REG_SLIDES_DIR = os.path.normpath(REG_SLIDES_DIR)
 
 logger.info(f"Core         : {TARGET_CORE}")
 logger.info(f"Pickle       : {PICKLE_PATH}")
@@ -261,7 +263,7 @@ mclass_colour = {mc: colour_list[i % len(colour_list)] for i, mc in enumerate(al
 
 # 1 row, 2 columns. Increased figsize to accommodate larger fonts.
 fig, axes = plt.subplots(1, 2, figsize=(16, 7))
-fig.suptitle(f"{TARGET_CORE} — Landmark Registration Accuracy  "
+fig.suptitle(f"Pipeline B {TARGET_CORE} — Landmark Registration Accuracy  "
              f"(pixel size = {PIXEL_SIZE_UM} µm)",
              fontsize=18, fontweight='bold')
 
@@ -309,7 +311,7 @@ plt.tight_layout()
 # Provide a slight buffer at the top so the main title doesn't overlap the subplots
 plt.subplots_adjust(top=0.88)
 
-plot_path = os.path.join(VERIFY_OUTPUT, f"{TARGET_CORE}_landmark_accuracy_plot.png")
+plot_path = os.path.join(VERIFY_OUTPUT, f"{TARGET_CORE}_landmark_accuracy_plot_Valis.png")
 fig.savefig(plot_path, dpi=150, bbox_inches='tight')
 plt.close(fig)
 logger.info(f"Plot → {plot_path}")
@@ -335,33 +337,35 @@ CK_CHANNEL_IDX   = 6
 
 
 def load_slice_channel_valis(slice_idx, channel_idx):
-    """
-    Load a single channel from the C,Y,X .ome.tif for a VALIS slide.
-    Uses slide_obj.src_f (the original source file recorded in the registrar).
-    Returns a contrast-stretched float32 array in [0,1], or None on failure.
-    """
     slide_obj = idx_to_slide.get(slice_idx)
     if slide_obj is None:
         return None
-    src = getattr(slide_obj, 'src_f', None)
-    if src is None or not os.path.isfile(src):
+
+    # Find registered output file instead of raw src_f
+    src_basename = os.path.splitext(os.path.basename(slide_obj.src_f))[0]
+    candidates = glob.glob(os.path.join(REG_SLIDES_DIR, f"*{src_basename}*"))
+    if not candidates:
+        logger.warning(f"No registered file found for slice_idx={slice_idx} "
+                       f"(looking for *{src_basename}* in {REG_SLIDES_DIR})")
         return None
+    reg_path = candidates[0]
+
     try:
         import tifffile
-        img = tifffile.imread(src)           # expected shape: (C, Y, X)
+        img = tifffile.imread(reg_path)
         if img.ndim == 2:
             ch = img
         elif img.ndim == 3:
             ch = img[channel_idx]
         else:
-            ch = img[0, channel_idx]         # Z,C,Y,X fallback
+            ch = img[0, channel_idx]
         ch = ch.astype(np.float32)
         p2, p98 = np.percentile(ch, 2), np.percentile(ch, 98)
         if p98 > p2:
             ch = np.clip((ch - p2) / (p98 - p2), 0, 1)
         return ch
     except Exception as e:
-        logger.warning(f"Could not load slice_idx={slice_idx} ch={channel_idx}: {e}")
+        logger.warning(f"Could not load registered slice_idx={slice_idx}: {e}")
         return None
 
 
@@ -446,7 +450,7 @@ def plot_adjacent_slice_overlays_valis(df_detail,
                                  squeeze=False)
 
         fig.suptitle(
-            f"{TARGET_CORE}  —  VALIS adjacent-slice overlay  |  mclass {mc}\n"
+            f"Pipeline B: {TARGET_CORE}  —  VALIS adjacent-slice overlay  |  mclass {mc}\n"
             f"Green = lower slice, Red = upper slice  |  pixel size = {PIXEL_SIZE_UM} µm",
             fontsize=10, fontweight='bold'
         )

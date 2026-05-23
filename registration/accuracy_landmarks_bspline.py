@@ -39,7 +39,7 @@ Usage
         [--mclass all]             # 'all' or comma-separated ints
 """
 
-import os, re, sys, json, glob, argparse
+import os, re, sys, json, glob, argparse, yaml
 import numpy as np
 import pandas as pd
 import matplotlib
@@ -76,8 +76,9 @@ DATA_BASE_PATH = os.path.join(config.DATASPACE, "TMA_Cores_Grouped_Rotate_Confor
 INPUT_FOLDER   = os.path.join(DATA_BASE_PATH, TARGET_CORE)
 WORK_OUTPUT    = os.path.join(config.DATASPACE, "Filter_AKAZE_TissueMask_BSpline")
 OUTPUT_FOLDER  = os.path.join(WORK_OUTPUT, TARGET_CORE)
-DEFORM_FOLDER  = os.path.join(OUTPUT_FOLDER, "deformation_maps")
-VERIFY_OUTPUT  = os.path.join(OUTPUT_FOLDER, "annotation_verification_bspline")
+DEFORM_FOLDER     = os.path.join(OUTPUT_FOLDER, "deformation_maps")
+VERIFY_OUTPUT     = os.path.join(OUTPUT_FOLDER, "annotation_verification_bspline")
+SLICE_FILTER_YAML = os.path.join(config.DATASPACE, "slice_filter.yaml")
 os.makedirs(VERIFY_OUTPUT, exist_ok=True)
 
 logger.info(f"Core         : {TARGET_CORE}")
@@ -98,6 +99,46 @@ if not FILE_LIST:
     logger.error(f"No .ome.tif files in {INPUT_FOLDER}")
     sys.exit(1)
 logger.info(f"Found {len(FILE_LIST)} slices")
+
+# ─── FILTERED SLICE LIST + SLICE→VOL_Z MAP ────────────────────────────────────
+# The registered volume only contains filtered slices, so Z indices in the
+# volume correspond to positions in FILTERED_FILE_LIST, not FILE_LIST.
+# Mirrors the working RoMaV2 accuracy script exactly.
+
+def load_slice_filter(yaml_path, core_name):
+    if not os.path.exists(yaml_path):
+        return None
+    with open(yaml_path) as fh:
+        data = yaml.safe_load(fh) or {}
+    raw = data.get(core_name)
+    if raw is None:
+        return None
+    allowed = set()
+    for part in str(raw).split(","):
+        part = part.strip()
+        if "-" in part:
+            lo, hi = part.split("-", 1)
+            allowed.update(range(int(lo.strip()), int(hi.strip()) + 1))
+        else:
+            allowed.add(int(part))
+    return allowed
+
+allowed_positions = load_slice_filter(SLICE_FILTER_YAML, TARGET_CORE)
+
+if allowed_positions is not None:
+    FILTERED_FILE_LIST = [f for i, f in enumerate(FILE_LIST) if i in allowed_positions]
+    logger.info(f"Slice filter active: {len(FILTERED_FILE_LIST)}/{len(FILE_LIST)} slices kept.")
+else:
+    FILTERED_FILE_LIST = FILE_LIST
+    logger.info("No slice filter — using all slices.")
+
+# slice_idx = z_json + 10 is a 0-based position into FILE_LIST.
+file_to_orig_pos = {f: i for i, f in enumerate(FILE_LIST)}
+SLICE_IDX_TO_VOL_Z = {
+    file_to_orig_pos[f]: vol_z
+    for vol_z, f in enumerate(FILTERED_FILE_LIST)
+}
+logger.info(f"Slice→vol_z map: {SLICE_IDX_TO_VOL_Z}")
 
 # ─── DEFORMATION HELPERS ──────────────────────────────────────────────────────
 
@@ -281,7 +322,7 @@ mclass_colour = {mc: colour_list[i % len(colour_list)] for i, mc in enumerate(al
 
 # 1 row, 2 columns. Increased figsize to accommodate larger fonts.
 fig, axes = plt.subplots(1, 2, figsize=(16, 7))
-fig.suptitle(f"{TARGET_CORE} — Landmark Registration Accuracy  "
+fig.suptitle(f"Pipeline A: {TARGET_CORE} — Landmark Registration Accuracy  "
              f"(pixel size = {PIXEL_SIZE_UM} µm)",
              fontsize=18, fontweight='bold')
 
@@ -356,30 +397,28 @@ DAPI_CHANNEL_IDX = 0
 CK_CHANNEL_IDX   = 6
 
 
-def load_slice_channel(slice_idx, channel_idx):
+def load_slice_channel_from_vol(vol, slice_idx, channel_idx):
     """
-    Load a single channel from the C,Y,X .ome.tif for slice_idx.
-    Returns a contrast-stretched float32 array in [0,1], or None on failure.
+    Load and contrast-stretch a single channel from the registered volume.
+
+    Uses SLICE_IDX_TO_VOL_Z to map TMA slice_idx to the correct Z position
+    in the registered volume (Z, C, H, W).  Loading from the registered
+    volume ensures image content is aligned with the warped landmark coords.
+    Previously this read from the raw unregistered FILE_LIST which caused
+    the image to be misaligned with the warped landmark coordinates.
     """
-    import tifffile
-    path = FILE_LIST[slice_idx] if slice_idx < len(FILE_LIST) else None
-    if path is None or not os.path.isfile(path):
+    vol_z = SLICE_IDX_TO_VOL_Z.get(slice_idx)
+    if vol_z is None:
+        logger.warning(f"slice_idx={slice_idx} not found in filtered slice list — skipping.")
         return None
     try:
-        img = tifffile.imread(path)           # expected shape: (C, Y, X)
-        if img.ndim == 2:
-            ch = img                           # single-channel file
-        elif img.ndim == 3:
-            ch = img[channel_idx]              # C,Y,X — index on first axis
-        else:
-            ch = img[0, channel_idx]           # Z,C,Y,X fallback
-        ch = ch.astype(np.float32)
+        ch = vol[vol_z, channel_idx].astype(np.float32)
         p2, p98 = np.percentile(ch, 2), np.percentile(ch, 98)
         if p98 > p2:
             ch = np.clip((ch - p2) / (p98 - p2), 0, 1)
         return ch
     except Exception as e:
-        logger.warning(f"Could not load slice_idx={slice_idx} ch={channel_idx}: {e}")
+        logger.warning(f"Could not load vol_z={vol_z} ch={channel_idx}: {e}")
         return None
 
 
@@ -442,14 +481,29 @@ def plot_adjacent_slice_overlays(df_detail,
                                  dpi=120):
     """
     For each mclass with ≥2 z-levels, produce one PNG with:
-      Row 0 — DAPI (ch 0) cyan/magenta overlay — tighter crop (dapi_crop_half=50)
-      Row 1 — CK   (ch 6) cyan/magenta overlay — wider crop  (ck_crop_half=150)
+      Row 0 — DAPI (ch 0) overlay — tighter crop (dapi_crop_half=50)
+      Row 1 — CK   (ch 6) overlay — wider crop  (ck_crop_half=150)
+
+    Loads from the registered output volume so image content is aligned
+    with the warped landmark coordinates.  Uses SLICE_IDX_TO_VOL_Z for
+    correct Z-axis indexing into the volume.
     """
     try:
-        import tifffile  # noqa
+        import tifffile
     except ImportError:
         logger.warning("tifffile not installed — skipping adjacent-slice overlays.")
         return
+
+    # Load registered volume once — avoids re-reading the TIFF for every pair
+    reg_path = os.path.join(OUTPUT_FOLDER,
+                            f"{TARGET_CORE}_AKAZE_TissueMask_Aligned.ome.tif")
+    if not os.path.isfile(reg_path):
+        logger.warning(f"Registered volume not found at {reg_path} — skipping overlays.")
+        return
+
+    logger.info(f"Loading registered volume from {reg_path} ...")
+    reg_vol = tifffile.imread(reg_path)   # expected shape: (Z, C, H, W)
+    logger.info(f"Registered volume shape: {reg_vol.shape}")
 
     for mc, grp in df_detail.groupby('mclass'):
         grp_sorted = grp.sort_values('z_json').reset_index(drop=True)
@@ -465,7 +519,7 @@ def plot_adjacent_slice_overlays(df_detail,
                                  squeeze=False)
 
         fig.suptitle(
-            f"{TARGET_CORE}  —  Adjacent-slice overlay  |  mclass {mc}\n"
+            f"Pipeline A: {TARGET_CORE}  —  Adjacent-slice overlay  |  mclass {mc}\n"
             f"Green = lower slice, Red = upper slice  |  pixel size = {PIXEL_SIZE_UM} µm",
             fontsize=10, fontweight='bold'
         )
@@ -474,7 +528,7 @@ def plot_adjacent_slice_overlays(df_detail,
             row_a  = grp_sorted.iloc[ia]
             row_b  = grp_sorted.iloc[ib]
             sidx_a, sidx_b = int(row_a['slice_idx']), int(row_b['slice_idx'])
-            z_a,    z_b    = sidx_a, sidx_b   # display as original slice numbers
+            z_a,    z_b    = sidx_a, sidx_b
             wx_a,  wy_a   = float(row_a['x_warped']), float(row_a['y_warped'])
             wx_b,  wy_b   = float(row_b['x_warped']), float(row_b['y_warped'])
 
@@ -487,17 +541,17 @@ def plot_adjacent_slice_overlays(df_detail,
                     (DAPI_CHANNEL_IDX, "DAPI", dapi_crop_half),
                     (CK_CHANNEL_IDX,   "CK",   ck_crop_half)]):
 
-                ax      = axes[row_idx][col]
-                img_a   = load_slice_channel(sidx_a, ch_idx)
-                img_b   = load_slice_channel(sidx_b, ch_idx)
+                ax    = axes[row_idx][col]
+                img_a = load_slice_channel_from_vol(reg_vol, sidx_a, ch_idx)
+                img_b = load_slice_channel_from_vol(reg_vol, sidx_b, ch_idx)
 
                 if img_a is None and img_b is None:
                     ax.set_title(f"{ch_label}  z {z_a}→{z_b}\n(unavailable)")
                     ax.axis('off')
                     continue
 
-                ref     = img_a if img_a is not None else img_b
-                H, W    = ref.shape
+                ref  = img_a if img_a is not None else img_b
+                H, W = ref.shape
                 x0 = max(0, int(mid_x) - ch_crop)
                 x1 = min(W, int(mid_x) + ch_crop)
                 y0 = max(0, int(mid_y) - ch_crop)
