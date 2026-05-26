@@ -105,7 +105,7 @@ for i in $(seq $START $END); do
     fi
 
     echo "  [RUN] TME spatial analysis for ${CORE_NAME} ..."
-    echo "        (Entropy & log2 ratio mode -- should execute rapidly)"
+    echo "        (Entropy mode -- should execute rapidly)"
 
     python "${ANALYSIS_SCRIPT}" \
         --core_name  "${CORE_NAME}" \

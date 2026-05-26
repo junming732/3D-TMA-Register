@@ -13,14 +13,11 @@ for a single TMA core using three spatial analysis modules:
      - Summarise as mean ± std per type-pair
      - Computed in 2D (XY only, averaged across slices) and 3D (XYZ)
 
-  3. Neighbourhood alpha diversity + log2 enrichment ratio
+  3. Neighbourhood alpha diversity
      - For each cell, collect all neighbours within radius_um
      - Compute Shannon entropy of the neighbour cell-type composition
      - Summarise per-cell entropy distributions for 2D vs 3D
      - Statistical comparison: KS test + Mann-Whitney U (2D vs 3D)
-     - Also compute log2(observed/expected) enrichment ratio per type-pair
-       as a count-invariant interaction metric (replaces the permutation z-score)
-     - Positive log2 ratio = co-localised; negative = avoided; 0 = random
      - Reference: Pentimalli et al., Cell Systems 2025 (NSCLC 3D atlas, Chao/
        Shannon neighbourhood diversity comparison); Bull & Byrne, PLOS Comp Bio
        2023 (weighted PCF / neighbourhood entropy framework)
@@ -40,14 +37,11 @@ Outputs
     neighbourhood_entropy_2d.csv   ← per-cell entropy, 2D
     neighbourhood_entropy_3d.csv   ← per-cell entropy, 3D
     entropy_summary.csv            ← mean/std/median entropy + KS/MWU p-values
-    interaction_log2ratio_2d.csv   ← log2(obs/exp) per type-pair, 2D
-    interaction_log2ratio_3d.csv   ← log2(obs/exp) per type-pair, 3D
     summary_comparison.csv         — wide table for direct 2D vs 3D comparison
     figures/
       fig_A_cell_composition.png
       fig_B_nn_distances.png
-      fig_C_entropy_comparison.png          ← replaces interaction z-score scatter
-      fig_D_tumour_log2ratio_profile.png    ← replaces tumour co-localisation bar
+      fig_C_entropy_comparison.png
 
 Usage
 -----
@@ -81,7 +75,7 @@ logger = logging.getLogger(__name__)
 # ─────────────────────────────────────────────────────────────────────────────
 parser = argparse.ArgumentParser(
     description='2D vs 3D TME spatial analysis: density, NN distances, '
-                'neighbourhood entropy & log2 enrichment ratio.'
+                'and neighbourhood entropy.'
 )
 parser.add_argument('--core_name',   type=str,   required=True)
 parser.add_argument('--radius_um',   type=float, default=50.0,
@@ -284,29 +278,17 @@ logger.info('  NN distance CSVs saved.')
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# MODULE 3 — NEIGHBOURHOOD ALPHA DIVERSITY + LOG2 ENRICHMENT RATIO
+# MODULE 3 — NEIGHBOURHOOD ALPHA DIVERSITY
 # ─────────────────────────────────────────────────────────────────────────────
-# Replaces permutation z-score with two count-invariant metrics:
-#
-#   A) Per-cell Shannon entropy of neighbour composition (alpha diversity)
-#      H(cell_i) = -sum_t [ p_t * log(p_t) ]
-#      where p_t = fraction of neighbours within radius_um that are type t.
-#      An isolated cell or one with no neighbours gets H = NaN.
-#      Following Pentimalli et al. 2025 (Cell Systems) who validated this
-#      approach for 2D vs 3D neighbourhood diversity comparison in NSCLC.
-#
-#   B) Log2 enrichment ratio per type-pair (A→B)
-#      obs_AB  = mean number of type-B cells within radius_um of type-A cells
-#      exp_AB  = (total type-B cells / total cells) * mean neighbourhood size
-#              = global frequency of B * E[|N_i|]
-#      log2_ratio = log2(obs_AB / exp_AB)   [0 = random, >0 = co-localised]
-#      This is directly comparable across 2D and 3D because it normalises
-#      by expected density rather than by a permutation std, so it does not
-#      inflate with cell count.
+# Per-cell Shannon entropy of neighbour composition (alpha diversity)
+#   H(cell_i) = -sum_t [ p_t * log(p_t) ]
+#   where p_t = fraction of neighbours within radius_um that are type t.
+#   An isolated cell or one with no neighbours gets H = NaN.
+#   Following Pentimalli et al. 2025 (Cell Systems) who validated this
+#   approach for 2D vs 3D neighbourhood diversity comparison in NSCLC.
 # ─────────────────────────────────────────────────────────────────────────────
 logger.info('=' * 60)
-logger.info(f'MODULE 3: Neighbourhood entropy & log2 enrichment ratio '
-            f'(radius={RADIUS_UM} µm)')
+logger.info(f'MODULE 3: Neighbourhood entropy (radius={RADIUS_UM} µm)')
 
 
 def shannon_entropy(counts_array):
@@ -324,9 +306,9 @@ def shannon_entropy(counts_array):
     return -np.sum(p_nz * np.log(p_nz))
 
 
-def neighbourhood_entropy_and_log2ratio(coords, labels, valid_types, radius_um):
+def neighbourhood_entropy(coords, labels, valid_types, radius_um):
     """
-    Compute per-cell Shannon entropy and per-type-pair log2 enrichment ratio.
+    Compute per-cell Shannon entropy of neighbour composition.
 
     Parameters
     ----------
@@ -339,8 +321,6 @@ def neighbourhood_entropy_and_log2ratio(coords, labels, valid_types, radius_um):
     -------
     df_entropy  : DataFrame with columns [cell_idx, cell_type, n_neighbours,
                                           entropy, <type>_count for each type]
-    df_log2     : DataFrame with columns [src_type, tgt_type, obs_mean,
-                                          exp_mean, log2_ratio]
     """
     labels = np.array(labels)
     N      = len(labels)
@@ -382,46 +362,12 @@ def neighbourhood_entropy_and_log2ratio(coords, labels, valid_types, radius_um):
         entropy_rows.append(rec)
 
     df_entropy = pd.DataFrame(entropy_rows)
-
-    # ── Log2 enrichment ratio ─────────────────────────────────────────────────
-    # global frequency of each target type (among valid-type cells only)
-    valid_mask    = np.isin(labels, valid_types)
-    labels_valid  = labels[valid_mask]
-    global_freq   = {ct: np.sum(labels_valid == ct) / len(labels_valid)
-                     for ct in valid_types}
-
-    # mean neighbourhood size (excluding self, among valid types)
-    mean_nb_size  = count_matrix[valid_mask].sum(axis=1).mean()
-
-    log2_rows = []
-    for ki, src in enumerate(valid_types):
-        src_mask = (labels == src)
-        if src_mask.sum() == 0:
-            continue
-        src_counts = count_matrix[src_mask]   # rows = src cells, cols = types
-        for kj, tgt in enumerate(valid_types):
-            obs_mean = src_counts[:, kj].mean()
-            exp_mean = global_freq[tgt] * mean_nb_size
-            if exp_mean > 0:
-                log2_ratio = np.log2(obs_mean / exp_mean) if obs_mean > 0 else -np.inf
-            else:
-                log2_ratio = np.nan
-            log2_rows.append({
-                'src_type':   src,
-                'tgt_type':   tgt,
-                'obs_mean':   round(float(obs_mean),   4),
-                'exp_mean':   round(float(exp_mean),   4),
-                'log2_ratio': round(float(log2_ratio), 4),
-            })
-
-    df_log2 = pd.DataFrame(log2_rows)
-    return df_entropy, df_log2
+    return df_entropy
 
 
-# ── 2D entropy + log2 ratio (per slice, then aggregate) ──────────────────────
+# ── 2D entropy (per slice, then aggregate) ───────────────────────────────────
 logger.info('  Computing 2D neighbourhood entropy ...')
-entropy_2d_all    = []
-log2_2d_per_slice = []
+entropy_2d_all = []
 
 for sid in slice_ids:
     grp = df2d[df2d['slice_id'] == sid]
@@ -433,36 +379,23 @@ for sid in slice_ids:
     labels = grp['cell_type'].values
     mask   = np.isin(labels, types_here)
 
-    df_ent_s, df_l2_s = neighbourhood_entropy_and_log2ratio(
+    df_ent_s = neighbourhood_entropy(
         coords[mask], labels[mask], types_here, RADIUS_UM
     )
     df_ent_s['slice_id'] = sid
-    df_l2_s['slice_id']  = sid
     entropy_2d_all.append(df_ent_s)
-    log2_2d_per_slice.append(df_l2_s)
     logger.info(f'    Slice {sid}: {mask.sum()} cells, '
                 f'mean H={df_ent_s["entropy"].mean():.3f} nats')
 
 df_entropy_2d = pd.concat(entropy_2d_all, ignore_index=True)
 
-# Per-type-pair log2 ratio: average across slices
-df_log2_2d = (pd.concat(log2_2d_per_slice, ignore_index=True)
-              .groupby(['src_type', 'tgt_type'])
-              .agg(
-                  log2_ratio =('log2_ratio', 'mean'),
-                  obs_mean   =('obs_mean',   'mean'),
-                  exp_mean   =('exp_mean',   'mean'),
-                  n_slices   =('slice_id',   'nunique'),
-              )
-              .reset_index())
-
-# ── 3D entropy + log2 ratio ───────────────────────────────────────────────────
+# ── 3D entropy ────────────────────────────────────────────────────────────────
 logger.info('  Computing 3D neighbourhood entropy ...')
 mask_3d = df3d['cell_type'].isin(valid_types_3d)
 coords_3d_v = df3d[mask_3d][['x_um', 'y_um', 'z_um']].values
 labels_3d_v = df3d[mask_3d]['cell_type'].values
 
-df_entropy_3d, df_log2_3d = neighbourhood_entropy_and_log2ratio(
+df_entropy_3d = neighbourhood_entropy(
     coords_3d_v, labels_3d_v, valid_types_3d, RADIUS_UM
 )
 logger.info(f'    3D: {len(df_entropy_3d)} cells, '
@@ -515,8 +448,6 @@ df_entropy_summary = pd.DataFrame(entropy_summary_rows)
 df_entropy_2d.to_csv(os.path.join(OUT_DIR, 'neighbourhood_entropy_2d.csv'), index=False)
 df_entropy_3d.to_csv(os.path.join(OUT_DIR, 'neighbourhood_entropy_3d.csv'), index=False)
 df_entropy_summary.to_csv(os.path.join(OUT_DIR, 'entropy_summary.csv'), index=False)
-df_log2_2d.to_csv(os.path.join(OUT_DIR, 'interaction_log2ratio_2d.csv'), index=False)
-df_log2_3d.to_csv(os.path.join(OUT_DIR, 'interaction_log2ratio_3d.csv'), index=False)
 logger.info('  Module 3 CSVs saved.')
 
 # Print summary to log
@@ -542,16 +473,7 @@ nn_merge = (df_nn_2d[['src_type', 'tgt_type', 'mean_dist_um']]
 nn_merge['nn_dist_delta_um'] = (nn_merge['nn_dist_3d_um']
                                  - nn_merge['nn_dist_2d_um']).round(3)
 
-log2_merge = (df_log2_2d[['src_type', 'tgt_type', 'log2_ratio']]
-              .rename(columns={'log2_ratio': 'log2_ratio_2d'})
-              .merge(
-                  df_log2_3d[['src_type', 'tgt_type', 'log2_ratio']]
-                  .rename(columns={'log2_ratio': 'log2_ratio_3d'}),
-                  on=['src_type', 'tgt_type'], how='outer'))
-log2_merge['log2_ratio_delta'] = (log2_merge['log2_ratio_3d']
-                                   - log2_merge['log2_ratio_2d']).round(3)
-
-summary = nn_merge.merge(log2_merge, on=['src_type', 'tgt_type'], how='outer')
+summary = nn_merge.copy()
 summary.to_csv(os.path.join(OUT_DIR, 'summary_comparison.csv'), index=False)
 logger.info(f'  Summary table saved ({len(summary)} type-pairs).')
 
@@ -599,17 +521,6 @@ nn_merge_fig = (df_nn_2d[['src_type', 'tgt_type', 'mean_dist_um']]
                 .merge(df_nn_3d[['src_type', 'tgt_type', 'mean_dist_um']]
                        .rename(columns={'mean_dist_um': 'd3d'}),
                        on=['src_type', 'tgt_type']))
-
-log2_merge_fig = (df_log2_2d[['src_type', 'tgt_type', 'log2_ratio']]
-                  .rename(columns={'log2_ratio': 'l2d'})
-                  .merge(df_log2_3d[['src_type', 'tgt_type', 'log2_ratio']]
-                         .rename(columns={'log2_ratio': 'l3d'}),
-                         on=['src_type', 'tgt_type']))
-
-tgt_tum_log2_2d = (df_log2_2d[df_log2_2d['tgt_type'] == 'Tumour']
-                   .set_index('src_type')['log2_ratio'])
-tgt_tum_log2_3d = (df_log2_3d[df_log2_3d['tgt_type'] == 'Tumour']
-                   .set_index('src_type')['log2_ratio'])
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -816,94 +727,6 @@ logger.info(f'  Figure C saved: {path_c}')
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Figure D — Tumour log2 enrichment ratio profile
-#
-# Horizontal bars: log2(obs/exp) toward Tumour, pale = 2D, solid = 3D.
-# X-axis clipped to the actual data range (typically all-negative) so bars
-# fill the plot area rather than leaving a large empty positive half.
-# Title uses no pipe separators.
-# An annotation box highlights the all-depleted finding when applicable.
-# ─────────────────────────────────────────────────────────────────────────────
-fig_d, ax_tum = plt.subplots(figsize=(8, 5.5), facecolor=BG)
-_finish_ax(ax_tum)
-
-non_tum = [t for t in _ALL_TYPES_SORTED
-           if t != 'Tumour'
-           and t in tgt_tum_log2_2d.index
-           and t in tgt_tum_log2_3d.index]
-y_tum = np.arange(len(non_tum))
-
-for k, ct in enumerate(non_tum):
-    col = _type_color(ct)
-    v2d = tgt_tum_log2_2d.get(ct, 0)
-    v3d = tgt_tum_log2_3d.get(ct, 0)
-    ax_tum.barh(y_tum[k] + bh / 2, v2d, height=bh,
-                color=col, alpha=0.45, edgecolor='none')
-    ax_tum.barh(y_tum[k] - bh / 2, v3d, height=bh,
-                color=col, alpha=1.00, edgecolor='none')
-
-ax_tum.axvline(0, color='#555', lw=1.5, zorder=3)
-
-# ── Clip x-axis to data range with a small margin ────────────────────────────
-all_vals = [v for v in list(tgt_tum_log2_2d.values) +
-            list(tgt_tum_log2_3d.values) if np.isfinite(v)]
-x_min = min(all_vals) * 1.20
-x_max = max(max(all_vals) * 1.20, 0.15)   # always show a sliver of positive
-ax_tum.set_xlim(x_min, x_max)
-
-# Shade zones
-ax_tum.axvspan(0, x_max, color='#E8F5E9', alpha=0.4, zorder=0)
-ax_tum.axvspan(x_min, 0, color='#FCE4EC', alpha=0.4, zorder=0)
-
-ax_tum.set_yticks(y_tum)
-ax_tum.set_yticklabels(non_tum, fontsize=11)
-ax_tum.set_xlabel(
-    'log\u2082(observed / expected) neighbours within '
-    f'{int(RADIUS_UM)} µm of Tumour cells\n'
-    'Negative = depleted near Tumour   '
-    'Positive = enriched near Tumour   '
-    'Zero = random',
-    fontsize=9.5)
-ax_tum.set_title(
-    f'{TARGET_CORE}  —  Spatial enrichment toward Tumour\n'
-    f'Pale = 2D (per section)   Solid = 3D (reconstructed volume)',
-    fontsize=12, fontweight='bold', color='#1A1A2E', pad=10)
-
-# Highlight all-depleted finding if every value is negative
-all_negative = all(v < 0 for v in all_vals)
-if all_negative:
-    ax_tum.text(0.98, 0.97,
-                'All cell types depleted\nnear Tumour in both\n2D and 3D',
-                transform=ax_tum.transAxes, ha='right', va='top', fontsize=8.5,
-                color='#B71C1C',
-                bbox=dict(boxstyle='round,pad=0.35', fc='#FFEBEE',
-                          ec='#C62828', lw=0.9))
-
-# Annotate sign-flip cases if any exist
-for ct in non_tum:
-    v2d = tgt_tum_log2_2d.get(ct, 0)
-    v3d = tgt_tum_log2_3d.get(ct, 0)
-    if np.sign(v2d) != np.sign(v3d) and np.isfinite(v2d) and np.isfinite(v3d):
-        idx = non_tum.index(ct)
-        ax_tum.annotate('sign flip 2D / 3D',
-                        xy=(v3d, idx - bh / 2),
-                        xytext=(v3d + np.sign(v3d) * abs(x_min) * 0.12, idx + 0.5),
-                        fontsize=8, color='#1565C0',
-                        arrowprops=dict(arrowstyle='->', color='#1565C0', lw=0.9))
-
-ax_tum.legend(handles=[
-    mpatches.Patch(facecolor='#888', alpha=0.45, label='2D (per section)'),
-    mpatches.Patch(facecolor='#888', alpha=1.00, label='3D (reconstructed volume)'),
-], fontsize=9, frameon=False, loc='lower right')
-
-fig_d.tight_layout()
-path_d = os.path.join(FIG_DIR, 'fig_D_tumour_log2ratio_profile.png')
-fig_d.savefig(path_d, dpi=200, bbox_inches='tight', facecolor=BG)
-plt.close(fig_d)
-logger.info(f'  Figure D saved: {path_d}')
-
-
-# ─────────────────────────────────────────────────────────────────────────────
 # FINAL SUMMARY LOG
 # ─────────────────────────────────────────────────────────────────────────────
 logger.info('=' * 60)
@@ -914,11 +737,9 @@ logger.info('    cell_density_2d/3d.csv')
 logger.info('    nn_distances_2d/3d.csv')
 logger.info('    neighbourhood_entropy_2d/3d.csv')
 logger.info('    entropy_summary.csv  (KS + MWU tests)')
-logger.info('    interaction_log2ratio_2d/3d.csv')
 logger.info('    summary_comparison.csv')
 logger.info('  Figures written:')
 logger.info('    fig_A_cell_composition.png')
 logger.info('    fig_B_nn_distances.png')
 logger.info('    fig_C_entropy_comparison.png   (violin + bar, 2D vs 3D)')
-logger.info('    fig_D_tumour_log2ratio_profile.png')
 logger.info('=' * 60)

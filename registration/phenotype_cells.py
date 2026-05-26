@@ -538,6 +538,9 @@ def save_qc_plot(
             fontsize=14, fontweight='bold', y=1.002,
         )
 
+        # Calculate aspect ratio (Height / Width) to align plot heights with image dimensions
+        img_aspect = dapi_img.shape[0] / dapi_img.shape[1]
+
         # ── Row 0: DAPI | score map | positivity bar chart | (empty) ─────────
         ax_dapi = fig.add_subplot(gs[0, 0])
         ax_dapi.imshow(_stretch(dapi_img), cmap='gray', interpolation='nearest')
@@ -568,6 +571,7 @@ def save_qc_plot(
             ax_bar.text(min(pct + 1, 98), bar.get_y() + bar.get_height() / 2,
                         f'{pct:.0f}%', va='center', fontsize=8)
         ax_bar.axvline(50, color='gray', linestyle='--', linewidth=0.8, alpha=0.6)
+        ax_bar.set_box_aspect(img_aspect)
 
         fig.add_subplot(gs[0, 3]).axis('off')   # placeholder
 
@@ -601,8 +605,6 @@ def save_qc_plot(
             ax_pos.axis('off')
 
             # ── Col 2: QuPath-style pixel histogram ───────────────────────────
-            # All pixels, raw x-axis, log y.  Threshold shown as dashed line
-            # (for visual reference only — not where the decision is made).
             ax_px = fig.add_subplot(gs[row, 2])
             flat  = ch_img.ravel()
             flat  = flat[flat > 0]          # skip exact-zero background pixels
@@ -613,8 +615,6 @@ def save_qc_plot(
                 ax_px.bar(centres, counts, width=bin_w,
                           color='steelblue', alpha=0.75, edgecolor='none')
                 ax_px.set_yscale('log')
-                # Draw threshold as dashed vertical — it's in the same intensity
-                # space as cell medians (both are denoised pixel values)
                 ax_px.axvline(thresh_t, color='red', linewidth=1.5,
                               linestyle='--',
                               label=f'threshold = {thresh_t:.1f}')
@@ -623,9 +623,9 @@ def save_qc_plot(
             ax_px.set_ylabel('Pixel count (log)', fontsize=8)
             ax_px.set_title(f'{ch}  pixel distribution (QuPath-style)', fontsize=9)
             ax_px.tick_params(labelsize=7)
+            ax_px.set_box_aspect(img_aspect)
 
             # ── Col 3: cell-median histogram ──────────────────────────────────
-            # This is where the threshold is derived and applied.
             ax_cm = fig.add_subplot(gs[row, 3])
             if n_cells > 0 and len(cell_meds) > 0:
                 ax_cm.hist(cell_meds, bins=80, color='#e67e22',
@@ -638,6 +638,7 @@ def save_qc_plot(
             ax_cm.set_ylabel('Cell count (log)', fontsize=8)
             ax_cm.set_title(f'{ch}  cell-median distribution  ← threshold here', fontsize=9)
             ax_cm.tick_params(labelsize=7)
+            ax_cm.set_box_aspect(img_aspect)
 
         fig.savefig(out_path, dpi=80, bbox_inches='tight')
         plt.close(fig)
@@ -659,11 +660,10 @@ def save_single_channel_qc(
     High-resolution 1×4 pathologist QC panel for one marker channel.
 
     Panel 1  Raw image (contrast-stretched grayscale)
-    Panel 2  Pixel intensity histogram — QuPath-style (non-zero pixels, log y).
-             Threshold shown as dashed red line for visual reference.
-             x-axis = denoised pixel intensity (same units as cell medians).
-    Panel 3  Cell-median histogram — where the threshold is derived and applied.
-             Threshold shown as solid red line.
+    Panel 2  Cell-median histogram — where the threshold is derived and applied.
+             Threshold shown as solid red line (magenta for manual thresholds).
+    Panel 3  Full-image pixel intensity histogram (non-zero pixels, log y).
+             Threshold shown as dashed red line for visual reference only.
     Panel 4  Positivity overlay (green = positive, dark red = negative)
     """
     try:
@@ -672,8 +672,11 @@ def save_single_channel_qc(
         import matplotlib.pyplot as plt
         import matplotlib.gridspec as gridspec
 
-        fig     = plt.figure(figsize=(28, 5.5))
-        gs      = gridspec.GridSpec(1, 4, figure=fig, wspace=0.12)
+        fig     = plt.figure(figsize=(32, 12))
+        # Reserve the top 12% for the suptitle; panels occupy the rest
+        gs      = gridspec.GridSpec(1, 4, figure=fig, wspace=0.30,
+                                    left=0.04, right=0.98,
+                                    top=0.78, bottom=0.12)
         n_cells = len(df_slice)
 
         thresh_t  = float(df_slice[f'thresh_{ch_name}'].iloc[0]) if n_cells > 0 else 0.0
@@ -683,23 +686,43 @@ def save_single_channel_qc(
         pct       = 100.0 * n_pos / n_cells                       if n_cells > 0 else 0.0
 
         fig.suptitle(
-            f'{TARGET_CORE}  |  Slice {slice_id:03d}  |  {ch_name}  |  {n_cells} cells  '
-            f'|  threshold = {thresh_t:.1f}  [{t_type}]  '
-            f'|  {n_pos}/{n_cells} positive ({pct:.0f}%)',
-            fontsize=18, fontweight="bold", y=1.02,
+            f'{TARGET_CORE}  |  Slice {slice_id:03d}  |  {ch_name}  |  {n_cells} cells\n'
+            f'threshold = {thresh_t:.1f}  [{t_type}]  |  {n_pos}/{n_cells} positive ({pct:.0f}%)',
+            fontsize=32, fontweight='bold', y=0.97,
         )
+
+        # Calculate aspect ratio (Height / Width) to lock histogram box heights to the image
+        img_aspect = raw_img.shape[0] / raw_img.shape[1]
 
         # ── Panel 1: raw image ────────────────────────────────────────────────
         ax_raw = fig.add_subplot(gs[0, 0])
         ax_raw.imshow(_stretch(raw_img), cmap='gray', interpolation='nearest')
         ax_raw.set_title(
-            f'{ch_name}\nBackground-corrected, contrast-stretched',
-            fontsize=16,
+            f'{ch_name}\nBackground-corrected',
+            fontsize=30, pad=10,
         )
         ax_raw.axis('off')
 
-        # ── Panel 2: QuPath-style pixel histogram ─────────────────────────────
-        ax_px = fig.add_subplot(gs[0, 1])
+        # ── Panel 2: cell-median histogram ────────────────────────────────────
+        ax_cm = fig.add_subplot(gs[0, 1])
+        if n_cells > 0 and len(cell_meds) > 0:
+            ax_cm.hist(cell_meds, bins=100, color='#e67e22',
+                       alpha=0.80, edgecolor='none', log=True)
+            line_col = 'magenta' if 'manual' in t_type else 'red'
+            ax_cm.axvline(thresh_t, color=line_col, linewidth=2.5,
+                          label=f'threshold = {thresh_t:.1f}\n[{t_type}]')
+            ax_cm.legend(fontsize=28)
+        ax_cm.set_xlabel('Per-cell median intensity', fontsize=28)
+        ax_cm.set_ylabel('Cell count (log scale)', fontsize=28)
+        ax_cm.set_title(
+            'Per-cell median distribution\n(threshold derived here)',
+            fontsize=30, pad=10,
+        )
+        ax_cm.tick_params(labelsize=28)
+        ax_cm.set_box_aspect(img_aspect)
+
+        # ── Panel 3: full-image pixel histogram (visual reference) ────────────
+        ax_px = fig.add_subplot(gs[0, 2])
         flat  = raw_img.ravel().astype(np.float32)
         flat  = flat[flat > 0]
         if len(flat) > 0:
@@ -711,31 +734,15 @@ def save_single_channel_qc(
             ax_px.set_yscale('log')
             ax_px.axvline(thresh_t, color='red', linewidth=2.0, linestyle='--',
                           label=f'threshold = {thresh_t:.1f}\n(visual reference only)')
-            ax_px.legend(fontsize=13)
-        ax_px.set_xlabel('Pixel intensity (background-corrected)', fontsize=15)
-        ax_px.set_ylabel('Pixel count (log scale)', fontsize=15)
+            ax_px.legend(fontsize=28)
+        ax_px.set_xlabel('Pixel intensity (background-corrected)', fontsize=28)
+        ax_px.set_ylabel('Pixel count (log scale)', fontsize=28)
         ax_px.set_title(
-            f'{ch_name}  full-image pixel distribution\n(QuPath-style, non-zero pixels)',
-            fontsize=16,
+            'Full-image pixel distribution\n(visual reference only)',
+            fontsize=30, pad=10,
         )
-        ax_px.tick_params(labelsize=13)
-
-        # ── Panel 3: cell-median histogram ────────────────────────────────────
-        ax_cm = fig.add_subplot(gs[0, 2])
-        if n_cells > 0 and len(cell_meds) > 0:
-            ax_cm.hist(cell_meds, bins=100, color='#e67e22',
-                       alpha=0.80, edgecolor='none', log=True)
-            line_col = 'magenta' if 'manual' in t_type else 'red'
-            ax_cm.axvline(thresh_t, color=line_col, linewidth=2.5,
-                          label=f'threshold = {thresh_t:.1f}\n[{t_type}]')
-            ax_cm.legend(fontsize=13)
-        ax_cm.set_xlabel('Per-cell median intensity', fontsize=15)
-        ax_cm.set_ylabel('Cell count (log scale)', fontsize=15)
-        ax_cm.set_title(
-            f'{ch_name}  per-cell median distribution\nThreshold applied here',
-            fontsize=16,
-        )
-        ax_cm.tick_params(labelsize=13)
+        ax_px.tick_params(labelsize=28)
+        ax_px.set_box_aspect(img_aspect)
 
         # ── Panel 4: positivity overlay ───────────────────────────────────────
         ax_over = fig.add_subplot(gs[0, 3])
@@ -743,13 +750,13 @@ def save_single_channel_qc(
             rgb = _make_overlay(raw_img, mask, df_slice['cell_id'].values,
                                 cell_meds, thresh_t)
             ax_over.set_title(
-                f'{n_pos} / {n_cells} positive  ({pct:.0f}%)',
-                fontsize=16,
+                f'Positivity overlay\n{n_pos} / {n_cells} positive  ({pct:.0f}%)',
+                fontsize=30, pad=10,
             )
         else:
             gray = _stretch(raw_img)
             rgb  = np.stack([gray, gray, gray], axis=-1)
-            ax_over.set_title('No cells', fontsize=13)
+            ax_over.set_title('Positivity overlay\nNo cells', fontsize=30, pad=10)
         ax_over.imshow(rgb, interpolation='nearest')
         ax_over.axis('off')
 
