@@ -40,7 +40,6 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 from matplotlib.colors import TABLEAU_COLORS
-from itertools import combinations
 from collections import defaultdict
 
 # ── config.py ─────────────────────────────────────────────────────────────────
@@ -124,6 +123,7 @@ logger.info(f"Registrar contains {len(idx_to_slide)} slides:")
 for i, name in enumerate(slide_names_sorted):
     logger.info(f"  slice_idx={i:02d}  ->  {name}")
 
+
 # ─── LOAD ANNOTATIONS ─────────────────────────────────────────────────────────
 with open(args.annotation_json) as fh:
     ann_data = json.load(fh)
@@ -183,68 +183,82 @@ if df.empty:
     logger.error("No landmarks warped. Check the registrar and file matching.")
     sys.exit(1)
 
-# ─── COMPUTE TRE — identical to registration_accuracy_landmarks.py ────────────
+# ─── COMPUTE TRE (Fitzpatrick et al. 1998 — consecutive pairwise) ─────────────
+# For each mclass, TRE is the Euclidean distance between warped landmark
+# positions on consecutive slices: TRE_i = ||T(p_i) - T(p_i+1)||
+# (eq. 1 from the paper).  Mean TRE for the mclass = mean over its N-1 pairs.
+# This matches our chained rolling registration exactly: each adjacent pair
+# was registered directly to each other, so pairwise distance is the direct
+# measure of that registration step's error.
 summary_rows = []
 detail_rows  = []
 
 for mc, grp in df.groupby('mclass'):
-    pts          = grp[['x_warped', 'y_warped']].values
-    cx, cy       = pts.mean(axis=0)
-    residuals_px = np.linalg.norm(pts - np.array([cx, cy]), axis=1)
-    residuals_um = residuals_px * PIXEL_SIZE_UM
+    grp = grp.sort_values('z_json').reset_index(drop=True)
+    pts = grp[['x_warped', 'y_warped']].values   # (N, 2), sorted by z
 
+    # Consecutive pairs only: (0,1), (1,2), ..., (N-2, N-1)
     if len(pts) >= 2:
-        pairs     = list(combinations(range(len(pts)), 2))
-        pair_dist = np.array([np.linalg.norm(pts[i] - pts[j]) for i, j in pairs])
-        pair_um   = pair_dist * PIXEL_SIZE_UM
+        pair_indices = [(i, i + 1) for i in range(len(pts) - 1)]
+        pair_dist_px = np.array([
+            np.linalg.norm(pts[i] - pts[j]) for i, j in pair_indices
+        ])
+        pair_dist_um = pair_dist_px * PIXEL_SIZE_UM
     else:
-        pair_dist = np.array([0.0])
-        pair_um   = np.array([0.0])
+        pair_indices = []
+        pair_dist_px = np.array([0.0])
+        pair_dist_um = np.array([0.0])
 
-    for i, (_, row) in enumerate(grp.iterrows()):
+    mean_TRE_px = pair_dist_px.mean()
+    mean_TRE_um = pair_dist_um.mean()
+    logger.info(
+        f"mclass {mc}: {len(pts)} slices, {len(pair_indices)} pair(s), "
+        f"mean TRE = {mean_TRE_px:.2f} px = {mean_TRE_um:.2f} µm"
+    )
+
+    # Detail rows — one per consecutive pair
+    for (ia, ib), d_px, d_um in zip(pair_indices, pair_dist_px, pair_dist_um):
+        row_a, row_b = grp.iloc[ia], grp.iloc[ib]
         detail_rows.append({
-            'id':          row['id'],
-            'mclass':      mc,
-            'z_json':      row['z_json'],
-            'slice_idx':   row['slice_idx'],
-            'x_warped':    round(row['x_warped'], 2),
-            'y_warped':    round(row['y_warped'], 2),
-            'centroid_x':  round(cx, 2),
-            'centroid_y':  round(cy, 2),
-            'TRE_px':      round(residuals_px[i], 3),
-            'TRE_um':      round(residuals_um[i], 3),
+            'mclass':        mc,
+            'z_json_a':      row_a['z_json'],
+            'z_json_b':      row_b['z_json'],
+            'slice_idx_a':   row_a['slice_idx'],
+            'slice_idx_b':   row_b['slice_idx'],
+            'id_a':          row_a['id'],
+            'id_b':          row_b['id'],
+            'x_warped_a':    round(row_a['x_warped'], 2),
+            'y_warped_a':    round(row_a['y_warped'], 2),
+            'x_warped_b':    round(row_b['x_warped'], 2),
+            'y_warped_b':    round(row_b['y_warped'], 2),
+            'TRE_px':        round(d_px, 3),
+            'TRE_um':        round(d_um, 3),
         })
 
     summary_rows.append({
-        'mclass':            mc,
-        'n_landmarks':       len(pts),
-        'centroid_x':        round(cx, 2),
-        'centroid_y':        round(cy, 2),
-        'mean_TRE_px':       round(residuals_px.mean(), 3),
-        'median_TRE_px':     round(np.median(residuals_px), 3),
-        'max_TRE_px':        round(residuals_px.max(), 3),
-        'std_TRE_px':        round(residuals_px.std(), 3),
-        'mean_TRE_um':       round(residuals_um.mean(), 3),
-        'median_TRE_um':     round(np.median(residuals_um), 3),
-        'max_TRE_um':        round(residuals_um.max(), 3),
-        'mean_pairwise_px':  round(pair_dist.mean(), 3),
-        'max_pairwise_px':   round(pair_dist.max(), 3),
-        'mean_pairwise_um':  round(pair_um.mean(), 3),
-        'max_pairwise_um':   round(pair_um.max(), 3),
+        'mclass':        mc,
+        'n_slices':      len(pts),
+        'n_pairs':       len(pair_indices),
+        'mean_TRE_px':   round(mean_TRE_px, 3),
+        'max_TRE_px':    round(pair_dist_px.max(), 3),
+        'std_TRE_px':    round(pair_dist_px.std(), 3) if len(pair_dist_px) > 1 else 0.0,
+        'mean_TRE_um':   round(mean_TRE_um, 3),
+        'max_TRE_um':    round(pair_dist_um.max(), 3),
+        'std_TRE_um':    round(pair_dist_um.std(), 3) if len(pair_dist_um) > 1 else 0.0,
     })
 
 df_detail  = pd.DataFrame(detail_rows)
 df_summary = pd.DataFrame(summary_rows).sort_values('mclass')
 
+# Global TRE across all consecutive pairs
 all_tre_px = df_detail['TRE_px'].values
 all_tre_um = df_detail['TRE_um'].values
-
-logger.info("─── Global TRE summary (VALIS) ───────────────────────────────")
-logger.info(f"  n landmarks  : {len(df_detail)}")
-logger.info(f"  mean  TRE    : {all_tre_px.mean():.2f} px = {all_tre_um.mean():.2f} µm")
-logger.info(f"  median TRE   : {np.median(all_tre_px):.2f} px = {np.median(all_tre_um):.2f} µm")
-logger.info(f"  max   TRE    : {all_tre_px.max():.2f} px = {all_tre_um.max():.2f} µm")
-logger.info(f"  std   TRE    : {all_tre_px.std():.2f} px = {all_tre_um.std():.2f} µm")
+logger.info("─── Global TRE summary ───────────────────────────────────────")
+logger.info(f"  n pairs        : {len(df_detail)}")
+logger.info(f"  mean  TRE      : {all_tre_px.mean():.2f} px  = {all_tre_um.mean():.2f} µm")
+logger.info(f"  median TRE     : {np.median(all_tre_px):.2f} px  = {np.median(all_tre_um):.2f} µm")
+logger.info(f"  max   TRE      : {all_tre_px.max():.2f} px  = {all_tre_um.max():.2f} µm")
+logger.info(f"  std   TRE      : {all_tre_px.std():.2f} px  = {all_tre_um.std():.2f} µm")
 logger.info("──────────────────────────────────────────────────────────────")
 
 # ─── SAVE CSVs ────────────────────────────────────────────────────────────────
@@ -267,17 +281,25 @@ fig.suptitle(f"Pipeline B {TARGET_CORE} — Landmark Registration Accuracy  "
              f"(pixel size = {PIXEL_SIZE_UM} µm)",
              fontsize=18, fontweight='bold')
 
-# ── Panel 1: TRE per landmark vs slice ──────────
+# ── Panel 1: TRE per consecutive pair vs slice pair ─────────────────────────
 ax = axes[0]
 for mc in all_mclasses:
-    grp = df_detail[df_detail['mclass'] == mc].sort_values('slice_idx')
-    ax.plot(grp['slice_idx'], grp['TRE_um'], 'o-',
+    grp = df_detail[df_detail['mclass'] == mc].sort_values('z_json_a').reset_index(drop=True)
+    # Convert from 0-based slice_idx to 1-based slice index for labels
+    x_labels = [f"{int(r.slice_idx_a) + 1}→{int(r.slice_idx_b) + 1}" for _, r in grp.iterrows()]
+    x_pos    = np.arange(len(grp))
+    ax.plot(x_pos, grp['TRE_um'], 'o-',
             color=mclass_colour[mc], label=f"mclass {mc}", markersize=8)
+    for xi, lab in zip(x_pos, x_labels):
+        ax.annotate(lab, (xi, grp['TRE_um'].iloc[xi]),
+                    textcoords='offset points', xytext=(0, 6),
+                    ha='center', fontsize=7, color=mclass_colour[mc])
 
 ax.axhline(all_tre_um.mean(), color='black', linestyle='--', lw=2,
            label=f"global mean {all_tre_um.mean():.1f} µm")
-ax.set_title("TRE per landmark vs slice", fontsize=15)
-ax.set_xlabel("slice index", fontsize=13)
+ax.set_title("TRE per consecutive slice pair", fontsize=15)
+# Removed the explicit z_json_a -> z_json_b text from the axis label
+ax.set_xlabel("slice pair", fontsize=13)
 ax.set_ylabel("TRE (µm)", fontsize=13)
 ax.tick_params(axis='both', labelsize=11)
 ax.legend(fontsize=11, ncol=2)
@@ -438,12 +460,10 @@ def plot_adjacent_slice_overlays_valis(df_detail,
         return
 
     for mc, grp in df_detail.groupby('mclass'):
-        grp_sorted = grp.sort_values('z_json').reset_index(drop=True)
-        if len(grp_sorted) < 2:
+        grp_sorted = grp.sort_values('z_json_a').reset_index(drop=True)
+        n_pairs = len(grp_sorted)
+        if n_pairs < 1:
             continue
-
-        pairs   = [(i, i + 1) for i in range(len(grp_sorted) - 1)]
-        n_pairs = len(pairs)
 
         fig, axes = plt.subplots(2, n_pairs,
                                  figsize=(5 * n_pairs, 10),
@@ -455,16 +475,21 @@ def plot_adjacent_slice_overlays_valis(df_detail,
             fontsize=10, fontweight='bold'
         )
 
-        for col, (ia, ib) in enumerate(pairs):
-            row_a   = grp_sorted.iloc[ia]
-            row_b   = grp_sorted.iloc[ib]
-            sidx_a, sidx_b  = int(row_a['slice_idx']), int(row_b['slice_idx'])
-            z_a,    z_b     = sidx_a, sidx_b   # display as original slice numbers
-            wx_a,   wy_a    = float(row_a['x_warped']), float(row_a['y_warped'])
-            wx_b,   wy_b    = float(row_b['x_warped']), float(row_b['y_warped'])
+        for col, (_, pair_row) in enumerate(grp_sorted.iterrows()):
+            sidx_a = int(pair_row['slice_idx_a'])
+            sidx_b = int(pair_row['slice_idx_b'])
+            
+            # Map directly to 1-based index to feed the plotting helper
+            z_a    = sidx_a + 1
+            z_b    = sidx_b + 1
+            
+            wx_a   = float(pair_row['x_warped_a'])
+            wy_a   = float(pair_row['y_warped_a'])
+            wx_b   = float(pair_row['x_warped_b'])
+            wy_b   = float(pair_row['y_warped_b'])
 
-            dist_px = np.hypot(wx_b - wx_a, wy_b - wy_a)
-            dist_um = dist_px * PIXEL_SIZE_UM
+            dist_px = float(pair_row['TRE_px'])
+            dist_um = float(pair_row['TRE_um'])
             mid_x   = (wx_a + wx_b) / 2
             mid_y   = (wy_a + wy_b) / 2
 

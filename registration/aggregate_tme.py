@@ -164,6 +164,128 @@ logger.info('Aggregate CSVs saved.')
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# AMBIGUOUS CELL EXCLUSION SUMMARY
+#
+# Quantifies how many Ambiguous cells are present per core (and as a % of all
+# cells) in both 2D and 3D density CSVs.  These cells are excluded from the
+# downstream figures (Figure 1 uses BIOLOGICAL_TYPES only; Figures 2-4 receive
+# pre-filtered CSVs from compare_2d_3d_tme.py where Ambiguous never enters the
+# valid_types lists).  This block makes that exclusion explicit and auditable.
+#
+# Outputs
+# -------
+#   ambiguous_exclusion_summary.csv   — per-core counts and percentages (2D & 3D)
+#   ambiguous_exclusion_summary.txt   — human-readable report with per-core table
+#                                       and cross-core averages
+# ─────────────────────────────────────────────────────────────────────────────
+logger.info('=' * 60)
+logger.info('AMBIGUOUS EXCLUSION SUMMARY')
+
+ambig_rows = []
+for core in CORE_NAMES:
+    # ── 2D ───────────────────────────────────────────────────────────────────
+    sub2 = df_density_2d[df_density_2d['core'] == core]
+    total2  = sub2['mean_density_per_mm2'].sum()
+    ambig2  = sub2.loc[sub2['cell_type'] == 'Ambiguous',
+                       'mean_density_per_mm2'].sum()
+    n_ambig2 = sub2.loc[sub2['cell_type'] == 'Ambiguous',
+                        'n_cells'].sum() if 'n_cells' in sub2.columns else np.nan
+    pct2    = 100.0 * ambig2 / total2 if total2 > 0 else np.nan
+
+    # ── 3D ───────────────────────────────────────────────────────────────────
+    sub3 = df_density_3d[df_density_3d['core'] == core]
+    total3  = sub3['density_per_mm3'].sum()
+    ambig3  = sub3.loc[sub3['cell_type'] == 'Ambiguous',
+                       'density_per_mm3'].sum()
+    n_ambig3 = sub3.loc[sub3['cell_type'] == 'Ambiguous',
+                        'n_cells'].sum() if 'n_cells' in sub3.columns else np.nan
+    pct3    = 100.0 * ambig3 / total3 if total3 > 0 else np.nan
+
+    ambig_rows.append({
+        'core':                    core,
+        # 2D
+        'n_ambiguous_2d':          int(n_ambig2) if not np.isnan(n_ambig2) else np.nan,
+        'density_ambiguous_2d':    round(ambig2,  4),
+        'density_total_2d':        round(total2,  4),
+        'pct_ambiguous_2d':        round(pct2,    2) if not np.isnan(pct2)  else np.nan,
+        # 3D
+        'n_ambiguous_3d':          int(n_ambig3) if not np.isnan(n_ambig3) else np.nan,
+        'density_ambiguous_3d':    round(ambig3,  4),
+        'density_total_3d':        round(total3,  4),
+        'pct_ambiguous_3d':        round(pct3,    2) if not np.isnan(pct3)  else np.nan,
+    })
+
+df_ambig = pd.DataFrame(ambig_rows)
+
+# ── Cross-core averages ───────────────────────────────────────────────────────
+mean_pct2  = df_ambig['pct_ambiguous_2d'].mean()
+mean_pct3  = df_ambig['pct_ambiguous_3d'].mean()
+mean_n2    = df_ambig['n_ambiguous_2d'].mean()
+mean_n3    = df_ambig['n_ambiguous_3d'].mean()
+total_n2   = df_ambig['n_ambiguous_2d'].sum()
+total_n3   = df_ambig['n_ambiguous_3d'].sum()
+
+# ── Save CSV ──────────────────────────────────────────────────────────────────
+ambig_csv = os.path.join(OUT_DIR, 'ambiguous_exclusion_summary.csv')
+df_ambig.to_csv(ambig_csv, index=False)
+logger.info(f'  Saved: {ambig_csv}')
+
+# ── Save human-readable text report ──────────────────────────────────────────
+ambig_txt = os.path.join(OUT_DIR, 'ambiguous_exclusion_summary.txt')
+col_w = 12
+with open(ambig_txt, 'w') as f:
+    f.write('AMBIGUOUS CELL EXCLUSION REPORT\n')
+    f.write(f'Cores analysed : {len(CORE_NAMES)}\n')
+    f.write('=' * 72 + '\n\n')
+
+    # Header
+    f.write(f"{'Core':<12} {'N_ambig_2D':>12} {'%_ambig_2D':>12} "
+            f"{'N_ambig_3D':>12} {'%_ambig_3D':>12}\n")
+    f.write('-' * 62 + '\n')
+
+    for _, row in df_ambig.iterrows():
+        n2_str  = f"{int(row['n_ambiguous_2d'])}"  if not pd.isna(row['n_ambiguous_2d'])  else 'N/A'
+        n3_str  = f"{int(row['n_ambiguous_3d'])}"  if not pd.isna(row['n_ambiguous_3d'])  else 'N/A'
+        pct2_str = f"{row['pct_ambiguous_2d']:.2f}%" if not pd.isna(row['pct_ambiguous_2d']) else 'N/A'
+        pct3_str = f"{row['pct_ambiguous_3d']:.2f}%" if not pd.isna(row['pct_ambiguous_3d']) else 'N/A'
+        f.write(f"{row['core']:<12} {n2_str:>12} {pct2_str:>12} "
+                f"{n3_str:>12} {pct3_str:>12}\n")
+
+    f.write('-' * 62 + '\n')
+    f.write(f"{'MEAN':<12} {mean_n2:>11.1f} {mean_pct2:>11.2f}% "
+            f"{mean_n3:>11.1f} {mean_pct3:>11.2f}%\n")
+    f.write(f"{'TOTAL':<12} {total_n2:>11.0f} {'':>12} "
+            f"{total_n3:>11.0f}\n\n")
+
+    f.write('Notes\n')
+    f.write('-----\n')
+    f.write('N_ambig     : raw cell count from density CSV (n_cells column).\n')
+    f.write('              Shown as N/A if n_cells not present in CSV.\n')
+    f.write('%_ambig     : Ambiguous density / total density × 100.\n')
+    f.write('              Density proxy used because raw counts may vary\n')
+    f.write('              across slices / volume estimates.\n')
+    f.write('Exclusion   : Ambiguous cells are excluded from Figure 1\n')
+    f.write('              (BIOLOGICAL_TYPES filter) and from Figures 2-4\n')
+    f.write('              (valid_types filter in compare_2d_3d_tme.py).\n')
+
+logger.info(f'  Saved: {ambig_txt}')
+
+# ── Log summary ───────────────────────────────────────────────────────────────
+logger.info(f'  {"Core":<12} {"N_ambig_2D":>12} {"%_ambig_2D":>12} '
+            f'{"N_ambig_3D":>12} {"%_ambig_3D":>12}')
+for _, row in df_ambig.iterrows():
+    n2_s  = f"{int(row['n_ambiguous_2d'])}"   if not pd.isna(row['n_ambiguous_2d'])  else 'N/A'
+    n3_s  = f"{int(row['n_ambiguous_3d'])}"   if not pd.isna(row['n_ambiguous_3d'])  else 'N/A'
+    p2_s  = f"{row['pct_ambiguous_2d']:.2f}%" if not pd.isna(row['pct_ambiguous_2d']) else 'N/A'
+    p3_s  = f"{row['pct_ambiguous_3d']:.2f}%" if not pd.isna(row['pct_ambiguous_3d']) else 'N/A'
+    logger.info(f'  {row["core"]:<12} {n2_s:>12} {p2_s:>12} {n3_s:>12} {p3_s:>12}')
+logger.info(f'  {"MEAN":<12} {mean_n2:>11.1f} {mean_pct2:>11.2f}% '
+            f'{mean_n3:>11.1f} {mean_pct3:>11.2f}%')
+logger.info(f'  {"TOTAL":<12} {total_n2:>11.0f} {"":>12} {total_n3:>11.0f}')
+logger.info('=' * 60)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # FIGURE 1 — Cell-type fraction: 2D vs 3D scatter plot
 #
 # For each cell type, one panel shows the 2D fraction (x) vs 3D fraction (y)

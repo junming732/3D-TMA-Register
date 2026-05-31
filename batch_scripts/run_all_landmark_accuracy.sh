@@ -162,25 +162,40 @@ path_C = f"{dataspace}/Filter_AKAZE_RoMaV2_Linear_Warp_map/{core_name}/annotatio
 def get_df(p):
     return pd.read_csv(p) if os.path.exists(p) else None
 
+# Detail CSV (one row per consecutive pair) — for TRE metrics
 dfA, dfB, dfC = get_df(path_A), get_df(path_B), get_df(path_C)
+
+# Summary CSV (one row per mclass) — for landmark/pair counts
+path_A_sum = path_A.replace('_detail.csv', '_summary.csv')
+path_B_sum = path_B.replace('_detail.csv', '_summary.csv')
+path_C_sum = path_C.replace('_detail.csv', '_summary.csv')
+dfA_sum, dfB_sum, dfC_sum = get_df(path_A_sum), get_df(path_B_sum), get_df(path_C_sum)
 
 if dfA is None and dfB is None and dfC is None:
     print("        No CSV outputs found to generate LaTeX.")
     import sys; sys.exit(0)
 
-def extract_metrics(df):
+def extract_metrics(df, df_sum):
     if df is None or df.empty:
-        return {'mean': np.nan, 'median': np.nan, 'max': np.nan, 'std': np.nan, 'count': 0, 'mclass_stats': None}
+        return {'mean': np.nan, 'median': np.nan, 'max': np.nan, 'std': np.nan,
+                'n_landmarks': 0, 'n_pairs': 0, 'mclass_stats': None}
+    # n_landmarks = total annotated points (sum of n_slices across mclasses)
+    # n_pairs     = total consecutive pairs evaluated (sum of n_pairs across mclasses)
+    n_landmarks = int(df_sum['n_slices'].sum()) if df_sum is not None and 'n_slices' in df_sum else len(df)
+    n_pairs     = int(df_sum['n_pairs'].sum())  if df_sum is not None and 'n_pairs'  in df_sum else len(df)
     return {
-        'mean': df['TRE_um'].mean(),
-        'median': df['TRE_um'].median(),
-        'max': df['TRE_um'].max(),
-        'std': df['TRE_um'].std(),
-        'count': len(df),
-        'mclass_stats': df.groupby('mclass')['TRE_um'].agg(mean='mean', max='max', count='count').reset_index()
+        'mean':        df['TRE_um'].mean(),
+        'median':      df['TRE_um'].median(),
+        'max':         df['TRE_um'].max(),
+        'std':         df['TRE_um'].std(),
+        'n_landmarks': n_landmarks,
+        'n_pairs':     n_pairs,
+        'mclass_stats': df.groupby('mclass')['TRE_um'].agg(mean='mean', max='max').reset_index()
     }
 
-metA, metB, metC = extract_metrics(dfA), extract_metrics(dfB), extract_metrics(dfC)
+metA = extract_metrics(dfA, dfA_sum)
+metB = extract_metrics(dfB, dfB_sum)
+metC = extract_metrics(dfC, dfC_sum)
 
 # Bolds the lowest error value (minimum is best)
 def bold_min(vals, fmt="{:.2f}"):
@@ -194,7 +209,8 @@ def bold_min(vals, fmt="{:.2f}"):
         else: res.append(fmt.format(v))
     return res
 
-tot_landmarks = max([metA['count'], metB['count'], metC['count']])
+# Use the pipeline with most data as reference counts
+tot_landmarks = max(metA['n_landmarks'], metB['n_landmarks'], metC['n_landmarks'])
 
 # Determine highest error & best performing structures
 all_mclasses = set()
@@ -205,15 +221,13 @@ for m in [metA, metB, metC]:
 mclass_agg = []
 for mc in all_mclasses:
     means = []
-    count = 0
     for m in [metA, metB, metC]:
         if m['mclass_stats'] is not None:
             row = m['mclass_stats'][m['mclass_stats']['mclass'] == mc]
             if not row.empty:
                 means.append(row['mean'].iloc[0])
-                count = max(count, row['count'].iloc[0])
     avg_mean = np.nanmean(means) if means else np.nan
-    mclass_agg.append({'mclass': mc, 'avg_mean': avg_mean, 'count': count})
+    mclass_agg.append({'mclass': mc, 'avg_mean': avg_mean})
 
 mclass_agg.sort(key=lambda x: x['avg_mean'], reverse=True)
 worst_mc = mclass_agg[0] if mclass_agg else None
@@ -229,7 +243,8 @@ tex.append(f"\\toprule")
 tex.append(f"& \\textbf{{Pipeline A}} & \\textbf{{Pipeline B}} & \\textbf{{Pipeline C}} \\\\")
 tex.append(f"Metric & (Bspline) & (VALIS) & (RoMaV2) \\\\")
 tex.append(f"\\midrule")
-tex.append(f"\\multicolumn{{4}}{{l}}{{\\textit{{Global --- all structures ({tot_landmarks} landmarks)}}}} \\\\")
+n_mclasses = len(all_mclasses)
+tex.append(f"\\multicolumn{{4}}{{l}}{{\\textit{{Global --- {n_mclasses} structures, {tot_landmarks} annotated landmarks}}}} \\\\")
 tex.append(f"\\quad Mean \\gls{{tre}} ($\\mu$m)   & {' & '.join(bold_min([metA['mean'], metB['mean'], metC['mean']]))} \\\\")
 tex.append(f"\\quad Median \\gls{{tre}} ($\\mu$m) & {' & '.join(bold_min([metA['median'], metB['median'], metC['median']]))} \\\\")
 tex.append(f"\\quad Max \\gls{{tre}} ($\\mu$m)    & {' & '.join(bold_min([metA['max'], metB['max'], metC['max']]))} \\\\")
@@ -237,7 +252,7 @@ tex.append(f"\\quad Std \\gls{{tre}} ($\\mu$m)    & {' & '.join(bold_min([metA['
 
 if worst_mc:
     tex.append(f"\\midrule")
-    tex.append(f"\\multicolumn{{4}}{{l}}{{\\textit{{Highest-error structure --- mclass~{worst_mc['mclass']} ({worst_mc['count']} landmarks)}}}} \\\\")
+    tex.append(f"\\multicolumn{{4}}{{l}}{{\\textit{{Highest-error structure --- mclass~{worst_mc['mclass']}}}}} \\\\")
     w_means, w_maxes = [], []
     for m in [metA, metB, metC]:
         if m['mclass_stats'] is not None and worst_mc['mclass'] in m['mclass_stats']['mclass'].values:
