@@ -219,22 +219,30 @@ for mc, records in mc_records.items():
     n = len(records)
     logger.info(f"mclass {mc}: {n} annotation(s)")
 
+    # Define grid constraints: maximum 4 columns per row
+    max_cols  = 4
+    cols      = min(n, max_cols)
+    rows      = (n + max_cols - 1) // max_cols
+    
     tile_px   = CROP_HALF * 2          
     tile_in   = max(3.0, tile_px / 80) 
-    fig_w     = tile_in * n + 0.5
+    fig_w     = tile_in * cols + 0.5
     
-    # Reduced vertical buffer from 1.2 to 0.8 to remove the blank canvas
-    fig_h     = tile_in + 0.8          
-    fig, axes = plt.subplots(1, n, figsize=(fig_w, fig_h), squeeze=False)
+    # Adjust vertical figure height to account for multiple rows
+    fig_h     = (tile_in + 0.2) * rows + 0.6          
+    fig, axes = plt.subplots(rows, cols, figsize=(fig_w, fig_h), squeeze=False)
     
-    # Removed the second line containing the directory string
     fig.suptitle(
         f"{TARGET_CORE}  —  RAW landmarks  |  mclass {mc}  |  ch {CHANNEL_IDX}",
         fontsize=11, fontweight='bold'
     )
 
-    for col, rec in enumerate(records):
-        ax = axes[0][col]
+    for i, rec in enumerate(records):
+        # Convert flat index to 2D grid row/column
+        r = i // cols
+        c = i % cols
+        ax = axes[r][c]
+        
         img, fpath = load_raw_channel(rec['slice_idx'], CHANNEL_IDX)
 
         if img is None:
@@ -261,9 +269,17 @@ for mc, records in mc_records.items():
             fontsize=9
         )
         ax.set_xlabel("x (px)", fontsize=8)
-        if col == 0:
+        
+        # Only show y-axis labels on the leftmost column of any row
+        if c == 0:
             ax.set_ylabel("y (px)", fontsize=8)
         ax.tick_params(labelsize=7)
+
+    # Clean up empty subplots in the final row if n is not a multiple of max_cols
+    for i in range(n, rows * cols):
+        r = i // cols
+        c = i % cols
+        axes[r][c].axis('off')
 
     # Add a shared legend
     handles = [mpatches.Patch(color='#ff4444', label='raw landmark')]

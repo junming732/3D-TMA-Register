@@ -85,7 +85,7 @@ def generate_pipeline_figure(out_path):
     draw_arrow(ax, X_RAW + W_sm/2, Y_MOVING, X_PREP - W_sm/2, Y_MOVING, color=C_MOVING)
 
     # --- Stage 3: Two-Stage Rigid Alignment ---
-    draw_block(ax, X_RIGID, Y_ALGO, W_lg, H_lg, "Two-Stage Rigid", "Rotation Est. -> DISK/LightGlue", '#F5F5F5', C_ALGO)
+    draw_block(ax, X_RIGID, Y_ALGO, W_lg, H_lg, "Two-Stage Rigid", "VGG Rotation -> DISK/LightGlue", '#F5F5F5', C_ALGO)
     draw_block(ax, X_RIGID, Y_MOVING, W_lg, H_lg, "Rigid Volume", "Composed Transformation", '#FCE4F3', C_MOVING)
 
     # Feeds into Rigid
@@ -99,7 +99,7 @@ def generate_pipeline_figure(out_path):
     draw_arrow(ax, X_PREP + W_sm/2, Y_MOVING, X_RIGID - W_lg/2, Y_MOVING, color=C_MOVING)
 
     # --- Stage 4: Non-Rigid Registration ---
-    draw_block(ax, X_NONRIGID, Y_ALGO, W_lg, H_lg, "Automated Non-Rigid", "Internal Deformation Scaling", '#F5F5F5', C_ALGO)
+    draw_block(ax, X_NONRIGID, Y_ALGO, W_lg, H_lg, "Automated Non-Rigid", "DeepFlow optical flow", '#F5F5F5', C_ALGO)
     draw_block(ax, X_NONRIGID, Y_MOVING, W_lg, H_lg, "Aligned Volume", "Cropped & Stacked OME-TIFF", '#E8F5E9', C_OUT, lw=3)
     
     # Feeds into Non-Rigid

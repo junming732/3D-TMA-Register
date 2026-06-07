@@ -86,7 +86,7 @@ def fig0_conceptual_pipeline(out_path):
 
     # Stage 3: L0 Global Alignment
     draw_block(ax, X_AKAZE, Y_ALGO, W_lg, H_lg, "L0: AKAZE Affine", "RANSAC + Lowe Ratio Test", '#F5F5F5', C_ALGO)
-    draw_block(ax, X_AKAZE, Y_MOVING, W_lg, H_lg, "Affine Volume", "Coarse Rigid Prealignment", '#FCE4F3', C_MOVING)
+    draw_block(ax, X_AKAZE, Y_MOVING, W_lg, H_lg, "Affine Volume", "Coarse Affine Prealignment", '#FCE4F3', C_MOVING)
 
     # Feeds into AKAZE
     draw_arrow(ax, X_PREP + W_sm/2, Y_FIXED, X_AKAZE - W_lg/2 + 0.4, Y_ALGO + H_lg*0.5, rad=-0.1, color=C_FIXED)

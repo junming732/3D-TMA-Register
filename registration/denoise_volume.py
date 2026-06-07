@@ -527,32 +527,34 @@ def _dog_artifact_mask(med: np.ndarray, pixel_um: float, cfg: dict, ch_name: str
     return final_mask
 
 
+# NEW — kernel scales to the size of the masked region so the blur
+#        always spans the full hole, not just its edges
 def _inpaint_artifact(img: np.ndarray, mask: np.ndarray) -> np.ndarray:
-    """
-    Fast matrix-based inpainting. 
-    Replaces cv2.inpaint (Telea algorithm) which is computationally prohibitive 
-    for high-resolution arrays with scattered masks.
-    """
     if not mask.any():
         return img
-    
-    # 1. Determine a safe baseline to prevent artifacts from spiking the blur
-    #    and zeros from sinking it.
+
     valid_pixels = img[img > 0]
     baseline_val = float(np.median(valid_pixels)) if valid_pixels.size > 0 else 0.0
-    
-    # 2. Create a base image where artifacts are neutralized
+
     clean_base = img.copy()
     clean_base[mask] = baseline_val
-    
-    # 3. Generate a fast local topography estimate
-    #    31x31 is large enough to blend edges without massive CPU overhead
-    local_topo = cv2.GaussianBlur(clean_base, (31, 31), 0, borderType=cv2.BORDER_REFLECT)
-    
-    # 4. Inject only the local topography into the masked regions
+
+    # Measure the bounding box of the masked region so the kernel is
+    # guaranteed to be larger than the hole — preventing the flat grey fill
+    rows = np.any(mask, axis=1)
+    cols = np.any(mask, axis=0)
+    mask_h = int(rows.sum())
+    mask_w = int(cols.sum())
+    blur_radius = max(mask_h, mask_w, 31)   # never smaller than 31 px
+    ksize = blur_radius * 2 + 1
+
+    local_topo = cv2.GaussianBlur(
+        clean_base, (ksize, ksize), blur_radius / 3.0,
+        borderType=cv2.BORDER_REFLECT
+    )
+
     inpainted = img.copy()
     inpainted[mask] = local_topo[mask]
-    
     return inpainted
 
 def _gaussian_background(img_clean: np.ndarray, sigma_px: float) -> np.ndarray:
@@ -621,6 +623,37 @@ def denoise_channel(raw: np.ndarray, cfg: dict, ch_name: str) -> dict:
         artifact_mask = dog_mask
 
     # Dilate the combined mask by ~7.5 µm to absorb optical halos
+    # NEW — two-stage dilation: large blobs get a big halo dilation first,
+#        then everything gets the standard 7.5 µm cleanup dilation
+    if is_dapi and large_mask.any():
+    # Step 1: measure how far the intensity halo extends outside the blob edge
+    # by sampling a ring of increasing thickness and checking mean intensity
+        valid_px   = med[med > 0]
+        bg_level   = float(np.percentile(valid_px, 50))   # median = typical background
+        
+        # Try dilations of increasing radius; stop when the ring pixels are at background
+        found_radius_um = 15.0   # minimum — always absorb immediate edge
+        for test_um in [15, 30, 50, 80, 120]:
+            r_px    = _um_to_px(test_um)
+            d       = 2 * r_px + 1
+            k       = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (d, d))
+            dilated = cv2.dilate(large_mask.astype(np.uint8), k).astype(bool)
+            ring    = dilated & ~large_mask          # pixels in the new ring only
+            if ring.sum() == 0:
+                break
+            ring_mean = float(med[ring].mean())
+            found_radius_um = test_um
+            if ring_mean <= bg_level * 1.5:          # ring is ~background → stop
+                break
+        
+        r_px   = _um_to_px(found_radius_um)
+        d      = 2 * r_px + 1
+        k      = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (d, d))
+        large_mask_dilated = cv2.dilate(large_mask.astype(np.uint8), k).astype(bool)
+        artifact_mask      = large_mask_dilated | (artifact_mask & ~large_mask)
+        logger.info(f'[{ch_name}] Large-blob halo dilation: auto-selected {found_radius_um:.0f} µm '
+                    f'({int(large_mask.sum()):,} → {int(large_mask_dilated.sum()):,} px)')
+    # Standard 7.5 µm dilation for all channels (absorbs small-blob / DoG edges)
     if artifact_mask.any():
         dilate_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (41, 41))
         artifact_mask = cv2.dilate(artifact_mask.astype(np.uint8), dilate_kernel).astype(bool)

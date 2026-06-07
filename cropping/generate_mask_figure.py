@@ -227,81 +227,101 @@ def build_segmentation_figure(file_path: str, out_path: str, slide_index: int = 
 
     tma_name = os.path.basename(os.path.dirname(os.path.dirname(file_path)))
 
-    # ─────────────────────────────────────────────────────────────────────────
-    # Figure layout 
+   # ─────────────────────────────────────────────────────────────────────────
+    # Figure layout — Split into Part 1 (Masks) and Part 2 (Results)
     # ─────────────────────────────────────────────────────────────────────────
 
-    fig = plt.figure(figsize=(12, 16))
-    fig.patch.set_facecolor("white")
-
-    gs = GridSpec(
-        3, 2, 
-        figure=fig,
-        height_ratios=[1, 1, 1],
-        hspace=0.28,          
-        wspace=0.15,
-        left=0.05, right=0.95,
-        top=0.93, bottom=0.06,
-    )
+    # Extract base path to save part1 and part2
+    base_out, ext = os.path.splitext(out_path)
+    if not ext:
+        ext = ".png"
+    out_path_part1 = f"{base_out}_part1{ext}"
+    out_path_part2 = f"{base_out}_part2{ext}"
 
     MASK_CMAP  = "inferno"
     GRAY_CMAP  = "gray"
     
-    LABEL_KW   = dict(fontsize=14, color="black", fontfamily="monospace", labelpad=8)
-    TITLE_KW   = dict(fontsize=15, color="black", fontfamily="monospace")
+    # Aggressively scaled typography for A4 legibility
+    LABEL_KW   = dict(fontsize=18, color="black", fontfamily="monospace", labelpad=12)
+    TITLE_KW   = dict(fontsize=20, color="black", fontfamily="monospace")
+    SUPTITLE_FONT = 24
 
-    def _ax(row, col):
-        ax = fig.add_subplot(gs[row, col])
+    def _format_ax(ax):
         ax.set_facecolor("white")
         for spine in ax.spines.values():
             spine.set_edgecolor("#cccccc")
         ax.tick_params(left=False, bottom=False, labelleft=False, labelbottom=False)
         return ax
 
-    # ── (a) summed projection ─────────────────────────────────────────────────
-    ax_a = _ax(0, 0)
+    slice_num = tma_name.split('_')[-1]
+    title_str = f"Core segmentation pipeline  —  Slice {slice_num}"
+
+    # =========================================================================
+    # FIGURE 1: Mask Progression (2x2)
+    # =========================================================================
+    fig1 = plt.figure(figsize=(14, 14))
+    fig1.patch.set_facecolor("white")
+
+    gs1 = GridSpec(
+        2, 2, figure=fig1,
+        hspace=0.25, wspace=0.15,
+        left=0.05, right=0.95, top=0.86, bottom=0.06  # Lowered top boundary to 0.86
+    )
+
+    # ── (a) summed projection
+    ax_a = _format_ax(fig1.add_subplot(gs1[0, 0]))
     ax_a.imshow(norm, cmap=GRAY_CMAP, interpolation="nearest")
-    ax_a.set_title(f"(a)  Summed projection\n"
-                   f"({actual_factor}× downsampled, level {used_level_idx + 1}/{n_levels})",
-                   **TITLE_KW)
+    ax_a.set_title("(a)  Summed projection", **TITLE_KW)
     ax_a.set_xlabel("$I_{\\mathrm{norm}}$", **LABEL_KW)
 
-    # ── (b) safe mask ─────────────────────────────────────────────────────────
-    ax_b = _ax(0, 1)
+    # ── (b) safe mask
+    ax_b = _format_ax(fig1.add_subplot(gs1[0, 1]))
     ax_b.imshow(safe_mask, cmap=MASK_CMAP, interpolation="nearest")
-    ax_b.set_title("(b)  Safe mask  $M_{\\mathrm{safe}}$\n"
-                   "Otsu on BG-subtracted proj. + dilation",
-                   **TITLE_KW)
+    ax_b.set_title("(b)  Safe mask  $M_{\\mathrm{safe}}$", **TITLE_KW)
     ax_b.set_xlabel("$M_{\\mathrm{safe}}$", **LABEL_KW)
 
-    # ── (c) triangle mask ─────────────────────────────────────────────────────
-    ax_c = _ax(1, 0)
+    # ── (c) triangle mask
+    ax_c = _format_ax(fig1.add_subplot(gs1[1, 0]))
     ax_c.imshow(binary_raw, cmap=MASK_CMAP, interpolation="nearest")
-    ax_c.set_title(f"(c)  Triangle mask  $M_{{\\mathrm{{tri}}}}$\n"
-                   f"$T_{{\\mathrm{{tri}}}}$ = {thresh_val:.0f}  (contrast-stretched)",
-                   **TITLE_KW)
+    ax_c.set_title(f"(c)  Triangle mask  $M_{{\\mathrm{{tri}}}}$", **TITLE_KW)
     ax_c.set_xlabel("$M_{\\mathrm{tri}}$", **LABEL_KW)
 
-    # ── (d) final mask ────────────────────────────────────────────────────────
-    ax_d = _ax(1, 1)
+    # ── (d) final mask
+    ax_d = _format_ax(fig1.add_subplot(gs1[1, 1]))
     ax_d.imshow(final_mask, cmap=MASK_CMAP, interpolation="nearest")
-    ax_d.set_title("(d)  Final mask  $M_{\\mathrm{final}}$\n"
-                   "$M_{\\mathrm{safe}}$ $\\cap$ $M_{\\mathrm{tri}}$  →  close  →  open",
-                   **TITLE_KW)
+    ax_d.set_title("(d)  Final mask  $M_{\\mathrm{final}}$", **TITLE_KW)
     ax_d.set_xlabel("$M_{\\mathrm{final}}$", **LABEL_KW)
 
-    # ── (e) detected cores ────────────────────────────────────────────────────
-    ax_e = _ax(2, 0)
+    # Anchored suptitle higher using y=0.96
+    fig1.suptitle(title_str + "\n(Part 1: Masking)", 
+                  fontsize=SUPTITLE_FONT, color="black", fontfamily="monospace", weight="bold", y=0.96)
+    
+    plt.figure(fig1.number)
+    plt.savefig(out_path_part1, dpi=200, bbox_inches="tight", facecolor=fig1.get_facecolor())
+    plt.close(fig1)
+    print(f"  Figure 1 saved → {out_path_part1}")
+
+    # =========================================================================
+    # FIGURE 2: Detection and Threshold Geometry (1x2)
+    # =========================================================================
+    fig2 = plt.figure(figsize=(16, 8))
+    fig2.patch.set_facecolor("white")
+
+    gs2 = GridSpec(
+        1, 2, figure=fig2,
+        wspace=0.20,
+        left=0.05, right=0.95, top=0.82, bottom=0.10  # Adjusted top boundary
+    )
+
+    # ── (a) detected cores (Formerly e)
+    ax_e = _format_ax(fig2.add_subplot(gs2[0, 0]))
     ax_e.imshow(overlay, interpolation="nearest")
-    ax_e.set_title(f"(e)  Detected cores\n"
-                   f"area $\\geq$ {params['MIN_AREA']} px,  "
-                   f"aspect ratio $\\in$ [0.3, 3.0]",
-                   **TITLE_KW)
+    ax_e.set_title("(a)  Detected cores", **TITLE_KW)
 
     ax_e.set_xlabel(f"accepted: {len(kept)}\n"
                     f"rejected (size): {len(discarded_area)}   "
                     f"rejected (shape): {len(discarded_aspect)}",
-                    fontsize=12, color="black", fontfamily="monospace") 
+                    fontsize=16, color="black", fontfamily="monospace") 
 
     legend_elements = [
         mpatches.Patch(facecolor=(60/255,  200/255, 100/255), label="accepted"),
@@ -309,94 +329,76 @@ def build_segmentation_figure(file_path: str, out_path: str, slide_index: int = 
         mpatches.Patch(facecolor=(230/255, 160/255,  20/255), label="rejected — aspect"),
     ]
     ax_e.legend(handles=legend_elements, loc="lower right",
-                fontsize=12, framealpha=0.85,
-                facecolor="white", edgecolor="#cccccc",
-                labelcolor="black")
+                fontsize=15, framealpha=0.85,
+                facecolor="white", edgecolor="#cccccc", labelcolor="black")
 
-    # ── (f) histogram inset — Triangle threshold geometry ─────────────────────
-    ax_f = fig.add_subplot(gs[2, 1])
+    # ── (b) histogram inset (Formerly f)
+    ax_f = fig2.add_subplot(gs2[0, 1])
     ax_f.set_facecolor("white")
     for spine in ax_f.spines.values():
         spine.set_edgecolor("#cccccc")
-    ax_f.tick_params(colors="black", labelsize=12)
+    ax_f.tick_params(colors="black", labelsize=15)
 
     peak_count   = float(hist_counts[peak_idx])
     nonzero_bins = np.where(hist_counts > peak_count * 0.001)[0]
     last_bin     = int(nonzero_bins[-1]) if len(nonzero_bins) else len(bin_centres) - 1
-    zoom_xmax    = min(255, max(int(bin_centres[threshold_idx]) + 20,
-                                int(bin_centres[last_bin])      + 5))
-    ax_f.set_xlim(0, zoom_xmax)
-    ax_f.set_ylim(0, peak_count * 1.08)
-
-    peak_count = float(hist_counts[peak_idx])
+    zoom_xmax    = min(255, max(int(bin_centres[threshold_idx]) + 20, int(bin_centres[last_bin]) + 5))
+    
     ax_f.set_xlim(0, 255)
     ax_f.set_ylim(0, peak_count * 1.08)
 
     ax_f.bar(bin_centres, hist_counts, width=(bin_centres[1] - bin_centres[0]),
              color="#3d6bb5", alpha=0.65, label="histogram $H(b)$", zorder=2)
 
-    px  = float(bin_centres[peak_idx])
-    py  = float(hist_counts[peak_idx])
-    tx  = float(bin_centres[tail_idx])
-    ty  = 0.0                          
-    cdx = tx - px
-    cdy = ty - py
+    px, py = float(bin_centres[peak_idx]), float(hist_counts[peak_idx])
+    tx, ty = float(bin_centres[tail_idx]), 0.0                          
+    cdx, cdy = tx - px, ty - py
 
-    chord_line, = ax_f.plot([px, tx], [py, ty],
-                            color="#e69138", linewidth=2.0, linestyle="--",
+    chord_line, = ax_f.plot([px, tx], [py, ty], color="#e69138", linewidth=2.5, linestyle="--",
                             label=r"chord  $(b_{\mathrm{peak}},H_{\mathrm{peak}})\!\to\!(b_{\mathrm{tail}},0)$",
                             zorder=4, clip_on=True)
 
     xb_data = float(bin_centres[threshold_idx])
     yb_data = float(hist_counts[threshold_idx])
 
-    def _draw_perp(event, _ax=ax_f, _px=px, _py=py, _cdx=cdx, _cdy=cdy,
-                   _xb=xb_data, _yb=yb_data):
+    def _draw_perp(event, _ax=ax_f, _px=px, _py=py, _cdx=cdx, _cdy=cdy, _xb=xb_data, _yb=yb_data):
         if getattr(_ax, "_perp_drawn", False):
             return
         trans = _ax.transData
-        P  = trans.transform([_px, _py])
-        D  = trans.transform([_px + _cdx, _py + _cdy])
-        B  = trans.transform([_xb, _yb])
+        P = trans.transform([_px, _py])
+        D = trans.transform([_px + _cdx, _py + _cdy])
+        B = trans.transform([_xb, _yb])
         cv = D - P
-        t  = np.dot(B - P, cv) / (np.dot(cv, cv) + 1e-24)
-        F  = P + t * cv
+        t = np.dot(B - P, cv) / (np.dot(cv, cv) + 1e-24)
+        F = P + t * cv
         xf, yf = _ax.transData.inverted().transform(F)
         _ax.annotate("", xy=(xf, yf), xytext=(_xb, _yb),
-                     arrowprops=dict(arrowstyle="<->", color="#e05c5c", lw=2.0),
-                     zorder=5)
+                     arrowprops=dict(arrowstyle="<->", color="#e05c5c", lw=2.5), zorder=5)
         _ax.text((_xb + xf) / 2 + 0.5, (_yb + yf) / 2,
-                 r"$d(b)_{\max}$", fontsize=11, color="#e05c5c", va="center")
+                 r"$d(b)_{\max}$", fontsize=16, color="#e05c5c", va="center")
         _ax._perp_drawn = True
         _ax.get_figure().canvas.draw()
 
-    fig.canvas.mpl_connect("draw_event", _draw_perp)
+    fig2.canvas.mpl_connect("draw_event", _draw_perp)
 
-    ax_f.axvline(tri_threshold, color="#e05c5c", linewidth=2.0, linestyle="-",
+    ax_f.axvline(tri_threshold, color="#e05c5c", linewidth=2.5, linestyle="-",
                  label=rf"$T_{{\mathrm{{tri}}}}$ = {tri_threshold:.0f}", zorder=4)
-    ax_f.set_xlabel("Intensity bin  $b$",  fontsize=14, color="black")
-    ax_f.set_ylabel("Count  $H(b)$",       fontsize=14, color="black")
-    ax_f.set_title(
-        "(f)  Triangle threshold geometry\n"
-        r"($T_{\mathrm{tri}} = \arg\max_b\, d(b)$)",
-        fontsize=14, color="black", loc="center",
-    )
-    ax_f.legend(fontsize=11, framealpha=0.85,
-                facecolor="white", edgecolor="#cccccc",
+    
+    ax_f.set_xlabel("Intensity bin  $b$", fontsize=18, color="black")
+    ax_f.set_ylabel("Count  $H(b)$", fontsize=18, color="black")
+    ax_f.set_title("(b)  Triangle threshold geometry", fontsize=20, color="black", loc="center")
+    
+    ax_f.legend(fontsize=15, framealpha=0.85, facecolor="white", edgecolor="#cccccc",
                 labelcolor="black", loc="upper right")
 
-    slice_num = tma_name.split('_')[-1]
+    fig2.suptitle(title_str + "\n(Part 2: Outcomes)", 
+                  fontsize=SUPTITLE_FONT, color="black", fontfamily="monospace", weight="bold", y=0.98)
     
-    fig.suptitle(
-        f"Core segmentation pipeline  —  Slice {slice_num}",
-        fontsize=18, color="black", fontfamily="monospace", weight="bold", y=0.98,
-    )
-
-    fig.canvas.draw()  
-    plt.savefig(out_path, dpi=180, bbox_inches="tight",
-                facecolor=fig.get_facecolor())
-    plt.close(fig)
-    print(f"  Figure saved → {out_path}")
+    plt.figure(fig2.number)
+    fig2.canvas.draw()  
+    plt.savefig(out_path_part2, dpi=200, bbox_inches="tight", facecolor=fig2.get_facecolor())
+    plt.close(fig2)
+    print(f"  Figure 2 saved → {out_path_part2}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────

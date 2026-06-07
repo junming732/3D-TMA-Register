@@ -27,9 +27,8 @@ Outputs (under TME_Analysis/Aggregate/)
     aggregate_summary.csv
     figures/
         fig_1_density_2d_vs_3d.png        — paired strip plot, 2D vs 3D density
-        fig_2_nn_delta_heatmap.png         — heatmap of 3D-2D NN delta per type-pair
+        fig_2_nn_distances.png      — per-source-type 2D vs 3D scatter across cores
         fig_3_entropy_delta_boxplot.png    — boxplot of delta mean H per cell type
-        fig_4_entropy_significance.png     — fraction of cores with KS p < 0.05
 
 Usage
 -----
@@ -321,7 +320,7 @@ n_types = len(types_frac)
 ncols   = 3
 nrows   = int(np.ceil(n_types / ncols))
 
-fig1, axes = plt.subplots(nrows, ncols, figsize=(4.2 * ncols, 4.0 * nrows),
+fig1, axes = plt.subplots(nrows, ncols, figsize=(6.0 * ncols, 5.5 * nrows),
                            facecolor=BG)
 axes = axes.flatten()
 
@@ -341,13 +340,13 @@ for idx, ct in enumerate(types_frac):
     merged = f2.merge(f3, on='core', how='inner')
 
     ax.scatter(merged['f2d'], merged['f3d'],
-               color=col, s=55, alpha=0.85, zorder=3,
-               edgecolors='white', lw=0.5)
+               color=col, s=120, alpha=0.85, zorder=3,
+               edgecolors='white', lw=0.8)
 
     # Diagonal (perfect agreement)
     lim_max = max(merged['f2d'].max(), merged['f3d'].max()) * 1.12
     ax.plot([0, lim_max], [0, lim_max],
-            color='#aaa', lw=1.2, ls='--', zorder=1)
+            color='#aaa', lw=2.0, ls='--', zorder=1)
 
     # Pearson r annotation
     if len(merged) >= 3:
@@ -355,13 +354,14 @@ for idx, ct in enumerate(types_frac):
         pstr = f'p={p:.2f}' if p >= 0.01 else 'p<0.01'
         ax.text(0.97, 0.05, f'r={r:.2f}  {pstr}',
                 transform=ax.transAxes, ha='right', va='bottom',
-                fontsize=8.5, color='#333')
+                fontsize=22, color='#333')
 
     ax.set_xlim(left=0)
     ax.set_ylim(bottom=0)
-    ax.set_xlabel('2D fraction', fontsize=9)
-    ax.set_ylabel('3D fraction', fontsize=9)
-    ax.set_title(ct, fontsize=11, fontweight='bold', color=col)
+    ax.set_xlabel('2D fraction', fontsize=24)
+    ax.set_ylabel('3D fraction', fontsize=24)
+    ax.tick_params(axis='both', labelsize=22)
+    ax.set_title(ct, fontsize=26, fontweight='bold', color=col)
 
 # Hide unused panels
 for ax in axes[n_types:]:
@@ -369,7 +369,7 @@ for ax in axes[n_types:]:
 
 fig1.suptitle(f'Cell-type composition: 2D vs 3D across {len(CORE_NAMES)} cores\n'
               f'Each point = one core   Dashed line = perfect agreement',
-              fontsize=13, fontweight='bold', color='#1A1A2E', y=1.01)
+              fontsize=28, fontweight='bold', color='#1A1A2E', y=1.01)
 fig1.tight_layout()
 path1 = os.path.join(FIG_DIR, 'fig_1_celltype_fraction_2d_vs_3d.png')
 fig1.savefig(path1, dpi=200, bbox_inches='tight', facecolor=BG)
@@ -378,12 +378,16 @@ logger.info(f'  Figure 1 saved: {path1}')
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# FIGURE 2 — NN distance delta heatmap (3D - 2D), median across cores
+# FIGURE 2 — NN distances: multi-panel paired bar + core dot strip
 #
-# Rows = source type, columns = target type.
-# Colour = median delta NN distance (µm) across cores.
+# One subplot per source cell type (grid layout, 3 columns).
+# Within each panel, one row per target type.
+# Pale bar  = median 2D distance across cores.
+# Solid bar = median 3D distance across cores.
+# Individual core values overlaid as dots (2D = open, 3D = filled).
+# Coloured by source type throughout.
 # ─────────────────────────────────────────────────────────────────────────────
-logger.info('Generating Figure 2: NN distance delta heatmap ...')
+logger.info('Generating Figure 2: NN distance multi-panel bar + strip plot ...')
 
 nn_merged = (df_nn_2d[['core', 'src_type', 'tgt_type', 'mean_dist_um']]
              .rename(columns={'mean_dist_um': 'dist_2d'})
@@ -391,47 +395,86 @@ nn_merged = (df_nn_2d[['core', 'src_type', 'tgt_type', 'mean_dist_um']]
                  df_nn_3d[['core', 'src_type', 'tgt_type', 'mean_dist_um']]
                  .rename(columns={'mean_dist_um': 'dist_3d'}),
                  on=['core', 'src_type', 'tgt_type'], how='inner'))
-nn_merged['delta'] = nn_merged['dist_3d'] - nn_merged['dist_2d']
 
-nn_pivot = (nn_merged
-            .groupby(['src_type', 'tgt_type'])['delta']
-            .median()
-            .unstack(fill_value=np.nan))
+src_types2 = [t for t in _ALL_TYPES_SORTED if t in nn_merged['src_type'].values]
+n_src      = len(src_types2)
+ncols2     = 3
+nrows2     = 2   # fixed 3×2 grid
 
-# Reorder rows/cols by canonical type order
-row_order = [t for t in _ALL_TYPES_SORTED if t in nn_pivot.index]
-col_order = [t for t in _ALL_TYPES_SORTED if t in nn_pivot.columns]
-nn_pivot  = nn_pivot.loc[row_order, col_order]
+# Panel height scales with the number of target types in the busiest source
+max_tgts   = max(
+    nn_merged[nn_merged['src_type'] == s]['tgt_type'].nunique()
+    for s in src_types2
+)
+panel_h    = max(6.0, max_tgts * 1.1 + 2.0)
 
-fig2, ax2 = plt.subplots(figsize=(8, 6.5), facecolor=BG)
-_finish_ax(ax2)
+fig2, axes2 = plt.subplots(nrows2, ncols2,
+                            figsize=(8.5 * ncols2, panel_h * nrows2),
+                            facecolor=BG)
+axes2 = axes2.flatten()
+for ax in axes2:
+    _finish_ax(ax)
 
-vmax = np.nanpercentile(np.abs(nn_pivot.values), 95)
-im   = ax2.imshow(nn_pivot.values, cmap='RdBu_r', aspect='auto',
-                  vmin=-vmax, vmax=vmax)
+bar_h = 0.32
+gap   = 0.08
+row_h = bar_h * 2 + gap + 0.18
+rng2  = np.random.default_rng(0)
 
-ax2.set_xticks(range(len(col_order)))
-ax2.set_yticks(range(len(row_order)))
-ax2.set_xticklabels(col_order, rotation=35, ha='right', fontsize=10)
-ax2.set_yticklabels(row_order, fontsize=10)
-ax2.set_xlabel('Target cell type', fontsize=11)
-ax2.set_ylabel('Source cell type', fontsize=11)
-ax2.set_title(f'Median NN distance delta (3D minus 2D, µm)\nacross {len(CORE_NAMES)} cores',
-              fontsize=12, fontweight='bold', color='#1A1A2E', pad=10)
+for idx, src in enumerate(src_types2):
+    ax  = axes2[idx]
+    col = _type_color(src)
 
-# Annotate cells
-for i in range(len(row_order)):
-    for j in range(len(col_order)):
-        val = nn_pivot.values[i, j]
-        if np.isfinite(val):
-            ax2.text(j, i, f'{val:.1f}', ha='center', va='center',
-                     fontsize=7.5, color='white' if abs(val) > vmax * 0.6 else '#333')
+    tgts = [t for t in _ALL_TYPES_SORTED
+            if ((nn_merged['src_type'] == src) &
+                (nn_merged['tgt_type'] == t)).any()]
+    y_centers2 = np.arange(len(tgts)) * row_h
 
-cbar = fig2.colorbar(im, ax=ax2, fraction=0.035, pad=0.03)
-cbar.set_label('Δ NN distance (µm)', fontsize=10)
+    for k, tgt in enumerate(tgts):
+        sub = nn_merged[(nn_merged['src_type'] == src) &
+                        (nn_merged['tgt_type'] == tgt)]
+        yc   = y_centers2[k]
+        med2 = sub['dist_2d'].median()
+        med3 = sub['dist_3d'].median()
 
+        # Pale bar = 2D median
+        ax.barh(yc + bar_h / 2 + gap / 2, med2,
+                height=bar_h, color=col, alpha=0.40, edgecolor='none', zorder=2)
+        # Solid bar = 3D median
+        ax.barh(yc - bar_h / 2 - gap / 2, med3,
+                height=bar_h, color=col, alpha=1.00, edgecolor='none', zorder=2)
+
+        # Core dots — 2D open, 3D filled
+        jit2 = rng2.uniform(-bar_h * 0.35, bar_h * 0.35, len(sub))
+        jit3 = rng2.uniform(-bar_h * 0.35, bar_h * 0.35, len(sub))
+        ax.scatter(sub['dist_2d'], yc + bar_h / 2 + gap / 2 + jit2,
+                   color=col, s=60, alpha=0.70, zorder=3,
+                   edgecolors=col, lw=1.5, facecolors='white')
+        ax.scatter(sub['dist_3d'], yc - bar_h / 2 - gap / 2 + jit3,
+                   color=col, s=60, alpha=0.70, zorder=3,
+                   edgecolors='none')
+
+    ax.set_yticks(y_centers2)
+    ax.set_yticklabels(tgts, fontsize=28)
+    ax.tick_params(axis='x', labelsize=26)
+    ax.invert_yaxis()
+    ax.set_xlabel('Mean NN distance (µm)', fontsize=28)
+    ax.set_title(f'Source: {src}', fontsize=32, fontweight='bold', color=col)
+
+# Shared legend on the first panel
+axes2[0].legend(handles=[
+    mpatches.Patch(facecolor='#888', alpha=0.40, label='2D  (pale bar + open dots)'),
+    mpatches.Patch(facecolor='#888', alpha=1.00, label='3D  (solid bar + filled dots)'),
+], fontsize=20, frameon=False, loc='lower right')
+
+for ax in axes2[n_src:]:
+    ax.set_visible(False)
+
+fig2.suptitle(
+    f'Nearest-neighbour distances: 2D vs 3D across {len(CORE_NAMES)} cores\n'
+    'Bars = median   Dots = individual cores   Rows = target type',
+    fontsize=34, fontweight='bold', color='#1A1A2E', y=1.01)
 fig2.tight_layout()
-path2 = os.path.join(FIG_DIR, 'fig_2_nn_delta_heatmap.png')
+path2 = os.path.join(FIG_DIR, 'fig_2_nn_distances.png')
 fig2.savefig(path2, dpi=200, bbox_inches='tight', facecolor=BG)
 plt.close(fig2)
 logger.info(f'  Figure 2 saved: {path2}')
@@ -447,22 +490,27 @@ logger.info('Generating Figure 3: entropy delta boxplot ...')
 
 types_ent = [t for t in _ALL_TYPES_SORTED if t in df_entropy['cell_type'].values]
 
-fig3, ax3 = plt.subplots(figsize=(9, 5.5), facecolor=BG)
+fig3, ax3 = plt.subplots(figsize=(13, 8), facecolor=BG)
 _finish_ax(ax3)
 
 x_positions = np.arange(len(types_ent))
 
 bp_data = []
 for ct in types_ent:
-    vals = df_entropy[df_entropy['cell_type'] == ct]['delta_mean_H'].dropna().values
-    bp_data.append(vals)
+    sub = df_entropy[df_entropy['cell_type'] == ct][
+        ['delta_mean_H', 'mean_H_2d']].dropna()
+    # relative % delta: (H_3D - H_2D) / H_2D * 100
+    rel = np.where(sub['mean_H_2d'] > 0,
+                   sub['delta_mean_H'] / sub['mean_H_2d'] * 100,
+                   np.nan)
+    bp_data.append(rel[np.isfinite(rel)])
 
-bp = ax3.boxplot(bp_data, positions=x_positions, widths=0.45,
+bp = ax3.boxplot(bp_data, positions=x_positions, widths=0.50,
                  patch_artist=True, notch=False,
-                 medianprops=dict(color='white', lw=2),
-                 whiskerprops=dict(color='#888'),
-                 capprops=dict(color='#888'),
-                 flierprops=dict(marker='o', markersize=3,
+                 medianprops=dict(color='white', lw=3.0),
+                 whiskerprops=dict(color='#888', lw=2.0),
+                 capprops=dict(color='#888', lw=2.0),
+                 flierprops=dict(marker='o', markersize=7,
                                  markerfacecolor='#aaa', markeredgecolor='none'))
 
 for patch, ct in zip(bp['boxes'], types_ent):
@@ -473,74 +521,25 @@ for patch, ct in zip(bp['boxes'], types_ent):
 # Strip of individual core points
 rng = np.random.default_rng(42)
 for xi, (ct, vals) in enumerate(zip(types_ent, bp_data)):
-    jitter = rng.uniform(-0.14, 0.14, len(vals))
+    jitter = rng.uniform(-0.16, 0.16, len(vals))
     ax3.scatter(xi + jitter, vals, color=_type_color(ct),
-                s=28, alpha=0.85, zorder=4, edgecolors='white', lw=0.4)
+                s=80, alpha=0.85, zorder=4, edgecolors='white', lw=0.6)
 
-ax3.axhline(0, color='#555', lw=1.2, ls='--', zorder=1)
+ax3.axhline(0, color='#555', lw=2.0, ls='--', zorder=1)
 ax3.set_xticks(x_positions)
-ax3.set_xticklabels(types_ent, rotation=28, ha='right', fontsize=10)
-ax3.set_ylabel('Δ Mean Shannon entropy H (nats)\n(3D minus 2D)', fontsize=11)
+ax3.set_xticklabels(types_ent, rotation=28, ha='right', fontsize=20)
+ax3.tick_params(axis='y', labelsize=20)
+ax3.set_ylabel('Relative Δ Shannon entropy H (%)\n(3D − 2D) / 2D × 100', fontsize=21)
 ax3.set_title(f'Neighbourhood entropy shift: 3D vs 2D\n'
               f'Distribution across {len(CORE_NAMES)} cores   '
               f'Radius = {int(RADIUS_UM)} µm',
-              fontsize=12, fontweight='bold', color='#1A1A2E', pad=10)
+              fontsize=23, fontweight='bold', color='#1A1A2E', pad=14)
 
 fig3.tight_layout()
 path3 = os.path.join(FIG_DIR, 'fig_3_entropy_delta_boxplot.png')
 fig3.savefig(path3, dpi=200, bbox_inches='tight', facecolor=BG)
 plt.close(fig3)
 logger.info(f'  Figure 3 saved: {path3}')
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# FIGURE 4 — Fraction of cores with significant entropy shift (KS p < 0.05)
-#
-# Horizontal bar per cell type, bar length = fraction of cores significant.
-# Annotated with n significant / n total cores.
-# ─────────────────────────────────────────────────────────────────────────────
-logger.info('Generating Figure 4: entropy significance summary ...')
-
-sig_rows = []
-for ct in types_ent:
-    sub      = df_entropy[df_entropy['cell_type'] == ct]
-    n_total  = len(sub)
-    n_sig    = (sub['ks_p'] < 0.05).sum()
-    sig_rows.append({'cell_type': ct,
-                     'n_sig':     n_sig,
-                     'n_total':   n_total,
-                     'frac_sig':  n_sig / n_total if n_total > 0 else 0})
-
-df_sig = pd.DataFrame(sig_rows)
-
-fig4, ax4 = plt.subplots(figsize=(8, 5), facecolor=BG)
-_finish_ax(ax4)
-
-y_pos = np.arange(len(df_sig))
-for k, row in df_sig.iterrows():
-    ax4.barh(k, row['frac_sig'], color=_type_color(row['cell_type']),
-             alpha=0.80, edgecolor='none', height=0.55)
-    ax4.text(row['frac_sig'] + 0.01, k,
-             f"{int(row['n_sig'])}/{int(row['n_total'])}",
-             va='center', fontsize=9, color='#333')
-
-ax4.axvline(0.5, color='#888', lw=1, ls='--')
-ax4.set_xlim(0, 1.15)
-ax4.set_yticks(y_pos)
-ax4.set_yticklabels(df_sig['cell_type'], fontsize=10)
-ax4.set_xlabel('Fraction of cores with KS p < 0.05\n(2D vs 3D entropy distribution)',
-               fontsize=11)
-ax4.set_title(f'Significance of 2D vs 3D entropy shift per cell type\n'
-              f'across {len(CORE_NAMES)} cores',
-              fontsize=12, fontweight='bold', color='#1A1A2E', pad=10)
-ax4.text(0.5, -0.7, '— 50 % threshold', fontsize=8.5,
-         color='#888', ha='center', style='italic')
-
-fig4.tight_layout()
-path4 = os.path.join(FIG_DIR, 'fig_4_entropy_significance.png')
-fig4.savefig(path4, dpi=200, bbox_inches='tight', facecolor=BG)
-plt.close(fig4)
-logger.info(f'  Figure 4 saved: {path4}')
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -556,7 +555,6 @@ logger.info('    aggregate_entropy.csv')
 logger.info('    aggregate_summary.csv')
 logger.info('  Figures:')
 logger.info('    fig_1_celltype_fraction_2d_vs_3d.png')
-logger.info('    fig_2_nn_delta_heatmap.png')
+logger.info('    fig_2_nn_distances.png')
 logger.info('    fig_3_entropy_delta_boxplot.png')
-logger.info('    fig_4_entropy_significance.png')
 logger.info('=' * 60)

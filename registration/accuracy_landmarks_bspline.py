@@ -493,10 +493,7 @@ def plot_adjacent_slice_overlays(df_detail,
     For each mclass with ≥2 z-levels, produce one PNG with:
       Row 0 — DAPI (ch 0) overlay — tighter crop (dapi_crop_half=50)
       Row 1 — CK   (ch 6) overlay — wider crop  (ck_crop_half=150)
-
-    Loads from the registered output volume so image content is aligned
-    with the warped landmark coordinates.  Uses SLICE_IDX_TO_VOL_Z for
-    correct Z-axis indexing into the volume.
+    Generates multiple files (max 3 columns) if the number of pairs is large.
     """
     try:
         import tifffile
@@ -504,7 +501,6 @@ def plot_adjacent_slice_overlays(df_detail,
         logger.warning("tifffile not installed — skipping adjacent-slice overlays.")
         return
 
-    # Load registered volume once — avoids re-reading the TIFF for every pair
     reg_path = os.path.join(OUTPUT_FOLDER,
                             f"{TARGET_CORE}_AKAZE_TissueMask_Aligned.ome.tif")
     if not os.path.isfile(reg_path):
@@ -512,8 +508,10 @@ def plot_adjacent_slice_overlays(df_detail,
         return
 
     logger.info(f"Loading registered volume from {reg_path} ...")
-    reg_vol = tifffile.imread(reg_path)   # expected shape: (Z, C, H, W)
+    reg_vol = tifffile.imread(reg_path)  
     logger.info(f"Registered volume shape: {reg_vol.shape}")
+
+    max_cols = 3
 
     for mc, grp in df_detail.groupby('mclass'):
         grp_sorted = grp.sort_values('z_json_a').reset_index(drop=True)
@@ -521,70 +519,75 @@ def plot_adjacent_slice_overlays(df_detail,
         if n_pairs < 1:
             continue
 
-        # 2 rows (DAPI / CK) × n_pairs columns
-        fig, axes = plt.subplots(2, n_pairs,
-                                 figsize=(5 * n_pairs, 10),
-                                 squeeze=False)
+        chunks = [grp_sorted.iloc[i:i + max_cols] for i in range(0, n_pairs, max_cols)]
 
-        fig.suptitle(
-            f"Pipeline A: {TARGET_CORE}  —  Adjacent-slice overlay  |  mclass {mc}\n"
-            f"Green = lower slice, Red = upper slice  |  pixel size = {PIXEL_SIZE_UM} µm",
-            fontsize=10, fontweight='bold'
-        )
-
-        for col, (_, pair_row) in enumerate(grp_sorted.iterrows()):
-            sidx_a = int(pair_row['slice_idx_a'])
-            sidx_b = int(pair_row['slice_idx_b'])
+        for chunk_idx, chunk in enumerate(chunks):
+            n_cols = len(chunk)
             
-            # Reassign z_a and z_b to be 1-based slice indices
-            z_a    = sidx_a + 1
-            z_b    = sidx_b + 1
-            
-            wx_a   = float(pair_row['x_warped_a'])
-            wy_a   = float(pair_row['y_warped_a'])
-            wx_b   = float(pair_row['x_warped_b'])
-            wy_b   = float(pair_row['y_warped_b'])
+            fig, axes = plt.subplots(2, n_cols,
+                                     figsize=(5 * n_cols, 10),
+                                     squeeze=False)
 
-            dist_px = float(pair_row['TRE_px'])
-            dist_um = float(pair_row['TRE_um'])
-            mid_x   = (wx_a + wx_b) / 2
-            mid_y   = (wy_a + wy_b) / 2
+            part_str = f" (Part {chunk_idx + 1}/{len(chunks)})" if len(chunks) > 1 else ""
+            fig.suptitle(
+                f"Pipeline A: {TARGET_CORE}  —  Adjacent-slice overlay  |  mclass {mc}{part_str}\n"
+                f"Green = lower slice, Red = upper slice  |  pixel size = {PIXEL_SIZE_UM} µm",
+                fontsize=10, fontweight='bold'
+            )
 
-            for row_idx, (ch_idx, ch_label, ch_crop) in enumerate([
-                    (DAPI_CHANNEL_IDX, "DAPI", dapi_crop_half),
-                    (CK_CHANNEL_IDX,   "CK",   ck_crop_half)]):
+            for col, (_, pair_row) in enumerate(chunk.iterrows()):
+                sidx_a = int(pair_row['slice_idx_a'])
+                sidx_b = int(pair_row['slice_idx_b'])
+                
+                z_a    = sidx_a + 1
+                z_b    = sidx_b + 1
+                
+                wx_a   = float(pair_row['x_warped_a'])
+                wy_a   = float(pair_row['y_warped_a'])
+                wx_b   = float(pair_row['x_warped_b'])
+                wy_b   = float(pair_row['y_warped_b'])
 
-                ax    = axes[row_idx][col]
-                img_a = load_slice_channel_from_vol(reg_vol, sidx_a, ch_idx)
-                img_b = load_slice_channel_from_vol(reg_vol, sidx_b, ch_idx)
+                dist_px = float(pair_row['TRE_px'])
+                dist_um = float(pair_row['TRE_um'])
+                mid_x   = (wx_a + wx_b) / 2
+                mid_y   = (wy_a + wy_b) / 2
 
-                if img_a is None and img_b is None:
-                    ax.set_title(f"{ch_label}  z {z_a}→{z_b}\n(unavailable)")
-                    ax.axis('off')
-                    continue
+                for row_idx, (ch_idx, ch_label, ch_crop) in enumerate([
+                        (DAPI_CHANNEL_IDX, "DAPI", dapi_crop_half),
+                        (CK_CHANNEL_IDX,   "CK",   ck_crop_half)]):
 
-                ref  = img_a if img_a is not None else img_b
-                H, W = ref.shape
-                x0 = max(0, int(mid_x) - ch_crop)
-                x1 = min(W, int(mid_x) + ch_crop)
-                y0 = max(0, int(mid_y) - ch_crop)
-                y1 = min(H, int(mid_y) + ch_crop)
+                    ax    = axes[row_idx][col]
+                    img_a = load_slice_channel_from_vol(reg_vol, sidx_a, ch_idx)
+                    img_b = load_slice_channel_from_vol(reg_vol, sidx_b, ch_idx)
 
-                def crop(img, _y0=y0, _y1=y1, _x0=x0, _x1=x1):
-                    return img[_y0:_y1, _x0:_x1] if img is not None else None
+                    if img_a is None and img_b is None:
+                        ax.set_title(f"{ch_label}  z {z_a}→{z_b}\n(unavailable)")
+                        ax.axis('off')
+                        continue
 
-                rgb = make_two_channel_rgb(crop(img_a), crop(img_b))
-                _annotate_overlay_ax(ax, rgb, wx_a, wy_a, wx_b, wy_b,
-                                     x0, x1, y0, y1, z_a, z_b,
-                                     dist_px, dist_um, ch_label)
+                    ref  = img_a if img_a is not None else img_b
+                    H, W = ref.shape
+                    x0 = max(0, int(mid_x) - ch_crop)
+                    x1 = min(W, int(mid_x) + ch_crop)
+                    y0 = max(0, int(mid_y) - ch_crop)
+                    y1 = min(H, int(mid_y) + ch_crop)
 
-        plt.tight_layout()
-        overlay_path = os.path.join(
-            VERIFY_OUTPUT, f"{TARGET_CORE}_adjacent_overlay_mclass{mc}.png"
-        )
-        fig.savefig(overlay_path, dpi=dpi, bbox_inches='tight')
-        plt.close(fig)
-        logger.info(f"Adjacent overlay (mclass {mc}) → {overlay_path}")
+                    def crop(img, _y0=y0, _y1=y1, _x0=x0, _x1=x1):
+                        return img[_y0:_y1, _x0:_x1] if img is not None else None
+
+                    rgb = make_two_channel_rgb(crop(img_a), crop(img_b))
+                    _annotate_overlay_ax(ax, rgb, wx_a, wy_a, wx_b, wy_b,
+                                         x0, x1, y0, y1, z_a, z_b,
+                                         dist_px, dist_um, ch_label)
+
+            plt.tight_layout()
+            file_suffix  = f"_pt{chunk_idx + 1}" if len(chunks) > 1 else ""
+            overlay_path = os.path.join(
+                VERIFY_OUTPUT, f"{TARGET_CORE}_adjacent_overlay_mclass{mc}{file_suffix}.png"
+            )
+            fig.savefig(overlay_path, dpi=dpi, bbox_inches='tight')
+            plt.close(fig)
+            logger.info(f"Adjacent overlay (mclass {mc}{part_str}) → {overlay_path}")
 
 
 plot_adjacent_slice_overlays(df_detail)
