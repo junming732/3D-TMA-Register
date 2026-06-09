@@ -80,17 +80,9 @@ for i in $(seq $START $END); do
     CORE_ALL_OK=1
 
     # 1. Prioritize merged JSON files
-    ANN_JSON="${ANNOTATION_DIR}/merged_${CORE_NAME_LOWER}.json"
+    ANN_JSON="${ANNOTATION_DIR}/landmark_annotation_${CORE_NAME_LOWER}.json"
     if [ ! -f "${ANN_JSON}" ]; then
-        ANN_JSON="${ANNOTATION_DIR}/merged_${CORE_NAME}.json"
-    fi
-
-    # 2. Fallback to original rough_annotation naming if merged version doesn't exist
-    if [ ! -f "${ANN_JSON}" ]; then
-        ANN_JSON="${ANNOTATION_DIR}/rough_annotation_${CORE_NAME}.json"
-    fi
-    if [ ! -f "${ANN_JSON}" ]; then
-        ANN_JSON="${ANNOTATION_DIR}/rough_annotation_${CORE_NAME_LOWER}.json"
+        ANN_JSON="${ANNOTATION_DIR}/landmark_annotation_${CORE_NAME}.json"
     fi
 
     if [ ! -f "${ANN_JSON}" ]; then
@@ -111,7 +103,7 @@ for i in $(seq $START $END); do
             --core_name "${CORE_NAME}" \
             --annotation_json "${ANN_JSON}" \
             --pixel_size_um "${PIXEL_SIZE_UM}" \
-            --mclass "${MCLASS}" \
+            --landmark_id "${MCLASS}" \
             > "${log_file}" 2>&1
 
         local exit_code=$?
@@ -190,7 +182,7 @@ def extract_metrics(df, df_sum):
         'std':         df['TRE_um'].std(),
         'n_landmarks': n_landmarks,
         'n_pairs':     n_pairs,
-        'mclass_stats': df.groupby('mclass')['TRE_um'].agg(mean='mean', max='max').reset_index()
+        'mclass_stats': df.groupby('landmark_id')['TRE_um'].agg(mean='mean', max='max').reset_index()
     }
 
 metA = extract_metrics(dfA, dfA_sum)
@@ -216,14 +208,14 @@ tot_landmarks = max(metA['n_landmarks'], metB['n_landmarks'], metC['n_landmarks'
 all_mclasses = set()
 for m in [metA, metB, metC]:
     if m['mclass_stats'] is not None:
-        all_mclasses.update(m['mclass_stats']['mclass'].unique())
+        all_mclasses.update(m['mclass_stats']['landmark_id'].unique())
 
 mclass_agg = []
 for mc in all_mclasses:
     means = []
     for m in [metA, metB, metC]:
         if m['mclass_stats'] is not None:
-            row = m['mclass_stats'][m['mclass_stats']['mclass'] == mc]
+            row = m['mclass_stats'][m['mclass_stats']['landmark_id'] == mc]
             if not row.empty:
                 means.append(row['mean'].iloc[0])
     avg_mean = np.nanmean(means) if means else np.nan
@@ -252,11 +244,11 @@ tex.append(f"\\quad Std \\gls{{tre}} ($\\mu$m)    & {' & '.join(bold_min([metA['
 
 if worst_mc:
     tex.append(f"\\midrule")
-    tex.append(f"\\multicolumn{{4}}{{l}}{{\\textit{{Highest-error structure --- mclass~{worst_mc['mclass']}}}}} \\\\")
     w_means, w_maxes = [], []
+    tex.append(f"\\multicolumn{{4}}{{l}}{{\\textit{{Highest-error structure --- landmark~{worst_mc['mclass']}}}}} \\\\")
     for m in [metA, metB, metC]:
-        if m['mclass_stats'] is not None and worst_mc['mclass'] in m['mclass_stats']['mclass'].values:
-            row = m['mclass_stats'][m['mclass_stats']['mclass'] == worst_mc['mclass']]
+        if m['mclass_stats'] is not None and worst_mc['mclass'] in m['mclass_stats']['landmark_id'].values:
+            row = m['mclass_stats'][m['mclass_stats']['landmark_id'] == worst_mc['mclass']]
             w_means.append(row['mean'].iloc[0])
             w_maxes.append(row['max'].iloc[0])
         else:
@@ -271,11 +263,11 @@ if best_mcs:
     for bmc in best_mcs:
         b_means = []
         for m in [metA, metB, metC]:
-            if m['mclass_stats'] is not None and bmc['mclass'] in m['mclass_stats']['mclass'].values:
-                b_means.append(m['mclass_stats'][m['mclass_stats']['mclass'] == bmc['mclass']]['mean'].iloc[0])
+            if m['mclass_stats'] is not None and bmc['mclass'] in m['mclass_stats']['landmark_id'].values:
+                b_means.append(m['mclass_stats'][m['mclass_stats']['landmark_id'] == bmc['mclass']]['mean'].iloc[0])
             else:
                 b_means.append(np.nan)
-        tex.append(f"\\quad mclass~{bmc['mclass']} mean \\gls{{tre}} ($\\mu$m) & {' & '.join(bold_min(b_means))} \\\\")
+        tex.append(f"\\quad landmark~{bmc['mclass']} mean \\gls{{tre}} ($\\mu$m) & {' & '.join(bold_min(b_means))} \\\\")
 
 tex.append(f"\\bottomrule")
 tex.append(f"\\end{{tabular}}")

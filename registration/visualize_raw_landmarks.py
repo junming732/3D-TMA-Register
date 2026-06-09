@@ -61,7 +61,7 @@ parser.add_argument('--dapi_crop_half',  type=int,   default=50,
                     help="Half-width of crop window in pixels (default 50)")
 parser.add_argument('--channel',         type=int,   default=0,
                     help="Channel index to display as 'DAPI' (default 0)")
-parser.add_argument('--mclass',          default='all',
+parser.add_argument('--landmark_id',          default='all',
                     help="'all' or comma-separated ints")
 parser.add_argument('--output_dir',      default=None,
                     help="Directory to write PNG files "
@@ -104,7 +104,7 @@ logger.info(f"Output dir   : {OUTPUT_DIR}")
 
 # ─── Z MAPPING (same as all other scripts) ────────────────────────────────────
 def z_json_to_slice_idx(z_json):
-    return z_json + 10
+    return z_json - 1
 
 # ─── FILE LIST ────────────────────────────────────────────────────────────────
 def get_slice_number(filename):
@@ -122,13 +122,13 @@ logger.info(f"Found {len(FILE_LIST)} raw slices")
 with open(args.annotation_json) as fh:
     ann_data = json.load(fh)
 
-annotations = ann_data['annotations']
+annotations = ann_data
 logger.info(f"Loaded {len(annotations)} annotations")
 
-if args.mclass.lower() != 'all':
-    keep        = set(int(m) for m in args.mclass.split(','))
-    annotations = [a for a in annotations if a['mclass'] in keep]
-    logger.info(f"After mclass filter: {len(annotations)} annotations")
+if args.landmark_id.lower() != 'all':
+    keep        = set(int(m) for m in args.landmark_id.split(','))
+    annotations = [a for a in annotations if a['landmark_id'] in keep]
+    logger.info(f"After landmark_id filter: {len(annotations)} annotations")
 
 # ─── TIFF LOADING HELPER ──────────────────────────────────────────────────────
 try:
@@ -197,15 +197,15 @@ mc_records = defaultdict(list)
 for ann in annotations:
     z_json    = ann['z']
     slice_idx = z_json_to_slice_idx(z_json)
-    x_raw     = ann['points'][0]['x']
-    y_raw     = ann['points'][0]['y']
-    mc        = ann['mclass']
+    x_raw     = ann['x']
+    y_raw     = ann['y']
+    mc        = ann['landmark_id']
     mc_records[mc].append({
         'z_json':    z_json,
         'slice_idx': slice_idx,
         'x':         x_raw,
         'y':         y_raw,
-        'id':        ann['id'],
+        'id':        ann['landmark_id'],
     })
 
 # Sort each mclass by z
@@ -233,7 +233,7 @@ for mc, records in mc_records.items():
     fig, axes = plt.subplots(rows, cols, figsize=(fig_w, fig_h), squeeze=False)
     
     fig.suptitle(
-        f"{TARGET_CORE}  —  RAW landmarks  |  mclass {mc}  |  ch {CHANNEL_IDX}",
+        f"{TARGET_CORE}  —  RAW landmarks  |  landmark  {mc}  |  ch {CHANNEL_IDX}",
         fontsize=11, fontweight='bold'
     )
 
@@ -288,7 +288,7 @@ for mc, records in mc_records.items():
 
     plt.tight_layout()
     out_path = os.path.join(OUTPUT_DIR,
-                            f"{TARGET_CORE}_landmark_raw_overview_mclass{mc}.png")
+                            f"{TARGET_CORE}_landmark_raw_overview_id{mc}.png")
     fig.savefig(out_path, dpi=args.dpi, bbox_inches='tight')
     plt.close(fig)
     logger.info(f"  Overview → {out_path}")
@@ -315,7 +315,7 @@ for mc, records in mc_records.items():
                              figsize=(fig_w, fig_h),
                              squeeze=False)
     fig.suptitle(
-        f"{TARGET_CORE}  —  RAW adjacent-pair comparison  |  mclass {mc}  |  ch {CHANNEL_IDX}",
+        f"{TARGET_CORE}  —  RAW adjacent-pair comparison  |  landmark  {mc}  |  ch {CHANNEL_IDX}",
         fontsize=11, fontweight='bold'
     )
 
@@ -400,7 +400,7 @@ for mc, records in mc_records.items():
 
     plt.tight_layout()
     out_path = os.path.join(OUTPUT_DIR,
-                            f"{TARGET_CORE}_landmark_raw_adjacent_mclass{mc}.png")
+                            f"{TARGET_CORE}_landmark_raw_adjacent_id{mc}.png")
     fig.savefig(out_path, dpi=args.dpi, bbox_inches='tight')
     plt.close(fig)
     logger.info(f"  Adjacent comparison → {out_path}")

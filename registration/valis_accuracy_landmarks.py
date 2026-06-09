@@ -29,7 +29,7 @@ Usage
         --core_name Core_09 \
         --annotation_json /path/to/rough_annotation_core_09.json \
         [--pixel_size_um 0.4961] \
-        [--mclass all]
+        [--landmark_id all]
 """
 
 import os, re, sys, json, glob, argparse, pickle
@@ -53,7 +53,7 @@ parser = argparse.ArgumentParser()
 parser.add_argument('--core_name',       type=str, required=True)
 parser.add_argument('--annotation_json', type=str, required=True)
 parser.add_argument('--pixel_size_um',   type=float, default=0.4961)
-parser.add_argument('--mclass',          type=str,   default='all')
+parser.add_argument('--landmark_id',          type=str,   default='all')
 args = parser.parse_args()
 
 TARGET_CORE   = args.core_name
@@ -81,7 +81,7 @@ logger.info(f"Output       : {VERIFY_OUTPUT}")
 
 # ─── Z MAPPING ────────────────────────────────────────────────────────────────
 def z_json_to_slice_idx(z_json):
-    return z_json + 10
+    return z_json - 1
 
 # ─── SLICE INDEX → SLIDE NAME MAPPING ────────────────────────────────────────
 # Built after loading the registrar from registrar.slide_dict, which maps
@@ -128,12 +128,12 @@ for i, name in enumerate(slide_names_sorted):
 with open(args.annotation_json) as fh:
     ann_data = json.load(fh)
 
-annotations = ann_data['annotations']
+annotations = ann_data
 logger.info(f"Loaded {len(annotations)} annotations.")
 
-if args.mclass.lower() != 'all':
-    keep        = set(int(m) for m in args.mclass.split(','))
-    annotations = [a for a in annotations if a['mclass'] in keep]
+if args.landmark_id.lower() != 'all':
+    keep        = set(int(m) for m in args.landmark_id.split(','))
+    annotations = [a for a in annotations if a['landmark_id'] in keep]
     logger.info(f"After mclass filter: {len(annotations)} annotations.")
 
 # ─── WARP EVERY LANDMARK USING VALIS ─────────────────────────────────────────
@@ -145,10 +145,10 @@ records = []
 for ann in annotations:
     z_json    = ann['z']
     slice_idx = z_json_to_slice_idx(z_json)
-    x_raw     = ann['points'][0]['x']
-    y_raw     = ann['points'][0]['y']
-    mc        = ann['mclass']
-    ann_id    = ann['id']
+    x_raw     = ann['x']
+    y_raw     = ann['y']
+    mc        = ann['landmark_id']
+    ann_id    = ann['landmark_id']
 
     if slice_idx not in idx_to_slide:
         logger.warning(f"  id={ann_id} z_json={z_json}: slice_idx={slice_idx} "
@@ -167,7 +167,7 @@ for ann in annotations:
 
     records.append({
         'id':        ann_id,
-        'mclass':    mc,
+        'landmark_id':    mc,
         'z_json':    z_json,
         'slice_idx': slice_idx,
         'x_raw':     x_raw,
@@ -193,7 +193,7 @@ if df.empty:
 summary_rows = []
 detail_rows  = []
 
-for mc, grp in df.groupby('mclass'):
+for mc, grp in df.groupby('landmark_id'):
     grp = grp.sort_values('z_json').reset_index(drop=True)
     pts = grp[['x_warped', 'y_warped']].values   # (N, 2), sorted by z
 
@@ -220,7 +220,7 @@ for mc, grp in df.groupby('mclass'):
     for (ia, ib), d_px, d_um in zip(pair_indices, pair_dist_px, pair_dist_um):
         row_a, row_b = grp.iloc[ia], grp.iloc[ib]
         detail_rows.append({
-            'mclass':        mc,
+            'landmark_id':        mc,
             'z_json_a':      row_a['z_json'],
             'z_json_b':      row_b['z_json'],
             'slice_idx_a':   row_a['slice_idx'],
@@ -236,7 +236,7 @@ for mc, grp in df.groupby('mclass'):
         })
 
     summary_rows.append({
-        'mclass':        mc,
+        'landmark_id':        mc,
         'n_slices':      len(pts),
         'n_pairs':       len(pair_indices),
         'mean_TRE_px':   round(mean_TRE_px, 3),
@@ -248,7 +248,7 @@ for mc, grp in df.groupby('mclass'):
     })
 
 df_detail  = pd.DataFrame(detail_rows)
-df_summary = pd.DataFrame(summary_rows).sort_values('mclass')
+df_summary = pd.DataFrame(summary_rows).sort_values('landmark_id')
 
 # Global TRE across all consecutive pairs
 all_tre_px = df_detail['TRE_px'].values
@@ -272,7 +272,7 @@ logger.info(f"Summary CSV → {summary_csv}")
 # ─── PLOTS ────────────────────────────────────────────────────────────────────
 from matplotlib.colors import TABLEAU_COLORS
 colour_list   = list(TABLEAU_COLORS.values())
-all_mclasses  = sorted(df_detail['mclass'].unique())
+all_mclasses  = sorted(df_detail['landmark_id'].unique())
 mclass_colour = {mc: colour_list[i % len(colour_list)] for i, mc in enumerate(all_mclasses)}
 
 # 1 row, 2 columns. Increased figsize to accommodate larger fonts.
@@ -284,12 +284,12 @@ fig.suptitle(f"Pipeline B {TARGET_CORE} — Landmark Registration Accuracy  "
 # ── Panel 1: TRE per consecutive pair vs slice pair ─────────────────────────
 ax = axes[0]
 for mc in all_mclasses:
-    grp = df_detail[df_detail['mclass'] == mc].sort_values('z_json_a').reset_index(drop=True)
+    grp = df_detail[df_detail['landmark_id'] == mc].sort_values('z_json_a').reset_index(drop=True)
     # Convert from 0-based slice_idx to 1-based slice index for labels
     x_labels = [f"{int(r.slice_idx_a) + 1}→{int(r.slice_idx_b) + 1}" for _, r in grp.iterrows()]
     x_pos    = np.arange(len(grp))
     ax.plot(x_pos, grp['TRE_um'], 'o-',
-            color=mclass_colour[mc], label=f"mclass {mc}", markersize=8)
+            color=mclass_colour[mc], label=f"landmark {mc}", markersize=8)
     for xi, lab in zip(x_pos, x_labels):
         ax.annotate(lab, (xi, grp['TRE_um'].iloc[xi]),
                     textcoords='offset points', xytext=(0, 6),
@@ -307,7 +307,7 @@ ax.grid(True, alpha=0.3)
 
 # ── Panel 2: boxplot of TRE per mclass ───────────────────────────────────────
 ax = axes[1]
-data_per_class = [df_detail.loc[df_detail['mclass'] == mc, 'TRE_um'].values
+data_per_class = [df_detail.loc[df_detail['landmark_id'] == mc, 'TRE_um'].values
                   for mc in all_mclasses]
 bp = ax.boxplot(data_per_class, patch_artist=True, notch=False)
 for patch, mc in zip(bp['boxes'], all_mclasses):
@@ -315,9 +315,9 @@ for patch, mc in zip(bp['boxes'], all_mclasses):
     patch.set_alpha(0.7)
 
 ax.set_xticks(range(1, len(all_mclasses) + 1))
-ax.set_xticklabels([f"mclass {mc}" for mc in all_mclasses], rotation=30, ha='right', fontsize=12)
+ax.set_xticklabels([f"landmark {mc}" for mc in all_mclasses], rotation=30, ha='right', fontsize=12)
 ax.set_ylabel("TRE (µm)", fontsize=13)
-ax.set_title("TRE distribution per structure (mclass)", fontsize=15)
+ax.set_title("TRE distribution per structure (landmark_id)", fontsize=15)
 ax.axhline(all_tre_um.mean(), color='black', linestyle='--', lw=2,
            label=f"global mean {all_tre_um.mean():.1f} µm")
 ax.tick_params(axis='y', labelsize=11)
@@ -462,7 +462,7 @@ def plot_adjacent_slice_overlays_valis(df_detail,
 
     max_cols = 3
 
-    for mc, grp in df_detail.groupby('mclass'):
+    for mc, grp in df_detail.groupby('landmark_id'):
         grp_sorted = grp.sort_values('z_json_a').reset_index(drop=True)
         n_pairs = len(grp_sorted)
         if n_pairs < 1:
