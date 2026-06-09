@@ -414,33 +414,42 @@ def make_two_channel_rgb(img_a, img_b):
 def _annotate_overlay_ax(ax, rgb, wx_a, wy_a, wx_b, wy_b,
                          x0, x1, y0, y1, z_a, z_b,
                          dist_px, dist_um, row_label):
-    """Shared helper: imshow + markers + arrow + label for one overlay panel."""
+    """
+    Shared helper: imshow + markers + arrow + label for one overlay panel.
+    Enforces a strict minimum font size of 20 for all structural elements.
+    """
     mid_x = (wx_a + wx_b) / 2
     mid_y = (wy_a + wy_b) / 2
 
     ax.imshow(rgb, origin='upper', extent=[x0, x1, y1, y0])
 
-    ax.scatter(wx_a, wy_a, c='#00ff00', s=80, zorder=5,
-               edgecolors='white', linewidths=0.8, label=f"slice {z_a}")
-    ax.scatter(wx_b, wy_b, c='#ff0000', s=80, zorder=5,
-               edgecolors='white', linewidths=0.8, label=f"slice {z_b}")
+    # Scaled up marker sizes (s) for maximum visibility on a large 10x10.5 canvas
+    ax.scatter(wx_a, wy_a, c='#00ff00', s=180, zorder=5,
+               edgecolors='white', linewidths=1.2, label=f"slice {z_a}")
+    ax.scatter(wx_b, wy_b, c='#ff0000', s=180, zorder=5,
+               edgecolors='white', linewidths=1.2, label=f"slice {z_b}")
 
+    # Scaled up arrow line thickness for alignment tracking
     ax.annotate('', xy=(wx_b, wy_b), xytext=(wx_a, wy_a),
-                arrowprops=dict(arrowstyle='->', color='yellow', lw=1.8))
+                arrowprops=dict(arrowstyle='->', color='yellow', lw=2.5))
 
+    # Internal measurement badge text size scaled proportionately
     ax.text(mid_x, mid_y - 5,
             f"{dist_px:.1f} px / {dist_um:.1f} µm",
-            ha='center', va='bottom', fontsize=8,
+            ha='center', va='bottom', fontsize=14,
             color='yellow', fontweight='bold',
             bbox=dict(boxstyle='round,pad=0.2', fc='black', alpha=0.55, lw=0))
 
     ax.set_xlim(x0, x1)
     ax.set_ylim(y1, y0)
+    
+    # ─── FONT SIZE FIXES (MINIMUM 20) ────────────────────────────────────────
     ax.set_title(f"{row_label}  |  slice {z_a} → slice {z_b}  |  Δ = {dist_um:.1f} µm",
-                 fontsize=9)
-    ax.set_xlabel("x (px)", fontsize=8)
-    ax.set_ylabel("y (px)", fontsize=8)
-    ax.legend(fontsize=7, loc='lower right',
+                 fontsize=24, pad=12)
+    ax.set_xlabel("x (px)", fontsize=24)
+    ax.set_ylabel("y (px)", fontsize=24)
+    ax.tick_params(axis='both', labelsize=24)
+    ax.legend(fontsize=24, loc='lower right',
               facecolor='black', labelcolor='white', framealpha=0.6)
 
 
@@ -449,10 +458,10 @@ def plot_adjacent_slice_overlays_valis(df_detail,
                                        ck_crop_half=150,
                                        dpi=120):
     """
-    For each mclass with ≥2 z-levels, produce one PNG with:
+    For each mclass with ≥2 z-levels, produce one PNG with a horizontal grid layout:
       Row 0 — DAPI (ch 0) cyan/magenta overlay — tighter crop (dapi_crop_half=50)
       Row 1 — CK   (ch 6) cyan/magenta overlay — wider crop  (ck_crop_half=150)
-    Generates multiple files (max 3 columns) if the number of pairs is large.
+    Each column corresponds to an adjacent slice pair.
     """
     try:
         import tifffile  # noqa
@@ -474,17 +483,25 @@ def plot_adjacent_slice_overlays_valis(df_detail,
         for chunk_idx, chunk in enumerate(chunks):
             n_cols = len(chunk)
             
+            # ─── GEOMETRY FIX ────────────────────────────────────────────────
+            # Maintained original grid direction (2 Rows x n_cols Columns).
+            # Expanded baseline canvas width to (10 * n_cols) and height to 21 inches.
+            # This allocates a 10x10.5 inch space per square subplot, giving the
+            # long figure title natural room to fit without generating white side margins.
             fig, axes = plt.subplots(2, n_cols,
-                                     figsize=(5 * n_cols, 10),
+                                     figsize=(10 * n_cols, 21),
                                      squeeze=False)
 
             part_str = f" (Part {chunk_idx + 1}/{len(chunks)})" if len(chunks) > 1 else ""
+            
+            # Expanded main title font size with newline padding
             fig.suptitle(
-                f"Pipeline B: {TARGET_CORE}  —  VALIS adjacent-slice overlay  |  mclass {mc}{part_str}\n"
-                f"Green = lower slice, Red = upper slice  |  pixel size = {PIXEL_SIZE_UM} µm",
-                fontsize=10, fontweight='bold'
+                f"Pipeline B: {TARGET_CORE} | landmark {mc}{part_str}\n"
+                f"Adjacent-slice overlay",
+                fontsize=28, fontweight='bold'
             )
 
+            # Enumerate slice pairs along the horizontal columns
             for col, (_, pair_row) in enumerate(chunk.iterrows()):
                 sidx_a = int(pair_row['slice_idx_a'])
                 sidx_b = int(pair_row['slice_idx_b'])
@@ -502,16 +519,18 @@ def plot_adjacent_slice_overlays_valis(df_detail,
                 mid_x   = (wx_a + wx_b) / 2
                 mid_y   = (wy_a + wy_b) / 2
 
+                # Enumerate channel stains along the vertical rows
                 for row_idx, (ch_idx, ch_label, ch_crop) in enumerate([
                         (DAPI_CHANNEL_IDX, "DAPI", dapi_crop_half),
                         (CK_CHANNEL_IDX,   "CK",   ck_crop_half)]):
 
+                    # Maintained original matrix array indexing layout
                     ax    = axes[row_idx][col]
                     img_a = load_slice_channel_valis(sidx_a, ch_idx)
                     img_b = load_slice_channel_valis(sidx_b, ch_idx)
 
                     if img_a is None and img_b is None:
-                        ax.set_title(f"{ch_label}  z {z_a}→{z_b}\n(unavailable)")
+                        ax.set_title(f"{ch_label}  z {z_a}→{z_b}\n(unavailable)", fontsize=20)
                         ax.axis('off')
                         continue
 
@@ -530,7 +549,9 @@ def plot_adjacent_slice_overlays_valis(df_detail,
                                          x0, x1, y0, y1, z_a, z_b,
                                          dist_px, dist_um, ch_label)
 
-            plt.tight_layout()
+            # Restrict subplots to 95% height to prevent overlapping with the main title text
+            plt.tight_layout(rect=[0, 0, 1, 0.95])
+            
             file_suffix  = f"_pt{chunk_idx + 1}" if len(chunks) > 1 else ""
             overlay_path = os.path.join(
                 VERIFY_OUTPUT, f"{TARGET_CORE}_VALIS_adjacent_overlay_mclass{mc}{file_suffix}.png"
@@ -538,8 +559,6 @@ def plot_adjacent_slice_overlays_valis(df_detail,
             fig.savefig(overlay_path, dpi=dpi, bbox_inches='tight')
             plt.close(fig)
             logger.info(f"Adjacent overlay (mclass {mc}{part_str}) → {overlay_path}")
-
-
 plot_adjacent_slice_overlays_valis(df_detail)
 
 logger.info("Done.")

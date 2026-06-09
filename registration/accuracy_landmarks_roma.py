@@ -474,33 +474,42 @@ def make_two_channel_rgb(img_a, img_b):
 def _annotate_overlay_ax(ax, rgb, wx_a, wy_a, wx_b, wy_b,
                          x0, x1, y0, y1, z_a, z_b,
                          dist_px, dist_um, row_label):
-    """Shared helper: imshow + markers + arrow + label for one overlay panel."""
+    """
+    Shared helper: imshow + markers + arrow + label for one overlay panel.
+    Optimized with large font scaling and balanced geometry for high-res canvases.
+    """
     mid_x = (wx_a + wx_b) / 2
     mid_y = (wy_a + wy_b) / 2
 
     ax.imshow(rgb, origin='upper', extent=[x0, x1, y1, y0])
 
-    ax.scatter(wx_a, wy_a, c='#00ff00', s=80, zorder=5,
-               edgecolors='white', linewidths=0.8, label=f"slice {z_a}")
-    ax.scatter(wx_b, wy_b, c='#ff0000', s=80, zorder=5,
-               edgecolors='white', linewidths=0.8, label=f"slice {z_b}")
+    # Scaled up marker sizes (s) and borders for high visibility
+    ax.scatter(wx_a, wy_a, c='#00ff00', s=180, zorder=5,
+               edgecolors='white', linewidths=1.2, label=f"slice {z_a}")
+    ax.scatter(wx_b, wy_b, c='#ff0000', s=180, zorder=5,
+               edgecolors='white', linewidths=1.2, label=f"slice {z_b}")
 
+    # Scaled up the tracking arrow weight
     ax.annotate('', xy=(wx_b, wy_b), xytext=(wx_a, wy_a),
-                arrowprops=dict(arrowstyle='->', color='yellow', lw=1.8))
+                arrowprops=dict(arrowstyle='->', color='yellow', lw=2.5))
 
+    # Scaled up internal coordinate delta text badge
     ax.text(mid_x, mid_y - 5,
             f"{dist_px:.1f} px / {dist_um:.1f} µm",
-            ha='center', va='bottom', fontsize=8,
+            ha='center', va='bottom', fontsize=14,
             color='yellow', fontweight='bold',
             bbox=dict(boxstyle='round,pad=0.2', fc='black', alpha=0.55, lw=0))
 
     ax.set_xlim(x0, x1)
     ax.set_ylim(y1, y0)
+    
+    # Enforced a minimum font size of 20 for all text, labels, ticks, and legends
     ax.set_title(f"{row_label}  |  slice {z_a} → slice {z_b}  |  Δ = {dist_um:.1f} µm",
-                 fontsize=9)
-    ax.set_xlabel("x (px)", fontsize=8)
-    ax.set_ylabel("y (px)", fontsize=8)
-    ax.legend(fontsize=7, loc='lower right',
+                 fontsize=24, pad=10)
+    ax.set_xlabel("x (px)", fontsize=24)
+    ax.set_ylabel("y (px)", fontsize=24)
+    ax.tick_params(axis='both', labelsize=24)
+    ax.legend(fontsize=24, loc='lower right',
               facecolor='black', labelcolor='white', framealpha=0.6)
 
 
@@ -527,7 +536,7 @@ def plot_adjacent_slice_overlays(df_detail,
         return
 
     logger.info(f"Loading registered volume from {reg_path} ...")
-    reg_vol = tifffile.imread(reg_path)   
+    reg_vol = tifffile.imread(reg_path)  
     logger.info(f"Registered volume shape: {reg_vol.shape}")
 
     max_cols = 3
@@ -543,15 +552,17 @@ def plot_adjacent_slice_overlays(df_detail,
         for chunk_idx, chunk in enumerate(chunks):
             n_cols = len(chunk)
             
+            # Expanded canvas size to 10x21 inches (10x10 per square subplot + title clearance).
+            # This balances the layout grid's aspect ratio and completely eliminates side padding.
             fig, axes = plt.subplots(2, n_cols,
-                                     figsize=(5 * n_cols, 10),
+                                     figsize=(10 * n_cols, 21),
                                      squeeze=False)
 
             part_str = f" (Part {chunk_idx + 1}/{len(chunks)})" if len(chunks) > 1 else ""
             fig.suptitle(
-                f"Pipeline C: {TARGET_CORE}  —  Adjacent-slice overlay  |  mclass {mc}{part_str}\n"
-                f"Green = lower slice, Red = upper slice  |  pixel size = {PIXEL_SIZE_UM} µm",
-                fontsize=10, fontweight='bold'
+                f"Pipeline C: {TARGET_CORE} | landmark {mc}{part_str}\n"
+                f"Adjacent-slice overlay",
+                fontsize=28, fontweight='bold'
             )
 
             for col, (_, pair_row) in enumerate(chunk.iterrows()):
@@ -580,7 +591,7 @@ def plot_adjacent_slice_overlays(df_detail,
                     img_b = load_slice_channel_from_vol(reg_vol, sidx_b, ch_idx)
 
                     if img_a is None and img_b is None:
-                        ax.set_title(f"{ch_label}  z {z_a}→{z_b}\n(unavailable)")
+                        ax.set_title(f"{ch_label}  z {z_a}→{z_b}\n(unavailable)", fontsize=20)
                         ax.axis('off')
                         continue
 
@@ -599,7 +610,9 @@ def plot_adjacent_slice_overlays(df_detail,
                                          x0, x1, y0, y1, z_a, z_b,
                                          dist_px, dist_um, ch_label)
 
-            plt.tight_layout()
+            # Restrict subplots to 95% height to prevent overlapping with the large fig title
+            plt.tight_layout(rect=[0, 0, 1, 0.95])
+            
             file_suffix  = f"_pt{chunk_idx + 1}" if len(chunks) > 1 else ""
             overlay_path = os.path.join(
                 VERIFY_OUTPUT, f"{TARGET_CORE}_adjacent_overlay_mclass{mc}{file_suffix}.png"
