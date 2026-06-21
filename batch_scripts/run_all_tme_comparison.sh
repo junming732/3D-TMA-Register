@@ -31,7 +31,8 @@ PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 ANALYSIS_SCRIPT="${PROJECT_ROOT}/registration/compare_2d_3d_tme.py"
 
 LOG_ROOT="${PROJECT_ROOT}/log/full_pipeline"
-LOG_TME="${LOG_ROOT}/tme_comparison"
+#LOG_TME="${LOG_ROOT}/tme_comparison"
+LOG_TME="${LOG_ROOT}/tme_comparison_Bspline"
 
 # -----------------------------------------------------------------------------
 # SETUP
@@ -83,7 +84,8 @@ for i in $(seq $START $END); do
     # ------------------------------------------------------------------
     # PREREQUISITE CHECK 1: typed 2D phenotype CSV
     # ------------------------------------------------------------------
-    TYPED_2D="${DATASPACE}Phenotypes/${CORE_NAME}/${CORE_NAME}_phenotypes_typed.csv"
+    #TYPED_2D="${DATASPACE}Phenotypes/${CORE_NAME}/${CORE_NAME}_phenotypes_typed.csv"
+    TYPED_2D="${DATASPACE}Phenotypes_Bspline/${CORE_NAME}/${CORE_NAME}_phenotypes_typed.csv"
     if [ ! -f "${TYPED_2D}" ]; then
         echo "  [SKIP] Typed 2D phenotype CSV not found -- run assign_phenotypes.py first."
         echo "         Expected: ${TYPED_2D}"
@@ -95,7 +97,8 @@ for i in $(seq $START $END); do
     # ------------------------------------------------------------------
     # PREREQUISITE CHECK 2: typed 3D cell catalogue
     # ------------------------------------------------------------------
-    TYPED_3D="${DATASPACE}Phenotypes/${CORE_NAME}/${CORE_NAME}_3d_typed.csv"
+    # TYPED_3D="${DATASPACE}Phenotypes/${CORE_NAME}/${CORE_NAME}_3d_typed.csv"
+    TYPED_3D="${DATASPACE}Phenotypes_Bspline/${CORE_NAME}/${CORE_NAME}_3d_typed.csv"
     if [ ! -f "${TYPED_3D}" ]; then
         echo "  [SKIP] Typed 3D cell catalogue not found -- run assign_phenotypes.py first."
         echo "         Expected: ${TYPED_3D}"
@@ -152,5 +155,5 @@ for i in $(seq $START $END); do
 done
 echo "------------------------------------------------------------"
 echo "  Logs   : ${LOG_TME}/"
-echo "  Output : ${DATASPACE}TME_Analysis/<CORE>/"
+# echo "  Output : ${DATASPACE}TME_Analysis/<CORE>/"
 echo "============================================================"

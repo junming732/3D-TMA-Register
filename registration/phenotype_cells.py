@@ -125,16 +125,22 @@ args = parser.parse_args()
 TARGET_CORE   = args.core_name
 BIC_THRESHOLD = args.bic_threshold
 
+# DENOISED_VOL = os.path.join(
+#     config.DATASPACE, 'Denoised', TARGET_CORE,
+#     f'{TARGET_CORE}_denoised.ome.tif',
+# )
 DENOISED_VOL = os.path.join(
-    config.DATASPACE, 'Denoised', TARGET_CORE,
+    config.DATASPACE, 'Denoised_bspline', TARGET_CORE,
     f'{TARGET_CORE}_denoised.ome.tif',
 )
 
 # ─────────────────────────────────────────────────────────────────────────────
 # PATHS
 # ─────────────────────────────────────────────────────────────────────────────
-DAPI_MASK_DIR = os.path.join(config.DATASPACE, 'CellPose_DAPI_Warped', TARGET_CORE)
-OUTPUT_DIR    = os.path.join(config.DATASPACE, 'Phenotypes', TARGET_CORE)
+# DAPI_MASK_DIR = os.path.join(config.DATASPACE, 'CellPose_DAPI_Warped', TARGET_CORE)
+# OUTPUT_DIR    = os.path.join(config.DATASPACE, 'Phenotypes', TARGET_CORE)
+DAPI_MASK_DIR = os.path.join(config.DATASPACE, 'CellPose_DAPI_Warped_Bspline', TARGET_CORE)
+OUTPUT_DIR    = os.path.join(config.DATASPACE, 'Phenotypes_Bspline', TARGET_CORE)
 QC_DIR        = os.path.join(OUTPUT_DIR, 'qc_plots')
 
 os.makedirs(OUTPUT_DIR, exist_ok=True)

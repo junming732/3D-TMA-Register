@@ -70,8 +70,10 @@ for i in $(seq $START $END); do
     # ── STEP 3: Warp masks ─────
 
     MASK_DIR="${DATASPACE}CellPose_DAPI/${CORE_NAME}"
-    DEFORM_DIR="${DATASPACE}Filter_AKAZE_RoMaV2_Linear_Warp_map/${CORE_NAME}/deformation_maps"
-    OUT_DIR="${DATASPACE}CellPose_DAPI_Warped/${CORE_NAME}"
+    # DEFORM_DIR="${DATASPACE}Filter_AKAZE_RoMaV2_Linear_Warp_map/${CORE_NAME}/deformation_maps"
+    # OUT_DIR="${DATASPACE}CellPose_DAPI_Warped/${CORE_NAME}"
+    DEFORM_DIR="${DATASPACE}Filter_AKAZE_TissueMask_BSpline/${CORE_NAME}/deformation_maps"
+    OUT_DIR="${DATASPACE}CellPose_DAPI_Warped_Bspline/${CORE_NAME}"
 
     if [ ! -d "${MASK_DIR}" ]; then
         echo "  [SKIP] Warp: no mask directory found at ${MASK_DIR}"

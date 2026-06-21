@@ -65,7 +65,8 @@ PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 ANALYSIS_SCRIPT="${PROJECT_ROOT}/registration/link_3d_cells.py"
 
 LOG_ROOT="${PROJECT_ROOT}/log/full_pipeline"
-LOG_3D="${LOG_ROOT}/3d_analysis"
+# LOG_3D="${LOG_ROOT}/3d_analysis"
+LOG_3D="${LOG_ROOT}/3d_linkage_bspline"
 
 # -----------------------------------------------------------------------------
 # SETUP
@@ -124,7 +125,8 @@ for i in $(seq $START $END); do
             MAX_SLICES=4   # Default fallback
         fi
 
-        WARPED_DIR="${DATASPACE}CellPose_${CH}_Warped/${CORE_NAME}"
+        #WARPED_DIR="${DATASPACE}CellPose_${CH}_Warped/${CORE_NAME}"
+        WARPED_DIR="${DATASPACE}CellPose_${CH}_Warped_Bspline/${CORE_NAME}"
 
         # Skip if warped masks do not exist yet
         if [ ! -d "${WARPED_DIR}" ]; then
@@ -228,5 +230,5 @@ done
 
 echo "------------------------------------------------------------"
 echo "  Logs  : ${LOG_3D}/"
-echo "  Output: ${DATASPACE}CellPose_<CHANNEL>_3D/<CORE_NAME>/"
+# echo "  Output: ${DATASPACE}CellPose_<CHANNEL>_3D/<CORE_NAME>/"
 echo "============================================================"

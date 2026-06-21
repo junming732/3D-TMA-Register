@@ -63,7 +63,7 @@ parser = argparse.ArgumentParser(
 parser.add_argument('--core_name',    type=str, required=True,
                     help='TMA core identifier, e.g. Core_01.')
 parser.add_argument('--linking_channel', type=str, default='DAPI',
-                    help='Channel used for 3D linking in analyse_3d_cells.py (default: DAPI). '
+                    help='Channel used for 3D linking in link_3d_cells.py (default: DAPI). '
                          'Determines which 2D→3D map CSV is loaded.')
 parser.add_argument('--min_confidence', type=float, default=0.5,
                     help='Minimum fraction of 2D slices agreeing on a cell type '
@@ -77,9 +77,12 @@ MIN_CONFIDENCE  = args.min_confidence
 # -----------------------------------------------------------------------------
 # PATHS
 # -----------------------------------------------------------------------------
-PHENOTYPE_DIR = os.path.join(config.DATASPACE, 'Phenotypes',  TARGET_CORE)
-LINKING_DIR   = os.path.join(config.DATASPACE, f'CellPose_{LINK_CHANNEL}_3D', TARGET_CORE)
-OUTPUT_DIR    = os.path.join(config.DATASPACE, 'Phenotypes',  TARGET_CORE)
+# PHENOTYPE_DIR = os.path.join(config.DATASPACE, 'Phenotypes',  TARGET_CORE)
+# LINKING_DIR   = os.path.join(config.DATASPACE, f'CellPose_{LINK_CHANNEL}_3D', TARGET_CORE)
+# OUTPUT_DIR    = os.path.join(config.DATASPACE, 'Phenotypes',  TARGET_CORE)
+PHENOTYPE_DIR = os.path.join(config.DATASPACE, 'Phenotypes_Bspline',  TARGET_CORE)
+LINKING_DIR   = os.path.join(config.DATASPACE, f'CellPose_{LINK_CHANNEL}_3D_Bspline', TARGET_CORE)
+OUTPUT_DIR    = os.path.join(config.DATASPACE, 'Phenotypes_Bspline',  TARGET_CORE)
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 PHENOTYPE_CSV = os.path.join(PHENOTYPE_DIR, f'{TARGET_CORE}_phenotypes.csv')

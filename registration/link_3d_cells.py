@@ -107,8 +107,11 @@ SECTION_THICKNESS_UM = 4.5
 TARGET_CORE = args.core_name
 CH_NAME     = args.channel
 
-INPUT_FOLDER  = os.path.join(config.DATASPACE, f"CellPose_{CH_NAME}_Warped",  TARGET_CORE)
-OUTPUT_FOLDER = os.path.join(config.DATASPACE, f"CellPose_{CH_NAME}_3D",      TARGET_CORE)
+# INPUT_FOLDER  = os.path.join(config.DATASPACE, f"CellPose_{CH_NAME}_Warped",  TARGET_CORE)
+# OUTPUT_FOLDER = os.path.join(config.DATASPACE, f"CellPose_{CH_NAME}_3D",      TARGET_CORE)
+INPUT_FOLDER  = os.path.join(config.DATASPACE, f"CellPose_{CH_NAME}_Warped_Bspline",  TARGET_CORE)
+OUTPUT_FOLDER = os.path.join(config.DATASPACE, f"CellPose_{CH_NAME}_3D_Bspline",      TARGET_CORE)
+
 os.makedirs(OUTPUT_FOLDER, exist_ok=True)
 
 if not os.path.exists(INPUT_FOLDER):
@@ -315,7 +318,8 @@ for z, mask in enumerate(masks_2d):
 # Also used later in QC tile montages — loaded once here, reused there.
 # -----------------------------------------------------------------------------
 DENOISED_VOL_PATH = os.path.join(
-    config.DATASPACE, 'Denoised', TARGET_CORE,
+    # config.DATASPACE, 'Denoised', TARGET_CORE,
+    config.DATASPACE, 'Denoised_bspline', TARGET_CORE,
     f'{TARGET_CORE}_denoised.ome.tif',
 )
 dapi_vol_early = None   # memmap view (n_slices, H, W) — slices read on demand

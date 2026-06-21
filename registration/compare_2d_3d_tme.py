@@ -97,8 +97,10 @@ MIN_CELLS    = args.min_cells
 # ─────────────────────────────────────────────────────────────────────────────
 # PATHS
 # ─────────────────────────────────────────────────────────────────────────────
-PHENO_DIR   = os.path.join(config.DATASPACE, 'Phenotypes', TARGET_CORE)
-OUT_DIR     = os.path.join(config.DATASPACE, 'TME_Analysis', TARGET_CORE)
+# PHENO_DIR   = os.path.join(config.DATASPACE, 'Phenotypes', TARGET_CORE)
+# OUT_DIR     = os.path.join(config.DATASPACE, 'TME_Analysis', TARGET_CORE)
+PHENO_DIR   = os.path.join(config.DATASPACE, 'Phenotypes_Bspline', TARGET_CORE)
+OUT_DIR     = os.path.join(config.DATASPACE, 'TME_Analysis_Bspline', TARGET_CORE)
 FIG_DIR     = os.path.join(OUT_DIR, 'figures')
 os.makedirs(OUT_DIR,  exist_ok=True)
 os.makedirs(FIG_DIR,  exist_ok=True)

@@ -76,7 +76,8 @@ CORE_NAMES = [f'Core_{str(c).zfill(2)}' for c in CORE_IDS]
 # ─────────────────────────────────────────────────────────────────────────────
 # PATHS
 # ─────────────────────────────────────────────────────────────────────────────
-TME_DIR = os.path.join(config.DATASPACE, 'TME_Analysis')
+# TME_DIR = os.path.join(config.DATASPACE, 'TME_Analysis')
+TME_DIR = os.path.join(config.DATASPACE, 'TME_Analysis_Bspline')
 OUT_DIR = os.path.join(TME_DIR, 'Aggregate')
 FIG_DIR = os.path.join(OUT_DIR, 'figures')
 os.makedirs(OUT_DIR, exist_ok=True)

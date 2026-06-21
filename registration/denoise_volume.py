@@ -103,14 +103,22 @@ TARGET_CORE = args.core_name
 # ─────────────────────────────────────────────────────────────────────────────
 # PATHS
 # ─────────────────────────────────────────────────────────────────────────────
+# INPUT_VOL = os.path.join(
+#     config.DATASPACE,
+#     'Filter_AKAZE_RoMaV2_Linear_Warp_map',
+#     TARGET_CORE,
+#     f'{TARGET_CORE}_AKAZE_RoMaV2_Linear_Aligned.ome.tif',
+# )
+
 INPUT_VOL = os.path.join(
     config.DATASPACE,
-    'Filter_AKAZE_RoMaV2_Linear_Warp_map',
+    'Filter_AKAZE_TissueMask_BSpline',
     TARGET_CORE,
-    f'{TARGET_CORE}_AKAZE_RoMaV2_Linear_Aligned.ome.tif',
+    f'{TARGET_CORE}_AKAZE_TissueMask_Aligned.ome.tif',
 )
 
-OUTPUT_DIR  = os.path.join(config.DATASPACE, 'Denoised', TARGET_CORE)
+# OUTPUT_DIR  = os.path.join(config.DATASPACE, 'Denoised', TARGET_CORE)
+OUTPUT_DIR  = os.path.join(config.DATASPACE, 'Denoised_bspline', TARGET_CORE)
 OUTPUT_VOL  = os.path.join(OUTPUT_DIR, f'{TARGET_CORE}_denoised.ome.tif')
 PREVIEW_DIR = os.path.join(OUTPUT_DIR, 'preview')
 QC_DIR      = os.path.join(OUTPUT_DIR, 'qc')

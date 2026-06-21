@@ -28,7 +28,7 @@ PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 PHENO_SCRIPT="${PROJECT_ROOT}/registration/phenotype_cells.py"
 
 LOG_ROOT="${PROJECT_ROOT}/log/full_pipeline"
-LOG_PHENO="${LOG_ROOT}/phenotyping"
+LOG_PHENO="${LOG_ROOT}/phenotyping_bspline"
 
 # -----------------------------------------------------------------------------
 # SETUP
@@ -79,7 +79,8 @@ for i in $(seq $START $END); do
     echo "------------------------------------------------------------"
 
     # Skip if warped DAPI masks don't exist
-    DAPI_MASK_DIR="${DATASPACE}CellPose_DAPI_Warped/${CORE_NAME}"
+    # DAPI_MASK_DIR="${DATASPACE}CellPose_DAPI_Warped/${CORE_NAME}"
+    DAPI_MASK_DIR="${DATASPACE}CellPose_DAPI_Warped_Bspline/${CORE_NAME}"
     if [ ! -d "${DAPI_MASK_DIR}" ]; then
         echo "  [SKIP] No warped DAPI mask directory at ${DAPI_MASK_DIR}"
         echo "         Run CellPose (DAPI) + warp first."
@@ -97,14 +98,14 @@ for i in $(seq $START $END); do
     fi
 
     # Skip if registered volume doesn't exist
-    REG_VOL="${DATASPACE}Filter_AKAZE_RoMaV2_Linear_Warp_map/${CORE_NAME}/${CORE_NAME}_AKAZE_RoMaV2_Linear_Aligned.ome.tif"
-    if [ ! -f "${REG_VOL}" ]; then
-        echo "  [SKIP] Registered volume not found at ${REG_VOL}"
-        echo "         Run registration first."
-        SKIP=$((SKIP + 1))
-        CORE_STATUS[$CORE_NAME]="SKIP_NO_VOLUME"
-        continue
-    fi
+    # REG_VOL="${DATASPACE}Filter_AKAZE_RoMaV2_Linear_Warp_map/${CORE_NAME}/${CORE_NAME}_AKAZE_RoMaV2_Linear_Aligned.ome.tif"
+    # if [ ! -f "${REG_VOL}" ]; then
+    #     echo "  [SKIP] Registered volume not found at ${REG_VOL}"
+    #     echo "         Run registration first."
+    #     SKIP=$((SKIP + 1))
+    #     CORE_STATUS[$CORE_NAME]="SKIP_NO_VOLUME"
+    #     continue
+    # fi
 
     echo "  [RUN] Phenotyping (${N_MASKS} DAPI mask slices)..."
 
@@ -159,5 +160,5 @@ done
 
 echo "------------------------------------------------------------"
 echo "  Logs  : ${LOG_PHENO}/"
-echo "  Output: ${DATASPACE}Phenotypes/<CORE_NAME>/<CORE_NAME>_phenotypes.csv"
+# echo "  Output: ${DATASPACE}Phenotypes/<CORE_NAME>/<CORE_NAME>_phenotypes.csv"
 echo "============================================================"

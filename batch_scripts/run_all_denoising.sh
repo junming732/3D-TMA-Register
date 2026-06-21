@@ -15,7 +15,7 @@
 # -----------------------------------------------------------------------------
 # CONFIGURATION
 # -----------------------------------------------------------------------------
-START=1
+START=7
 END=30
 
 VENV_PATH="/home/junming/3D-TMA-Register/venv_312"
@@ -95,7 +95,8 @@ for i in $(seq $START $END); do
     echo "------------------------------------------------------------"
 
     # Skip if registered volume doesn't exist
-    REG_VOL="${DATASPACE}Filter_AKAZE_RoMaV2_Linear_Warp_map/${CORE_NAME}/${CORE_NAME}_AKAZE_RoMaV2_Linear_Aligned.ome.tif"
+    # REG_VOL="${DATASPACE}Filter_AKAZE_RoMaV2_Linear_Warp_map/${CORE_NAME}/${CORE_NAME}_AKAZE_RoMaV2_Linear_Aligned.ome.tif"
+    REG_VOL="${DATASPACE}Filter_AKAZE_TissueMask_BSpline/${CORE_NAME}/${CORE_NAME}_AKAZE_TissueMask_Aligned.ome.tif"
     if [ ! -f "${REG_VOL}" ]; then
         echo "  [SKIP] Registered volume not found at ${REG_VOL}"
         echo "         Run registration first."
@@ -106,7 +107,8 @@ for i in $(seq $START $END); do
 
     # Report if output already exists and overwrite is off (denoise_volume.py
     # will exit 0 cleanly in this case — we just surface it here for the log)
-    DENOISED_OUT="${DATASPACE}Denoised/${CORE_NAME}/${CORE_NAME}_denoised.ome.tif"
+    # DENOISED_OUT="${DATASPACE}Denoised/${CORE_NAME}/${CORE_NAME}_denoised.ome.tif"
+    DENOISED_OUT="${DATASPACE}Denoised_bspline/${CORE_NAME}/${CORE_NAME}_denoised.ome.tif"
     if [ -f "${DENOISED_OUT}" ] && [ "${OVERWRITE}" = false ]; then
         echo "  [SKIP] Denoised volume already exists -- skipping."
         echo "         Set OVERWRITE=true to re-run."

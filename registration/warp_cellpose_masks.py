@@ -128,7 +128,7 @@ def apply_deformation(mask: np.ndarray, npz_path: str,
     map_y    = d['map_y'].astype(np.float32)       # (H, W)
     h, w     = int(d['orig_h']), int(d['orig_w'])
     akaze_ok = bool(d['akaze_ok'])
-    warp_ok  = bool(d['warp_ok'])
+    warp_ok = bool(d['warp_ok'] if 'warp_ok' in d else d['bspline_ok'])
 
     logger.debug(f"  AKAZE_OK={akaze_ok}  WARP_OK={warp_ok}  shape=({h},{w})")
 

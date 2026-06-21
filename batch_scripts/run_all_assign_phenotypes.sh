@@ -37,7 +37,8 @@ PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 ASSIGN_SCRIPT="${PROJECT_ROOT}/registration/assign_phenotypes.py"
 
 LOG_ROOT="${PROJECT_ROOT}/log/full_pipeline"
-LOG_ASSIGN="${LOG_ROOT}/assign_phenotypes"
+#LOG_ASSIGN="${LOG_ROOT}/assign_phenotypes"
+LOG_ASSIGN="${LOG_ROOT}/assign_phenotypes_Bspline"
 
 # -----------------------------------------------------------------------------
 # SETUP
@@ -89,7 +90,8 @@ for i in $(seq $START $END); do
     # ------------------------------------------------------------------
     # PREREQUISITE CHECK 1: phenotype CSV from phenotype_cells.py
     # ------------------------------------------------------------------
-    PHENOTYPE_CSV="${DATASPACE}Phenotypes/${CORE_NAME}/${CORE_NAME}_phenotypes.csv"
+    #PHENOTYPE_CSV="${DATASPACE}Phenotypes/${CORE_NAME}/${CORE_NAME}_phenotypes.csv"
+    PHENOTYPE_CSV="${DATASPACE}Phenotypes_Bspline/${CORE_NAME}/${CORE_NAME}_phenotypes.csv"
     if [ ! -f "${PHENOTYPE_CSV}" ]; then
         echo "  [SKIP] Phenotype CSV not found -- run phenotype_cells.py first."
         echo "         Expected: ${PHENOTYPE_CSV}"
@@ -101,7 +103,8 @@ for i in $(seq $START $END); do
     # ------------------------------------------------------------------
     # PREREQUISITE CHECK 2: DAPI 2D→3D map from analyse_3d_cells.py
     # ------------------------------------------------------------------
-    MAP_CSV="${DATASPACE}CellPose_${LINKING_CHANNEL}_3D/${CORE_NAME}/${CORE_NAME}_${LINKING_CHANNEL}_2d_to_3d_map.csv"
+    #MAP_CSV="${DATASPACE}CellPose_${LINKING_CHANNEL}_3D/${CORE_NAME}/${CORE_NAME}_${LINKING_CHANNEL}_2d_to_3d_map.csv"
+    MAP_CSV="${DATASPACE}CellPose_${LINKING_CHANNEL}_3D_Bspline/${CORE_NAME}/${CORE_NAME}_${LINKING_CHANNEL}_2d_to_3d_map.csv"
     if [ ! -f "${MAP_CSV}" ]; then
         echo "  [SKIP] 2D→3D map CSV not found -- run analyse_3d_cells.py (DAPI) first."
         echo "         Expected: ${MAP_CSV}"
@@ -113,7 +116,8 @@ for i in $(seq $START $END); do
     # ------------------------------------------------------------------
     # PREREQUISITE CHECK 3: DAPI 3D stats from analyse_3d_cells.py
     # ------------------------------------------------------------------
-    STATS_CSV="${DATASPACE}CellPose_${LINKING_CHANNEL}_3D/${CORE_NAME}/${CORE_NAME}_${LINKING_CHANNEL}_3d_stats.csv"
+    #STATS_CSV="${DATASPACE}CellPose_${LINKING_CHANNEL}_3D/${CORE_NAME}/${CORE_NAME}_${LINKING_CHANNEL}_3d_stats.csv"
+    STATS_CSV="${DATASPACE}CellPose_${LINKING_CHANNEL}_3D_Bspline/${CORE_NAME}/${CORE_NAME}_${LINKING_CHANNEL}_3d_stats.csv"
     if [ ! -f "${STATS_CSV}" ]; then
         echo "  [SKIP] 3D stats CSV not found -- run analyse_3d_cells.py (DAPI) first."
         echo "         Expected: ${STATS_CSV}"
@@ -171,5 +175,5 @@ for i in $(seq $START $END); do
 done
 echo "------------------------------------------------------------"
 echo "  Logs   : ${LOG_ASSIGN}/"
-echo "  Output : ${DATASPACE}Phenotypes/<CORE>/*_typed.csv"
+# echo "  Output : ${DATASPACE}Phenotypes/<CORE>/*_typed.csv"
 echo "============================================================"
