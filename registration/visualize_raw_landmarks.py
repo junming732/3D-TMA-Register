@@ -4,31 +4,44 @@ visualize_raw_landmarks.py
 Visualise annotation landmarks on the **original, unregistered** input images
 from TMA_Cores_Grouped_Rotate_Conformed.
 
-Two outputs per mclass
-───────────────────────
-1. landmark_raw_overview_mclassN.png
+Three outputs per structure
+─────────────────────────────
+1. landmark_raw_overview_structureN.png
    All annotated slices tiled side-by-side.  Each tile shows the DAPI crop
    around the raw (x, y) point — no warping, no registration.  Use this to
    see whether a nucleus *already looks stretched* in the raw input before
    any registration is applied.
 
-2. landmark_raw_adjacent_mclassN.png   (≥2 slices only)
+2. landmark_raw_adjacent_structureN.png   (>=2 slices only)
    For each consecutive pair of slices, a two-panel figure:
      Left  — DAPI crops side-by-side (same physical location, two slices)
      Right — Red/Green overlay of the two crops at the landmark position
    This lets you compare the same nucleus across adjacent z-levels directly
    in the raw (pre-registration) image space.
 
+3. landmark_raw_full_core_overview.png   (NEW)
+   A single low-resolution overview of the WHOLE core, with every annotated
+   structure marked and labelled at its first annotated z-slice. Gives an
+   at-a-glance picture of how many structures were annotated and where they
+   are located within the core — useful as an example overview figure.
+
+Supports two JSON schemas automatically:
+  (a) Flat list:   [{"x":.., "y":.., "z":.., "landmark_id":..}, ...]
+  (b) Nested:       {"annotations": [{"z":.., "mclass":.., "id":..,
+                                       "points": [{"x":.., "y":..}]}, ...]}
+
 Usage
 ─────
     python visualize_raw_landmarks.py \\
         --core_name  core_09 \\
-        --annotation_json  /path/to/rough_annotation_core_09.json \\
+        --annotation_json  /path/to/landmark_annotation_core_09.json \\
         [--dapi_crop_half  80]          # half-width of crop window (pixels)
         [--channel         0]           # channel index for "DAPI" (default 0)
-        [--mclass          all]         # 'all' or comma-separated ints
+        [--structure       all]         # 'all' or comma-separated ints
         [--output_dir      .]           # where to save PNGs (default: cwd)
         [--dpi             120]
+        [--full_core_slice 10]          # which slice_idx to use as background
+                                         #   for the full-core overview
 """
 
 import os, re, sys, json, glob, argparse
@@ -61,13 +74,22 @@ parser.add_argument('--dapi_crop_half',  type=int,   default=50,
                     help="Half-width of crop window in pixels (default 50)")
 parser.add_argument('--channel',         type=int,   default=0,
                     help="Channel index to display as 'DAPI' (default 0)")
-parser.add_argument('--landmark_id',          default='all',
+parser.add_argument('--structure',       default='all',
                     help="'all' or comma-separated ints")
 parser.add_argument('--output_dir',      default=None,
                     help="Directory to write PNG files "
                          "(default: <DATASPACE>/Raw_Landmark_Visualization/<core_name>/)")
 parser.add_argument('--dpi',             type=int,   default=150,
                     help="Output DPI (default 150)")
+parser.add_argument('--full_core_slice', type=int,   default=10,
+                    help="slice_idx (0-based, into FILE_LIST) used as the "
+                         "background image for the full-core overview "
+                         "(default 10)")
+parser.add_argument('--full_core_channel', type=int, default=6,
+                    help="Channel index used as background for the "
+                         "full-core overview only (default 6 = CK, which "
+                         "shows tissue structure more clearly than DAPI "
+                         "at low magnification)")
 args = parser.parse_args()
 
 TARGET_CORE   = args.core_name
@@ -103,6 +125,9 @@ logger.info(f"Input folder : {INPUT_FOLDER}")
 logger.info(f"Output dir   : {OUTPUT_DIR}")
 
 # ─── Z MAPPING (same as all other scripts) ────────────────────────────────────
+# NOTE: this annotation tool stores z as a 1-based slice number that already
+# matches FILE_LIST directly (z=1 -> first file, z=20 -> last of 20 files).
+# Adjust this function if a different annotation export is ever used.
 def z_json_to_slice_idx(z_json):
     return z_json - 1
 
@@ -119,16 +144,40 @@ if not FILE_LIST:
 logger.info(f"Found {len(FILE_LIST)} raw slices")
 
 # ─── LOAD ANNOTATIONS ─────────────────────────────────────────────────────────
+# Supports two schemas automatically:
+#   (a) Flat list:   [{"x":.., "y":.., "z":.., "landmark_id":..}, ...]
+#   (b) Nested:       {"annotations": [{"z":.., "mclass":.., "id":..,
+#                                        "points": [{"x":.., "y":..}]}, ...]}
 with open(args.annotation_json) as fh:
     ann_data = json.load(fh)
 
-annotations = ann_data
-logger.info(f"Loaded {len(annotations)} annotations")
+normalised = []  # list of {'x','y','z','structure_id','id'}
 
-if args.landmark_id.lower() != 'all':
-    keep        = set(int(m) for m in args.landmark_id.split(','))
-    annotations = [a for a in annotations if a['landmark_id'] in keep]
-    logger.info(f"After landmark_id filter: {len(annotations)} annotations")
+if isinstance(ann_data, list):
+    for i, d in enumerate(ann_data):
+        normalised.append({
+            'x': d['x'], 'y': d['y'], 'z': d['z'],
+            'structure_id': d['landmark_id'],
+            'id': i,
+        })
+elif isinstance(ann_data, dict) and 'annotations' in ann_data:
+    for ann in ann_data['annotations']:
+        pt = ann['points'][0]
+        normalised.append({
+            'x': pt['x'], 'y': pt['y'], 'z': ann['z'],
+            'structure_id': ann['mclass'],
+            'id': ann['id'],
+        })
+else:
+    logger.error(f"Unrecognised annotation JSON schema in {args.annotation_json}")
+    sys.exit(1)
+
+logger.info(f"Loaded {len(normalised)} annotations")
+
+if args.structure.lower() != 'all':
+    keep        = set(int(s) for s in args.structure.split(','))
+    normalised  = [a for a in normalised if a['structure_id'] in keep]
+    logger.info(f"After structure filter: {len(normalised)} annotations")
 
 # ─── TIFF LOADING HELPER ──────────────────────────────────────────────────────
 try:
@@ -190,34 +239,31 @@ def make_rg_overlay(img_a, img_b):
                      np.zeros_like(a)], axis=2)
 
 
-# ─── BUILD PER-MCLASS RECORDS ─────────────────────────────────────────────────
+# ─── BUILD PER-STRUCTURE RECORDS ──────────────────────────────────────────────
 from collections import defaultdict
-mc_records = defaultdict(list)
+struct_records = defaultdict(list)
 
-for ann in annotations:
+for ann in normalised:
     z_json    = ann['z']
     slice_idx = z_json_to_slice_idx(z_json)
-    x_raw     = ann['x']
-    y_raw     = ann['y']
-    mc        = ann['landmark_id']
-    mc_records[mc].append({
+    struct_records[ann['structure_id']].append({
         'z_json':    z_json,
         'slice_idx': slice_idx,
-        'x':         x_raw,
-        'y':         y_raw,
-        'id':        ann['landmark_id'],
+        'x':         ann['x'],
+        'y':         ann['y'],
+        'id':        ann['id'],
     })
 
-# Sort each mclass by z
-for mc in mc_records:
-    mc_records[mc].sort(key=lambda r: r['z_json'])
+# Sort each structure by z
+for sid in struct_records:
+    struct_records[sid].sort(key=lambda r: r['z_json'])
 
-logger.info(f"mclasses found: {sorted(mc_records.keys())}")
+logger.info(f"structures found: {sorted(struct_records.keys())}")
 
 # ─── OUTPUT 1: TILED OVERVIEW — one tile per annotated slice ──────────────────
-for mc, records in mc_records.items():
+for sid, records in struct_records.items():
     n = len(records)
-    logger.info(f"mclass {mc}: {n} annotation(s)")
+    logger.info(f"structure {sid}: {n} annotation(s)")
 
     # Define grid constraints: maximum 4 columns per row
     max_cols  = 4
@@ -233,7 +279,7 @@ for mc, records in mc_records.items():
     fig, axes = plt.subplots(rows, cols, figsize=(fig_w, fig_h), squeeze=False)
     
     fig.suptitle(
-        f"{TARGET_CORE}  —  RAW landmarks  |  landmark  {mc}  |  ch {CHANNEL_IDX}",
+        f"{TARGET_CORE}  —  RAW landmarks  |  structure {sid}  |  ch {CHANNEL_IDX}",
         fontsize=11, fontweight='bold'
     )
 
@@ -288,7 +334,7 @@ for mc, records in mc_records.items():
 
     plt.tight_layout()
     out_path = os.path.join(OUTPUT_DIR,
-                            f"{TARGET_CORE}_landmark_raw_overview_id{mc}.png")
+                            f"{TARGET_CORE}_landmark_raw_overview_structure{sid}.png")
     fig.savefig(out_path, dpi=args.dpi, bbox_inches='tight')
     plt.close(fig)
     logger.info(f"  Overview → {out_path}")
@@ -296,7 +342,7 @@ for mc, records in mc_records.items():
 
 # ─── OUTPUT 2: ADJACENT-PAIR COMPARISON ───────────────────────────────────────
 # For each consecutive pair within a mclass: side-by-side crops + R/G overlay
-for mc, records in mc_records.items():
+for sid, records in struct_records.items():
     if len(records) < 2:
         continue
 
@@ -315,7 +361,7 @@ for mc, records in mc_records.items():
                              figsize=(fig_w, fig_h),
                              squeeze=False)
     fig.suptitle(
-        f"{TARGET_CORE}  —  RAW adjacent-pair comparison  |  landmark  {mc}  |  ch {CHANNEL_IDX}",
+        f"{TARGET_CORE}  —  RAW adjacent-pair comparison  |  structure {sid}  |  ch {CHANNEL_IDX}",
         fontsize=11, fontweight='bold'
     )
 
@@ -323,6 +369,17 @@ for mc, records in mc_records.items():
         rec_a, rec_b = records[ia], records[ib]
         img_a, _ = load_raw_channel(rec_a['slice_idx'], CHANNEL_IDX)
         img_b, _ = load_raw_channel(rec_b['slice_idx'], CHANNEL_IDX)
+
+        if img_a is None or img_b is None:
+            for r in range(3):
+                axes[r][col].text(0.5, 0.5, 'slice out of range\n(skipped)',
+                                 ha='center', va='center', fontsize=9,
+                                 transform=axes[r][col].transAxes)
+                axes[r][col].axis('off')
+            logger.warning(f"structure {sid}: skipping pair "
+                          f"(slice_idx {rec_a['slice_idx']}/{rec_b['slice_idx']}) "
+                          f"— image load failed")
+            continue
 
         # Use the mean landmark position as crop centre
         mid_x = (rec_a['x'] + rec_b['x']) / 2
@@ -400,9 +457,85 @@ for mc, records in mc_records.items():
 
     plt.tight_layout()
     out_path = os.path.join(OUTPUT_DIR,
-                            f"{TARGET_CORE}_landmark_raw_adjacent_id{mc}.png")
+                            f"{TARGET_CORE}_landmark_raw_adjacent_structure{sid}.png")
     fig.savefig(out_path, dpi=args.dpi, bbox_inches='tight')
     plt.close(fig)
     logger.info(f"  Adjacent comparison → {out_path}")
+
+
+# ─── OUTPUT 3: FULL-CORE OVERVIEW ──────────────────────────────────────────────
+# A single image of the whole core, with every annotated structure marked at
+# its first annotated z and labelled by structure ID. Gives a reviewer/reader
+# an at-a-glance picture of annotation coverage. Uses the CK channel (more
+# legible tissue structure than DAPI at low magnification) and is auto-cropped
+# to the tissue bounding box to remove dark background margins.
+logger.info("Building full-core overview...")
+
+bg_img, bg_path = load_raw_channel(args.full_core_slice, args.full_core_channel)
+
+if bg_img is None:
+    logger.warning(f"Could not load background slice_idx={args.full_core_slice} "
+                    f"ch={args.full_core_channel} for full-core overview — skipping.")
+else:
+    # Auto-crop to the tissue bounding box: threshold on intensity, take the
+    # bounding box of foreground pixels, then pad by a small margin.
+    thresh = max(0.03, np.percentile(bg_img, 90) * 0.15)
+    fg_mask = bg_img > thresh
+    if fg_mask.any():
+        ys, xs = np.where(fg_mask)
+        pad = int(0.04 * max(bg_img.shape))
+        y0c = max(0, ys.min() - pad)
+        y1c = min(bg_img.shape[0], ys.max() + pad)
+        x0c = max(0, xs.min() - pad)
+        x1c = min(bg_img.shape[1], xs.max() + pad)
+    else:
+        y0c, y1c, x0c, x1c = 0, bg_img.shape[0], 0, bg_img.shape[1]
+
+    bg_crop = bg_img[y0c:y1c, x0c:x1c]
+    # Mild contrast boost so tissue texture stays visible under bright markers
+    bg_crop = np.clip(bg_crop * 1.4, 0, 1)
+
+    fig, ax = plt.subplots(figsize=(10, 10))
+    ax.imshow(bg_crop, cmap='gray', vmin=0, vmax=1, origin='upper',
+              extent=[x0c, x1c, y1c, y0c])
+
+    MARK_COLOUR = '#39FF14'   # bright neon green — high contrast on both
+                               # dark background and bright CK tissue
+    TEXT_COLOUR = '#FFFF00'   # bright yellow for labels
+
+    import matplotlib.patheffects as pe
+    halo = [pe.withStroke(linewidth=2.2, foreground='black')]
+
+    for sid, records in sorted(struct_records.items()):
+        first = records[0]
+        if not (x0c <= first['x'] <= x1c and y0c <= first['y'] <= y1c):
+            continue  # outside the cropped region — skip
+        ax.scatter(first['x'], first['y'], c=MARK_COLOUR, s=70,
+                  marker='+', linewidths=2.2, zorder=5,
+                  path_effects=halo)
+        ax.annotate(str(sid), (first['x'], first['y']),
+                   textcoords="offset points", xytext=(5, 5),
+                   fontsize=7, color=TEXT_COLOUR, fontweight='bold',
+                   path_effects=halo, zorder=6)
+
+    n_struct = len(struct_records)
+    n_total  = sum(len(r) for r in struct_records.values())
+    ax.set_title(
+        f"{TARGET_CORE} — full-core annotation overview\n"
+        f"{n_struct} structures, {n_total} annotated points "
+        f"(background: CK, slice {args.full_core_slice + 1})",
+        fontsize=11, fontweight='bold'
+    )
+    ax.set_xlabel("x (px)")
+    ax.set_ylabel("y (px)")
+    ax.set_xlim(x0c, x1c)
+    ax.set_ylim(y1c, y0c)
+
+    plt.tight_layout()
+    out_path = os.path.join(OUTPUT_DIR,
+                            f"{TARGET_CORE}_landmark_raw_full_core_overview.png")
+    fig.savefig(out_path, dpi=args.dpi, bbox_inches='tight')
+    plt.close(fig)
+    logger.info(f"  Full-core overview → {out_path}")
 
 logger.info("Done.")

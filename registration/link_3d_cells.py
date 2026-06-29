@@ -180,15 +180,19 @@ def build_3d_components(all_nodes, edges_uvw, max_slices):
     for comp_id in range(n_comp):
         pending.append(np.where(labels == comp_id)[0])
 
-    # Batch eliminate_zeros every N cuts to avoid O(nnz) scan on each iteration
-    ELIM_BATCH   = 500
-    cuts_since_elim = 0
-    severed_total   = 0
+    severed_total = 0
 
+    # NOTE: each top-level connected component is disjoint from every other,
+    # so once we slice it out of the global matrix we never need to touch
+    # the global matrix again for that component. All cutting/splitting work
+    # below happens on the small LOCAL sub-matrix only. This avoids both:
+    #   (a) the old `mat[comp_idx[:, None], comp_idx]` broadcast-index bug
+    #       (caused ValueError / ArrayMemoryError on large components), and
+    #   (b) repeatedly re-slicing the huge global matrix on every single
+    #       cut, which is what caused the script to hang/stall.
     while pending:
         comp_idx = pending.pop()
 
-        # Vectorised z-span check — no Python loop over comp_idx
         z_vals = node_z[comp_idx]
         z_span = int(z_vals.max() - z_vals.min() + 1)
 
@@ -196,52 +200,49 @@ def build_3d_components(all_nodes, edges_uvw, max_slices):
             valid_components.append({all_nodes[i] for i in comp_idx})
             continue
 
-        # Single fancy-index slice (one CSR extraction, no intermediate COO)
-        sub = mat[comp_idx[:, None], comp_idx].tocoo()
+        # Extract the local subgraph ONCE (row-slice then column-slice,
+        # never a dense comp_idx x comp_idx broadcast).
+        sub = mat[comp_idx][:, comp_idx].tocsr()
 
-        if sub.nnz == 0:
-            valid_components.append({all_nodes[i] for i in comp_idx})
-            continue
+        local_pending = [(comp_idx, sub)]
 
-        upper = sub.row < sub.col
-        if not np.any(upper):
-            valid_components.append({all_nodes[i] for i in comp_idx})
-            continue
+        while local_pending:
+            c_idx, local_mat = local_pending.pop()
 
-        # --- BATCHED GLOBAL CUT ---
-        # 1. Find the minimum overlap weight in this component
-        min_weight = sub.data[upper].min()
+            z_vals = node_z[c_idx]
+            z_span = int(z_vals.max() - z_vals.min() + 1)
+            if z_span <= max_slices:
+                valid_components.append({all_nodes[i] for i in c_idx})
+                continue
 
-        # 2. Find ALL edges sharing this minimum weight
-        cut_mask = sub.data[upper] == min_weight
+            coo = local_mat.tocoo()
+            upper = coo.row < coo.col
+            if coo.nnz == 0 or not np.any(upper):
+                valid_components.append({all_nodes[i] for i in c_idx})
+                continue
 
-        # 3. Map local sub-matrix coordinates back to global matrix coordinates
-        local_u  = sub.row[upper][cut_mask]
-        local_v  = sub.col[upper][cut_mask]
-        global_u = comp_idx[local_u]
-        global_v = comp_idx[local_v]
+            # 1. Minimum overlap weight in this (local) component
+            min_weight = coo.data[upper].min()
 
-        # 4. Mutate the global matrix (zero out cut edges)
-        mat[global_u, global_v] = 0
-        mat[global_v, global_u] = 0
+            # 2. All edges sharing this minimum weight
+            cut_mask = coo.data[upper] == min_weight
+            lu = coo.row[upper][cut_mask]
+            lv = coo.col[upper][cut_mask]
 
-        severed_total   += len(global_u)
-        cuts_since_elim += len(global_u)
+            severed_total += len(lu)
 
-        # Defer eliminate_zeros — only pay O(nnz) scan every ELIM_BATCH cuts
-        if cuts_since_elim >= ELIM_BATCH:
-            mat.eliminate_zeros()
-            cuts_since_elim = 0
+            # 3. Zero out the cut edges in the LOCAL matrix only (small, fast)
+            local_mat = local_mat.tolil()
+            local_mat[lu, lv] = 0
+            local_mat[lv, lu] = 0
+            local_mat = local_mat.tocsr()
+            local_mat.eliminate_zeros()
 
-        # 5. Re-extract the sub-matrix (now with zeroed edges) and re-evaluate
-        sub2 = mat[comp_idx[:, None], comp_idx]
-        n_sub, sub_labels = sp_cc(sub2, directed=False)
-
-        for sub_id in range(n_sub):
-            pending.append(comp_idx[sub_labels == sub_id])
-
-    # Final cleanup of any residual explicit zeros
-    mat.eliminate_zeros()
+            # 4. Re-split locally and push the pieces back onto local_pending
+            n_sub, sub_labels = sp_cc(local_mat, directed=False)
+            for sub_id in range(n_sub):
+                mask = sub_labels == sub_id
+                local_pending.append((c_idx[mask], local_mat[mask][:, mask]))
 
     logger.info(f"  Edges severed during Z-span pruning: {severed_total}")
     logger.info(f"  Final component count: {len(valid_components)}")

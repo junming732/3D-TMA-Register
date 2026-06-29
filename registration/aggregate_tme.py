@@ -508,11 +508,10 @@ for ct in types_ent:
 
 bp = ax3.boxplot(bp_data, positions=x_positions, widths=0.50,
                  patch_artist=True, notch=False,
+                 showfliers=False,
                  medianprops=dict(color='white', lw=3.0),
                  whiskerprops=dict(color='#888', lw=2.0),
-                 capprops=dict(color='#888', lw=2.0),
-                 flierprops=dict(marker='o', markersize=7,
-                                 markerfacecolor='#aaa', markeredgecolor='none'))
+                 capprops=dict(color='#888', lw=2.0))
 
 for patch, ct in zip(bp['boxes'], types_ent):
     patch.set_facecolor(_type_color(ct))

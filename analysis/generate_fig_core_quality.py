@@ -44,7 +44,7 @@ CHANNEL_NAMES  = ['DAPI', 'CD31', 'GAP43', 'NFP', 'CD3', 'CD163', 'CK', 'AF']
 SELECTIONS = [
     ("Core_03", 5, "Usable"),
     ("Core_19", 5, "Scattered Structure"),
-    ("Core_17", 5, "Severely Damaged"),
+    ("Core_17", 5, "Unsuitable"),
 ]
 # ── END CONFIG ────────────────────────────────────────────────────────────────
 
