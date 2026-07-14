@@ -68,12 +68,19 @@ import config
 parser = argparse.ArgumentParser()
 parser.add_argument('--core_name',       type=str, required=True)
 parser.add_argument('--annotation_json', type=str, required=True)
+parser.add_argument('--registration_mode', type=str, default='ck_only',
+                    choices=['ck_only', '3ch_fusion', 'color_lut'],
+                    help='Must match the --registration_mode the core was run with '
+                         'in akaze_romav2_multi_channel_warp.py — selects which '
+                         'output folder (and therefore which deformation maps / '
+                         'registered volume) to evaluate.')
 parser.add_argument('--pixel_size_um',   type=float, default=0.4961,
                     help='Pixel size in µm (default 0.4961, from registration script).')
 parser.add_argument('--landmark_id',          type=str, default='all')
 args = parser.parse_args()
 
 TARGET_CORE    = args.core_name
+ROMA_MODE      = args.registration_mode
 PIXEL_SIZE_UM  = args.pixel_size_um
 
 import logging
@@ -83,8 +90,8 @@ logger = logging.getLogger(__name__)
 # ─── PATHS — mirrors registration script ──────────────────────────────────────
 DATA_BASE_PATH    = os.path.join(config.DATASPACE, "TMA_Cores_Grouped_Rotate_Conformed")
 INPUT_FOLDER      = os.path.join(DATA_BASE_PATH, TARGET_CORE)
-# WORK_OUTPUT       = os.path.join(config.DATASPACE, "Filter_AKAZE_RoMaV2_Linear_Warp_map")
-WORK_OUTPUT       = os.path.join(config.DATASPACE, "Filter_AKAZE_RoMaV2_Linear_Warp_map_hr_isolated")
+WORK_OUTPUT       = os.path.join(config.DATASPACE,
+                                 f"Filter_AKAZE_RoMaV2_Linear_Warp_map_multi_channel_{ROMA_MODE}")
 OUTPUT_FOLDER     = os.path.join(WORK_OUTPUT, TARGET_CORE)
 DEFORM_FOLDER     = os.path.join(OUTPUT_FOLDER, "deformation_maps")
 VERIFY_OUTPUT     = os.path.join(OUTPUT_FOLDER, "annotation_verification_Romav2")
@@ -92,6 +99,7 @@ SLICE_FILTER_YAML = os.path.join(config.DATASPACE, "slice_filter.yaml")
 os.makedirs(VERIFY_OUTPUT, exist_ok=True)
 
 logger.info(f"Core         : {TARGET_CORE}")
+logger.info(f"Reg. mode    : {ROMA_MODE}")
 logger.info(f"Deform folder: {DEFORM_FOLDER}")
 logger.info(f"Output       : {VERIFY_OUTPUT}")
 
