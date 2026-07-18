@@ -41,8 +41,8 @@ Deformation maps:
     orig_w   : int  — image width
 
   These maps can be applied to CellPose segmentation masks (run on the original,
-  unregistered images) using apply_deformation_to_mask() or the companion script
-  warp_cellpose_masks.py.
+  unregistered images) using the companion script warp_cellpose_masks.py, which
+  applies the identical two-step (affine, then remap) transform documented below.
 
   Warping semantics — the maps describe a FORWARD warp (moving→fixed):
     map_x[y, x] = x-coordinate in the source (moving) image that maps to pixel (x, y)
@@ -200,7 +200,7 @@ os.makedirs(DEFORM_FOLDER, exist_ok=True)
 # UTILITIES
 # ─────────────────────────────────────────────────────────────────────────────
 
-def load_slice_filter(yaml_path, core_name):
+def load_slice_filter(yaml_path: str, core_name: str) -> set[int] | None:
     if not os.path.exists(yaml_path):
         return None
     with open(yaml_path) as fh:
@@ -219,12 +219,12 @@ def load_slice_filter(yaml_path, core_name):
     return allowed
 
 
-def get_slice_number(filename):
+def get_slice_number(filename: str) -> int:
     match = re.search(r"TMA_(\d+)_", os.path.basename(filename))
     return int(match.group(1)) if match else 0
 
 
-def prepare_ck(img_arr):
+def prepare_ck(img_arr: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     """
     Returns (norm_lin, norm_log) — both uint8, derived from a single CK channel array.
 
@@ -253,7 +253,6 @@ def prepare_ck(img_arr):
 
 DAPI_CHANNEL_IDX = 0
 AF_CHANNEL_IDX   = 7
-FUSION_WEIGHTS   = (1.0, 0.3, 0.6)   # (DAPI, AF, CK)
 
 COLOR_LUT = {
     0: (0,   128, 255),
@@ -342,6 +341,16 @@ def prepare_ncc_gray_log(img_lin):
     return cv2.normalize(
         np.clip(log_img, p_lo, p_hi), None, 0, 255, cv2.NORM_MINMAX
     ).astype(np.uint8)
+
+def normalize_pct(img: np.ndarray, pct: float = 99.5) -> np.ndarray:
+    """
+    Percentile-clip normalise an image to [0, 1] float32 for display.
+    Shared by save_registration_plot and generate_qc_montage so both use
+    identical normalisation and can't silently drift apart.
+    """
+    p = np.percentile(img, pct)
+    return np.clip(img.astype(np.float32) / (p if p > 0 else 1), 0, 1)
+
 
 def to_rgb_pil(img):
     """
@@ -504,7 +513,7 @@ def save_deformation_maps(slice_id: str,
         orig_h   : int
         orig_w   : int
 
-    Applying to a mask (see also apply_deformation_to_mask):
+    Applying to a mask (see warp_cellpose_masks.py, which implements this):
         Step 1 — affine:  mask_affine = cv2.warpAffine(mask, M_affine, (W, H),
                               flags=cv2.INTER_NEAREST,
                               borderMode=cv2.BORDER_CONSTANT, borderValue=0)
@@ -559,8 +568,9 @@ def save_deformation_nifti(slice_id: str,
          image — i.e. exactly what ITK's own resampling expects when you
          hand it this field to warp the moving image into fixed space.
          This is the composition of the same two steps documented in
-         save_deformation_maps/apply_deformation_to_mask (affine, then
-         remap), collapsed into one field rather than kept as two stages.
+         save_deformation_maps (affine, then remap — see also
+         warp_cellpose_masks.py), collapsed into one field rather than
+         kept as two stages.
 
     Returns the path of the saved .nii.gz file.
     """
@@ -606,55 +616,6 @@ def save_deformation_nifti(slice_id: str,
     return out_path
 
 
-def apply_deformation_to_mask(mask: np.ndarray,
-                               npz_path: str,
-                               interpolation: int = cv2.INTER_NEAREST) -> np.ndarray:
-    """
-    Utility: apply a saved deformation .npz to a CellPose label mask (or any
-    2-D array) and return the warped result.
-
-    Parameters
-    ----------
-    mask          : (H, W) integer label array from CellPose (or float image).
-    npz_path      : path to the .npz saved by save_deformation_maps().
-    interpolation : cv2 interpolation flag.  Use cv2.INTER_NEAREST for integer
-                    label masks (preserves cell IDs); cv2.INTER_LINEAR for
-                    probability / intensity images.
-
-    Returns
-    -------
-    warped : same dtype as mask, same shape.
-
-    Notes
-    -----
-    The mask must come from running CellPose on the *original, unregistered*
-    moving slice.  The deformation was computed relative to that slice.
-    """
-    d        = np.load(npz_path)
-    M_affine = d['M_affine']                    # (2, 3) float64
-    map_x    = d['map_x'].astype(np.float32)    # (H, W)
-    map_y    = d['map_y'].astype(np.float32)    # (H, W)
-    h, w     = int(d['orig_h']), int(d['orig_w'])
-
-    mask_f32 = mask.astype(np.float32)
-
-    # Step 1: affine
-    mask_affine = cv2.warpAffine(
-        mask_f32, M_affine, (w, h),
-        flags=interpolation,
-        borderMode=cv2.BORDER_CONSTANT, borderValue=0,
-    )
-
-    # Step 2: dense remap
-    warped = cv2.remap(
-        mask_affine, map_x, map_y,
-        interpolation=interpolation,
-        borderMode=cv2.BORDER_CONSTANT, borderValue=0,
-    )
-
-    return warped.astype(mask.dtype)
-
-
 # ─────────────────────────────────────────────────────────────────────────────
 # L0: AKAZE AFFINE
 # ─────────────────────────────────────────────────────────────────────────────
@@ -678,8 +639,9 @@ def transform_is_sane(M: np.ndarray) -> bool:
     return rot_deg <= MAX_ROTATION_DEG
 
 
-def akaze_affine(fixed_log, moving_log, slice_id,
-                 fixed_mask=None, moving_mask=None):
+def akaze_affine(fixed_log: np.ndarray, moving_log: np.ndarray, slice_id: str,
+                 fixed_mask: np.ndarray | None = None,
+                 moving_mask: np.ndarray | None = None):
     """
     Tissue-masked AKAZE detection → BFMatcher → RANSAC affine.
     Returns (M, n_matches, n_inliers, kp1, kp2, good_matches, inlier_mask).
@@ -789,8 +751,9 @@ def get_romav2_model():
     return _romav2_model
 
 
-def romav2_dense_warp(fixed_lin, moving_lin, slice_id, orig_h, orig_w,
-                      tissue_mask_full=None):
+def romav2_dense_warp(fixed_lin: np.ndarray, moving_lin: np.ndarray, slice_id: str,
+                      orig_h: int, orig_w: int,
+                      tissue_mask_full: np.ndarray | None = None):
     """
     Run RoMaV2 on a (fixed_img, moving_img) pair and return remap maps.
 
@@ -1026,7 +989,9 @@ def _draw_colorwheel_legend(ax):
 # CORE: REGISTER ONE SLICE PAIR
 # ─────────────────────────────────────────────────────────────────────────────
 
-def register_slice(fixed_np, moving_np, fixed_mask, moving_mask, slice_id=None):
+def register_slice(fixed_np: np.ndarray, moving_np: np.ndarray,
+                   fixed_mask: np.ndarray | None, moving_mask: np.ndarray | None,
+                   slice_id: str | None = None):
     """
     Full pipeline: AKAZE affine → RoMaV2 dense warp.
 
@@ -1341,7 +1306,6 @@ def register_slice(fixed_np, moving_np, fixed_mask, moving_mask, slice_id=None):
     )
 
     # Save interim plot
-    # Save interim plot
     try:
         save_registration_plot(
             fixed_roma_input, moving_roma_input, moving_roma_input_affine,
@@ -1422,13 +1386,9 @@ def save_registration_plot(fixed_img, moving_img, moving_img_affine,
     out_dir = os.path.join(OUTPUT_FOLDER, "interim_plots")
     os.makedirs(out_dir, exist_ok=True)
 
-    def norm(x):
-        p = np.percentile(x, 99.5)
-        return np.clip(x.astype(np.float32) / (p if p > 0 else 1), 0, 1)
-
-    f         = norm(fixed_img)
-    m_raw     = norm(moving_img)
-    m_affine  = norm(moving_img_affine)
+    f         = normalize_pct(fixed_img)
+    m_raw     = normalize_pct(moving_img)
+    m_affine  = normalize_pct(moving_img_affine)
     src_remap = moving_img_affine.astype(np.float32)
 
     is_rgb = fixed_img.ndim == 3
@@ -1463,7 +1423,7 @@ def save_registration_plot(fixed_img, moving_img, moving_img_affine,
             interpolation=cv2.INTER_LINEAR,
             borderMode=cv2.BORDER_CONSTANT, borderValue=0,
         )
-        axes[2].imshow(make_overlay(f, norm(warped)))
+        axes[2].imshow(make_overlay(f, normalize_pct(warped)))
         axes[2].set_title(
             f"RoMaV2 Warp: {lbl_base} [{label}]\nNCC={ncc_warp:.4f}", fontsize=10
         )
@@ -1567,10 +1527,7 @@ def generate_qc_montage(vol, output_folder, slice_ids=None,
     for idx, (z1, z2) in enumerate(all_pairs):
         s1 = vol[z1, channel_idx].astype(np.float32)
         s2 = vol[z2, channel_idx].astype(np.float32)
-        def norm(x):
-            p = np.percentile(x, 99.5)
-            return np.clip(x / (p if p > 0 else 1), 0, 1)
-        overlay = np.dstack((norm(s1), norm(s2), np.zeros_like(s1)))
+        overlay = np.dstack((normalize_pct(s1), normalize_pct(s2), np.zeros_like(s1)))
         axes_flat[idx].imshow(overlay)
         lbl1 = slice_ids[z1] if slice_ids else z1
         lbl2 = slice_ids[z2] if slice_ids else z2

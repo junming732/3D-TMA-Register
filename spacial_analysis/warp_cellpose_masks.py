@@ -1,13 +1,13 @@
 """
 warp_cellpose_masks.py
 ======================
-Apply saved deformation maps (from akaze_linear_romav2_warp.py) to CellPose
+Apply saved deformation maps (produced by the registration step) to CellPose
 segmentation masks that were run on the original, unregistered images.
 
 Workflow
 --------
 1. Run CellPose on the original (unregistered) DAPI channel images → label masks.
-2. Run the updated registration script → deformation_maps/*.npz are saved.
+2. Run registration (whichever variant script is current) → deformation_maps/*.npz are saved.
 3. Run this script → warped masks aligned to the registered space.
 
 Usage
@@ -40,7 +40,8 @@ Notes on interpolation
 Performance notes
 -----------------
 - label_to_rgb uses fully vectorised numpy fancy-indexing (no per-cell Python loop).
-- np.unique(..., return_counts=False) is called only when needed for QC titles.
+- Cell counts use mask.max() rather than np.unique(...), since CellPose label IDs
+  are contiguous integers — this avoids an O(n log n) sort that np.unique would do.
 - tifffile.imwrite uses bigtiff=True to handle masks > 4 GB safely.
 - The anchor-slice branch now reads the mask before writing (bug fix).
 """

@@ -26,12 +26,23 @@ Usage
 -----
     python link_3d_cells.py \
         --core_name   Core_01   \
-        --channel     DAPI      \
         [--min_overlap      30] \
         [--max_slices        5] \
         [--plot_qc            ] \
         [--n_tile_samples   50] \
-        [--patch_size_px    80]
+        [--patch_size_px    80] \
+        [--input_dir_name    'CellPose_DAPI_Warped_Bspline'] \
+        [--output_dir_name   'CellPose_DAPI_3D_Bspline']     \
+        [--denoised_dir_name 'Denoised_bspline']              \
+        [--coloc_channel     CD163] [--coloc_dir_name 'CellPose_CD163_3D_Bspline']
+
+    CellPose (and therefore this script) only ever runs on DAPI, so channel
+    naming is fixed rather than a CLI flag. --coloc_channel is the one place
+    a second channel name is still relevant — for comparing DAPI-linked 3D
+    cells against another channel's already-computed 3D stats.
+
+    The *_dir_name flags make this script independent of which registration
+    algorithm produced its inputs.
 """
 
 import os
@@ -62,8 +73,6 @@ parser = argparse.ArgumentParser(
     description='Overlap-based 3D cell linking across registered CellPose masks.'
 )
 parser.add_argument('--core_name',          type=str,   required=True)
-parser.add_argument('--channel',            type=str,   default='DAPI',
-                    help='Channel label used in mask filenames (default: DAPI)')
 parser.add_argument('--min_overlap',        type=int,   default=10,
                     help='Min shared pixels for two 2D cells to be linked across Z.')
 parser.add_argument('--min_slices',         type=int,   default=1,
@@ -85,6 +94,22 @@ parser.add_argument('--min_intensity_frac', type=float, default=0.0,
                          'Requires denoised OME-TIFF. (default: 0.0 = off)')
 parser.add_argument('--plot_qc',            action='store_true',
                     help='Save all QC plots and visual tile montages.')
+parser.add_argument('--input_dir_name',     type=str, default='CellPose_DAPI_Warped_Bspline',
+                    help='Folder under DATASPACE containing warped DAPI masks '
+                         '(default: CellPose_DAPI_Warped_Bspline). Independent of which '
+                         'registration algorithm produced the warp.')
+parser.add_argument('--output_dir_name',    type=str, default='CellPose_DAPI_3D_Bspline',
+                    help='Folder under DATASPACE to write 3D linkage output into '
+                         '(default: CellPose_DAPI_3D_Bspline).')
+parser.add_argument('--denoised_dir_name',  type=str, default='Denoised_bspline',
+                    help='Folder under DATASPACE containing <CORE>_denoised.ome.tif, '
+                         'used for intensity-gated linking and QC tile montages '
+                         '(default: Denoised_bspline).')
+parser.add_argument('--coloc_dir_name',     type=str, default=None,
+                    help='Folder under DATASPACE containing --coloc_channel\'s 3D stats CSV. '
+                         'If omitted, defaults to CellPose_{coloc_channel}_3D_Bspline — this '
+                         'assumes the co-localisation channel was linked with the same '
+                         'registration variant as this (DAPI) run.')
 args = parser.parse_args()
 
 # -----------------------------------------------------------------------------
@@ -105,12 +130,10 @@ PIXEL_SIZE_XY_UM     = 0.4961
 SECTION_THICKNESS_UM = 4.5
 
 TARGET_CORE = args.core_name
-CH_NAME     = args.channel
+CH_NAME     = 'DAPI'   # CellPose is only ever run on DAPI in this pipeline
 
-# INPUT_FOLDER  = os.path.join(config.DATASPACE, f"CellPose_{CH_NAME}_Warped",  TARGET_CORE)
-# OUTPUT_FOLDER = os.path.join(config.DATASPACE, f"CellPose_{CH_NAME}_3D",      TARGET_CORE)
-INPUT_FOLDER  = os.path.join(config.DATASPACE, f"CellPose_{CH_NAME}_Warped_Bspline",  TARGET_CORE)
-OUTPUT_FOLDER = os.path.join(config.DATASPACE, f"CellPose_{CH_NAME}_3D_Bspline",      TARGET_CORE)
+INPUT_FOLDER  = os.path.join(config.DATASPACE, args.input_dir_name,  TARGET_CORE)
+OUTPUT_FOLDER = os.path.join(config.DATASPACE, args.output_dir_name, TARGET_CORE)
 
 os.makedirs(OUTPUT_FOLDER, exist_ok=True)
 
@@ -319,8 +342,7 @@ for z, mask in enumerate(masks_2d):
 # Also used later in QC tile montages — loaded once here, reused there.
 # -----------------------------------------------------------------------------
 DENOISED_VOL_PATH = os.path.join(
-    # config.DATASPACE, 'Denoised', TARGET_CORE,
-    config.DATASPACE, 'Denoised_bspline', TARGET_CORE,
+    config.DATASPACE, args.denoised_dir_name, TARGET_CORE,
     f'{TARGET_CORE}_denoised.ome.tif',
 )
 dapi_vol_early = None   # memmap view (n_slices, H, W) — slices read on demand
@@ -435,11 +457,6 @@ for z in range(n_slices - 1):
     logger.info(
         f"  Z{z} (slice {slice_ids[z]:03d}) -> Z{z+1}: {n_links} cell links"
     )
-    # Pre-flight sanity check: if links per slice pair are implausibly high,
-    # min_overlap is almost certainly too low and get_valid_components will hang.
-    # A reasonable upper bound is 5x the number of cells in the slice — each
-    # nucleus should link to at most one or two neighbours in the next slice.
-    n_cells_z = len([k for k in cell_areas if k[0] == z])
 
 
 # -----------------------------------------------------------------------------
@@ -845,7 +862,6 @@ if args.plot_qc:
     PATCH = PATCH_SIZE_PX
 
     # -- reuse denoised volume loaded for intensity gating (or load now if not done) --
-    DENOISED_VOL = DENOISED_VOL_PATH
     dapi_vol = dapi_vol_early   # may be None — falls back to binary mask patches below
 
     def extract_patch(img: np.ndarray, cy: float, cx: float, half: int) -> np.ndarray:
@@ -1059,8 +1075,9 @@ if args.plot_qc:
 # -----------------------------------------------------------------------------
 
 if args.coloc_channel is not None:
+    coloc_dir_name = args.coloc_dir_name or f"CellPose_{args.coloc_channel}_3D_Bspline"
     coloc_csv = os.path.join(
-        config.DATASPACE, f"CellPose_{args.coloc_channel}_3D",
+        config.DATASPACE, coloc_dir_name,
         TARGET_CORE, f"{TARGET_CORE}_{args.coloc_channel}_3d_stats.csv"
     )
     if os.path.exists(coloc_csv):

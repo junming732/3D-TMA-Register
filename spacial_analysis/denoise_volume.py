@@ -96,6 +96,18 @@ parser.add_argument('--artifact_max_area_um2', type=float, default=5000.0,
                          'dust clump). Default: 5000 µm² ≈ ~20,000 px at 0.5 µm/px. '
                          'Set to 0 to disable. Raise if large real structures '
                          '(vessel cross-sections) are being removed.')
+parser.add_argument('--input_dir_name',    type=str,
+                    default='Filter_AKAZE_TissueMask_BSpline',
+                    help='Folder under DATASPACE containing the registered volume '
+                         '(default: Filter_AKAZE_TissueMask_BSpline). Change this to '
+                         'point at a different registration variant without editing the script.')
+parser.add_argument('--input_file_suffix', type=str,
+                    default='_AKAZE_TissueMask_Aligned.ome.tif',
+                    help='Filename suffix appended to <CORE_NAME> to find the input volume '
+                         '(default: _AKAZE_TissueMask_Aligned.ome.tif).')
+parser.add_argument('--output_dir_name',   type=str, default='Denoised_bspline',
+                    help='Folder under DATASPACE to write denoised output into '
+                         '(default: Denoised_bspline).')
 args = parser.parse_args()
 
 TARGET_CORE = args.core_name
@@ -103,22 +115,14 @@ TARGET_CORE = args.core_name
 # ─────────────────────────────────────────────────────────────────────────────
 # PATHS
 # ─────────────────────────────────────────────────────────────────────────────
-# INPUT_VOL = os.path.join(
-#     config.DATASPACE,
-#     'Filter_AKAZE_RoMaV2_Linear_Warp_map',
-#     TARGET_CORE,
-#     f'{TARGET_CORE}_AKAZE_RoMaV2_Linear_Aligned.ome.tif',
-# )
-
 INPUT_VOL = os.path.join(
     config.DATASPACE,
-    'Filter_AKAZE_TissueMask_BSpline',
+    args.input_dir_name,
     TARGET_CORE,
-    f'{TARGET_CORE}_AKAZE_TissueMask_Aligned.ome.tif',
+    f'{TARGET_CORE}{args.input_file_suffix}',
 )
 
-# OUTPUT_DIR  = os.path.join(config.DATASPACE, 'Denoised', TARGET_CORE)
-OUTPUT_DIR  = os.path.join(config.DATASPACE, 'Denoised_bspline', TARGET_CORE)
+OUTPUT_DIR  = os.path.join(config.DATASPACE, args.output_dir_name, TARGET_CORE)
 OUTPUT_VOL  = os.path.join(OUTPUT_DIR, f'{TARGET_CORE}_denoised.ome.tif')
 PREVIEW_DIR = os.path.join(OUTPUT_DIR, 'preview')
 QC_DIR      = os.path.join(OUTPUT_DIR, 'qc')
@@ -261,7 +265,7 @@ ARTIFACT_MIN_AREA_UM2 = 50.0   # ~50 µm² ≈ 200 px at 0.5 µm/px — tweak if
 def _um_to_px(um: float) -> int:
     return max(1, int(round(um / PIXEL_UM)))
 
-def _build_se(radius_um: float):
+def _build_se(radius_um: float) -> tuple[np.ndarray, int, int]:
     r_px = _um_to_px(radius_um)
     diam = 2 * r_px + 1
     return cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (diam, diam)), r_px, diam
@@ -822,7 +826,6 @@ def save_qc_slice_plot(
         axs[0].set_title(f'Raw Input\n(max={raw_max:.0f})', fontsize=16)
         axs[0].axis('off')
 
-        # Col 1: Stage 1 - Artifact Detection
         # Col 1: Stage 1 - Artifact Detection
         rgb_raw = np.stack([_stretch(raw)] * 3, axis=-1)
         if n_dust_px > 0:

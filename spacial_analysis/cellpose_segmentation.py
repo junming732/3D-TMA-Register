@@ -84,17 +84,19 @@ logger = logging.getLogger(__name__)
 DAPI_CONFIG = dict(
     idx                = 0,
     model              = 'nuclei',
-    diameter           = 14,     # 0.4961 µm/px → 25 px ≈ 12.4 µm; mid-range for typical nuclei (10–15 µm)
+    diameter           = 14,     # 0.4961 µm/px → 14 px ≈ 6.9 µm; tuned smaller than the
+                                 # nominal 10–15 µm nucleus range to catch tightly packed nuclei.
                                  # Override with --diameter 20 for small nuclei or --diameter 30 for large
-    flow_threshold     = 0.8,    # standard for nuclei; lower to 0.3 if over-segmenting
-    cellprob_threshold = -3.0,   # slightly permissive to catch dim/peripheral nuclei;
-                                 # raise to 0.0 if getting too much background
+    flow_threshold     = 0.8,    # permissive — tuned to reduce over-segmentation on this dataset;
+                                 # lower to 0.3-0.4 if under-segmenting instead
+    cellprob_threshold = -3.0,   # permissive to catch dim/peripheral nuclei;
+                                 # raise toward 0.0 if getting too much background
     notes = (
         "Nuclear segmentation at 0.4961 µm/px. Uses the 'nuclei' model (single-channel). "
-        "diameter=25 px ≈ 12.4 µm — mid-range for typical nuclei (10–15 µm). "
-        "Run with --min_size 200 to filter debris. "
+        "diameter=14 px ≈ 6.9 µm — tuned smaller than nominal (10-15 µm) to catch tightly "
+        "packed nuclei. Run with --min_size 50 (default) to filter debris. "
         "Tune: --diameter 20 (small nuclei) or --diameter 30 (large nuclei). "
-        "Lower cellprob_threshold to -2.0 if missing dim nuclei; raise to 0.0 to reduce background."
+        "Lower cellprob_threshold toward -4.0 if missing dim nuclei; raise toward 0.0 to reduce background."
     ),
 )
 
@@ -109,11 +111,11 @@ parser = argparse.ArgumentParser(
 )
 parser.add_argument('--core_name',          type=str,   required=True)
 parser.add_argument('--diameter',           type=float, default=None,
-                    help="Override nucleus diameter (px). Default: 25 px ≈ 12.4 µm at 0.4961 µm/px.")
+                    help="Override nucleus diameter (px). Default: 14 px ≈ 6.9 µm at 0.4961 µm/px.")
 parser.add_argument('--flow_threshold',     type=float, default=None,
-                    help="Override flow_threshold. Default: 0.4")
+                    help="Override flow_threshold. Default: 0.8")
 parser.add_argument('--cellprob_threshold', type=float, default=None,
-                    help="Override cellprob_threshold. Default: -1.0")
+                    help="Override cellprob_threshold. Default: -3.0")
 parser.add_argument('--use_gpu',            action='store_true',
                     help="Use GPU if available.")
 parser.add_argument('--batch_size',         type=int,   default=1,
@@ -123,7 +125,7 @@ parser.add_argument('--plot_qc',            action='store_true',
 parser.add_argument('--save_flows',         action='store_true',
                     help="Save flow magnitude TIFF alongside label masks.")
 parser.add_argument('--min_size',           type=int,   default=50,
-                    help="Minimum nucleus size in pixels (default: 200; ~π*(25/2)² * 0.5 at 0.4961 µm/px).")
+                    help="Minimum nucleus size in pixels (default: 50).")
 parser.add_argument('--slice_filter_yaml',  type=str,   default=None,
                     help="Path to slice_filter.yaml (default: <DATASPACE>/slice_filter.yaml).")
 args = parser.parse_args()
@@ -168,7 +170,7 @@ PIXEL_SIZE_XY_UM = 0.4961
 # UTILITIES
 # ─────────────────────────────────────────────────────────────────────────────
 
-def load_slice_filter(yaml_path, core_name):
+def load_slice_filter(yaml_path: str, core_name: str) -> set[int] | None:
     if not os.path.exists(yaml_path):
         return None
     with open(yaml_path) as fh:
@@ -187,12 +189,12 @@ def load_slice_filter(yaml_path, core_name):
     return allowed
 
 
-def get_slice_number(filename):
+def get_slice_number(filename: str) -> int:
     match = re.search(r"TMA_(\d+)_", os.path.basename(filename))
     return int(match.group(1)) if match else 0
 
 
-def load_slice(filepath):
+def load_slice(filepath: str) -> np.ndarray:
     arr = tifffile.imread(filepath)
     if arr.ndim == 2:
         arr = arr[np.newaxis]
@@ -341,11 +343,8 @@ def save_full_res_overlay_tiff(raw_dapi: np.ndarray, masks: np.ndarray, out_path
     Generates a 1:1 native resolution RGB overlay of the entire slice
     and saves it directly via tifffile, bypassing Matplotlib's DPI limits.
     """
-    # 1. Normalize DAPI to 8-bit
-    fg_pixels = raw_dapi[raw_dapi > 0]
-    p_lo, p_hi = np.percentile(fg_pixels, (0.5, 99.5)) if fg_pixels.size > 0 else (0, 1)
-    
-    dapi_norm = np.clip((raw_dapi.astype(np.float32) - p_lo) / max(p_hi - p_lo, 1e-6), 0, 1)
+    # 1. Normalize DAPI to 8-bit (shared helper — same normalisation as save_qc_plot)
+    dapi_norm = _percentile_stretch(raw_dapi, lo=0.5, hi=99.5)
     dapi_8bit = (dapi_norm * 255).astype(np.uint8)
     
     # 2. Broadcast to 3-channel RGB (H, W, 3)

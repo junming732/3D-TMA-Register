@@ -5,8 +5,8 @@
 # Step 4b: Dust-aware top-hat denoising across all cores
 #
 # Run this AFTER registration (Step 4) and BEFORE phenotyping (Step 5).
-# Reads registered volumes from Filter_AKAZE_RoMaV2_Linear_Warp_map/<CORE>/
-# Writes denoised OME-TIFFs to Denoised/<CORE>/<CORE>_denoised.ome.tif
+# Reads registered volumes from ${INPUT_DIR_NAME}/<CORE>/ (see CONFIGURATION
+# below) and writes denoised OME-TIFFs to ${OUTPUT_DIR_NAME}/<CORE>/<CORE>_denoised.ome.tif
 #
 # phenotype_cells.py auto-detects the denoised volume; if it is present it
 # uses it, otherwise it falls back to the raw volume.
@@ -28,10 +28,18 @@ WORKERS=4           # parallel threads per slice (raise if you have cores to spa
 OVERWRITE=true     # set to true to re-denoise cores that already have output
 PLOT_QC=true        # set to false to skip QC plots and save time
 
+# Registration variant to read from / denoised output folder to write to.
+# Change these three to point at a different registration variant instead of
+# editing denoise_volume.py directly — must match its --input_dir_name,
+# --input_file_suffix, --output_dir_name defaults/flags.
+INPUT_DIR_NAME="Filter_AKAZE_TissueMask_BSpline"
+INPUT_FILE_SUFFIX="_AKAZE_TissueMask_Aligned.ome.tif"
+OUTPUT_DIR_NAME="Denoised_bspline"
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
-DENOISE_SCRIPT="${PROJECT_ROOT}/registration/denoise_volume.py"
+DENOISE_SCRIPT="${PROJECT_ROOT}/spacial_analysis/denoise_volume.py"
 
 LOG_ROOT="${PROJECT_ROOT}/log/full_pipeline"
 LOG_DENOISE="${LOG_ROOT}/denoising"
@@ -95,8 +103,7 @@ for i in $(seq $START $END); do
     echo "------------------------------------------------------------"
 
     # Skip if registered volume doesn't exist
-    # REG_VOL="${DATASPACE}Filter_AKAZE_RoMaV2_Linear_Warp_map/${CORE_NAME}/${CORE_NAME}_AKAZE_RoMaV2_Linear_Aligned.ome.tif"
-    REG_VOL="${DATASPACE}Filter_AKAZE_TissueMask_BSpline/${CORE_NAME}/${CORE_NAME}_AKAZE_TissueMask_Aligned.ome.tif"
+    REG_VOL="${DATASPACE}${INPUT_DIR_NAME}/${CORE_NAME}/${CORE_NAME}${INPUT_FILE_SUFFIX}"
     if [ ! -f "${REG_VOL}" ]; then
         echo "  [SKIP] Registered volume not found at ${REG_VOL}"
         echo "         Run registration first."
@@ -107,8 +114,7 @@ for i in $(seq $START $END); do
 
     # Report if output already exists and overwrite is off (denoise_volume.py
     # will exit 0 cleanly in this case — we just surface it here for the log)
-    # DENOISED_OUT="${DATASPACE}Denoised/${CORE_NAME}/${CORE_NAME}_denoised.ome.tif"
-    DENOISED_OUT="${DATASPACE}Denoised_bspline/${CORE_NAME}/${CORE_NAME}_denoised.ome.tif"
+    DENOISED_OUT="${DATASPACE}${OUTPUT_DIR_NAME}/${CORE_NAME}/${CORE_NAME}_denoised.ome.tif"
     if [ -f "${DENOISED_OUT}" ] && [ "${OVERWRITE}" = false ]; then
         echo "  [SKIP] Denoised volume already exists -- skipping."
         echo "         Set OVERWRITE=true to re-run."
@@ -124,6 +130,9 @@ for i in $(seq $START $END); do
         --pixel_um   "${PIXEL_UM}" \
         --dust_pct   "${DUST_PCT}" \
         --workers    "${WORKERS}" \
+        --input_dir_name    "${INPUT_DIR_NAME}" \
+        --input_file_suffix "${INPUT_FILE_SUFFIX}" \
+        --output_dir_name   "${OUTPUT_DIR_NAME}" \
         ${QC_FLAG} \
         ${OVERWRITE_FLAG} \
         > "${LOG_DENOISE}/${CORE_NAME}.log" 2>&1
@@ -170,5 +179,5 @@ done
 
 echo "------------------------------------------------------------"
 echo "  Logs  : ${LOG_DENOISE}/"
-echo "  Output: ${DATASPACE}Denoised/<CORE_NAME>/<CORE_NAME>_denoised.ome.tif"
+echo "  Output: ${DATASPACE}${OUTPUT_DIR_NAME}/<CORE_NAME>/<CORE_NAME>_denoised.ome.tif"
 echo "============================================================"

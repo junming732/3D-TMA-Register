@@ -5,9 +5,10 @@
 # Step 5: Cell phenotyping across all cores
 #
 # Requires Steps 1-4 (registration -> CellPose DAPI -> warp) to have run.
-# Reads warped DAPI masks from CellPose_DAPI_Warped/<CORE_NAME>/
-# Reads registered volume from Filter_AKAZE_RoMaV2_Linear_Warp_map/<CORE_NAME>/
-# Writes per-core phenotype CSVs to Phenotypes/<CORE_NAME>/
+# Reads warped DAPI masks and the denoised volume from the folders configured
+# below (see CONFIGURATION) — independent of which registration algorithm
+# produced them, per phenotype_cells.py's --*_dir_name / --reg_stats_csv flags.
+# Writes per-core phenotype CSVs to ${OUTPUT_DIR_NAME}/<CORE_NAME>/
 # =============================================================================
 
 # -----------------------------------------------------------------------------
@@ -21,6 +22,18 @@ VENV_PATH="/home/junming/3D-TMA-Register/venv_312"
 # Phenotyping flags
 MIN_AREA_PX=200     # minimum nucleus area in pixels (consistent with CellPose min_size)
 PLOT_QC=true        # set to false to skip QC plots and save time
+
+# Registration-variant-dependent folders — must match whatever produced your
+# current inputs. Change these three (and REG_STATS_CSV below) to point at a
+# different registration run without editing phenotype_cells.py.
+DENOISED_DIR_NAME="Denoised_bspline"
+MASK_DIR_NAME="CellPose_DAPI_Warped_Bspline"
+OUTPUT_DIR_NAME="Phenotypes_Bspline"
+
+# Optional: full path to a registration_stats CSV (Slice_ID/Slice_Z columns) for
+# accurate slice-to-volume-index mapping. Leave empty to use sorted-filename-order
+# matching instead (phenotype_cells.py will warn clearly when it does this).
+REG_STATS_CSV=""
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
@@ -79,8 +92,7 @@ for i in $(seq $START $END); do
     echo "------------------------------------------------------------"
 
     # Skip if warped DAPI masks don't exist
-    # DAPI_MASK_DIR="${DATASPACE}CellPose_DAPI_Warped/${CORE_NAME}"
-    DAPI_MASK_DIR="${DATASPACE}CellPose_DAPI_Warped_Bspline/${CORE_NAME}"
+    DAPI_MASK_DIR="${DATASPACE}${MASK_DIR_NAME}/${CORE_NAME}"
     if [ ! -d "${DAPI_MASK_DIR}" ]; then
         echo "  [SKIP] No warped DAPI mask directory at ${DAPI_MASK_DIR}"
         echo "         Run CellPose (DAPI) + warp first."
@@ -97,21 +109,31 @@ for i in $(seq $START $END); do
         continue
     fi
 
-    # Skip if registered volume doesn't exist
-    # REG_VOL="${DATASPACE}Filter_AKAZE_RoMaV2_Linear_Warp_map/${CORE_NAME}/${CORE_NAME}_AKAZE_RoMaV2_Linear_Aligned.ome.tif"
-    # if [ ! -f "${REG_VOL}" ]; then
-    #     echo "  [SKIP] Registered volume not found at ${REG_VOL}"
-    #     echo "         Run registration first."
-    #     SKIP=$((SKIP + 1))
-    #     CORE_STATUS[$CORE_NAME]="SKIP_NO_VOLUME"
-    #     continue
-    # fi
+    # Skip if denoised volume doesn't exist (phenotype_cells.py reads the
+    # denoised volume, not the raw registered one)
+    DENOISED_VOL="${DATASPACE}${DENOISED_DIR_NAME}/${CORE_NAME}/${CORE_NAME}_denoised.ome.tif"
+    if [ ! -f "${DENOISED_VOL}" ]; then
+        echo "  [SKIP] Denoised volume not found at ${DENOISED_VOL}"
+        echo "         Run denoising first."
+        SKIP=$((SKIP + 1))
+        CORE_STATUS[$CORE_NAME]="SKIP_NO_VOLUME"
+        continue
+    fi
 
     echo "  [RUN] Phenotyping (${N_MASKS} DAPI mask slices)..."
+
+    REG_STATS_FLAG=""
+    if [ -n "${REG_STATS_CSV}" ]; then
+        REG_STATS_FLAG="--reg_stats_csv ${REG_STATS_CSV}"
+    fi
 
     python "${PHENO_SCRIPT}" \
         --core_name   "${CORE_NAME}" \
         --min_area_px "${MIN_AREA_PX}" \
+        --denoised_dir_name "${DENOISED_DIR_NAME}" \
+        --mask_dir_name     "${MASK_DIR_NAME}" \
+        --output_dir_name   "${OUTPUT_DIR_NAME}" \
+        ${REG_STATS_FLAG} \
         ${QC_FLAG} \
         > "${LOG_PHENO}/${CORE_NAME}.log" 2>&1
 
@@ -160,5 +182,5 @@ done
 
 echo "------------------------------------------------------------"
 echo "  Logs  : ${LOG_PHENO}/"
-# echo "  Output: ${DATASPACE}Phenotypes/<CORE_NAME>/<CORE_NAME>_phenotypes.csv"
+echo "  Output: ${DATASPACE}${OUTPUT_DIR_NAME}/<CORE_NAME>/<CORE_NAME>_phenotypes.csv"
 echo "============================================================"

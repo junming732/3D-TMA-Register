@@ -67,6 +67,14 @@ Usage
 -----
     python phenotype_cells.py --core_name Core_01 [--plot_qc] [--min_area_px 200]
                               [--no_consensus] [--bic_threshold 6.0]
+                              [--denoised_dir_name Denoised_bspline]
+                              [--mask_dir_name CellPose_DAPI_Warped_Bspline]
+                              [--output_dir_name Phenotypes_Bspline]
+                              [--reg_stats_csv /path/to/registration_stats.csv]
+
+    The three *_dir_name flags and --reg_stats_csv make this script independent
+    of which registration algorithm produced its inputs — point them at whatever
+    folder/CSV your current registration run actually wrote.
 """
 
 import os
@@ -120,27 +128,38 @@ parser.add_argument('--no_consensus',  action='store_true',
                     help='Skip cross-slice consensus threshold step.')
 parser.add_argument('--bic_threshold', type=float, default=DEFAULT_BIC_THRESHOLD,
                     help='ΔBIC required to prefer 2-component GMM (default: 6.0).')
+parser.add_argument('--denoised_dir_name', type=str, default='Denoised_bspline',
+                    help='Folder under DATASPACE containing <CORE>_denoised.ome.tif '
+                         '(default: Denoised_bspline). Independent of which '
+                         'registration algorithm produced the aligned volume.')
+parser.add_argument('--mask_dir_name', type=str, default='CellPose_DAPI_Warped_Bspline',
+                    help='Folder under DATASPACE containing warped CellPose masks '
+                         '(default: CellPose_DAPI_Warped_Bspline).')
+parser.add_argument('--output_dir_name', type=str, default='Phenotypes_Bspline',
+                    help='Folder under DATASPACE to write phenotype output into '
+                         '(default: Phenotypes_Bspline).')
+parser.add_argument('--reg_stats_csv', type=str, default=None,
+                    help='Full path to a registration_stats CSV with Slice_ID/Slice_Z '
+                         'columns, used for accurate slice-to-volume-index mapping. '
+                         'Filename and producing folder vary by registration algorithm, '
+                         'so this is a full explicit path, not assembled from a folder '
+                         'name. If omitted, falls back to sorted-filename-order matching '
+                         '(logged clearly — verify slice_z in the output CSV if used).')
 args = parser.parse_args()
 
 TARGET_CORE   = args.core_name
 BIC_THRESHOLD = args.bic_threshold
 
-# DENOISED_VOL = os.path.join(
-#     config.DATASPACE, 'Denoised', TARGET_CORE,
-#     f'{TARGET_CORE}_denoised.ome.tif',
-# )
 DENOISED_VOL = os.path.join(
-    config.DATASPACE, 'Denoised_bspline', TARGET_CORE,
+    config.DATASPACE, args.denoised_dir_name, TARGET_CORE,
     f'{TARGET_CORE}_denoised.ome.tif',
 )
 
 # ─────────────────────────────────────────────────────────────────────────────
 # PATHS
 # ─────────────────────────────────────────────────────────────────────────────
-# DAPI_MASK_DIR = os.path.join(config.DATASPACE, 'CellPose_DAPI_Warped', TARGET_CORE)
-# OUTPUT_DIR    = os.path.join(config.DATASPACE, 'Phenotypes', TARGET_CORE)
-DAPI_MASK_DIR = os.path.join(config.DATASPACE, 'CellPose_DAPI_Warped_Bspline', TARGET_CORE)
-OUTPUT_DIR    = os.path.join(config.DATASPACE, 'Phenotypes_Bspline', TARGET_CORE)
+DAPI_MASK_DIR = os.path.join(config.DATASPACE, args.mask_dir_name, TARGET_CORE)
+OUTPUT_DIR    = os.path.join(config.DATASPACE, args.output_dir_name, TARGET_CORE)
 QC_DIR        = os.path.join(OUTPUT_DIR, 'qc_plots')
 
 os.makedirs(OUTPUT_DIR, exist_ok=True)
@@ -811,32 +830,37 @@ def main() -> None:
         )
 
     # ── Slice ID → Z-index mapping ────────────────────────────────────────────
-    reg_stats_csv = os.path.join(
-        config.DATASPACE,
-        'Filter_AKAZE_RoMaV2_Linear_Warp_map',
-        TARGET_CORE,
-        'registration_stats_AKAZE_RoMaV2_Linear.csv',
-    )
     slice_id_to_z = {}
-    if os.path.exists(reg_stats_csv):
-        reg_df = pd.read_csv(reg_stats_csv)
-        slice_id_to_z = dict(
-            zip(reg_df['Slice_ID'].astype(int), reg_df['Slice_Z'].astype(int))
-        )
-        all_z     = set(range(n_slices))
-        missing_z = all_z - set(slice_id_to_z.values())
-        if len(missing_z) == 1:
-            mask_ids     = {get_slice_id(p) for p in
-                            glob.glob(os.path.join(DAPI_MASK_DIR, '*_DAPI_cp_masks_warped.tif'))}
-            unmapped_ids = mask_ids - set(slice_id_to_z.keys())
-            if len(unmapped_ids) == 1:
-                anchor_id = unmapped_ids.pop()
-                anchor_z  = missing_z.pop()
-                slice_id_to_z[anchor_id] = anchor_z
-                logger.info(f'Anchor slice inferred: ID={anchor_id} → Z={anchor_z}')
-        logger.info(f'Slice ID→Z mapping: {len(slice_id_to_z)} entries')
+    if args.reg_stats_csv:
+        if not os.path.exists(args.reg_stats_csv):
+            logger.warning(
+                f'--reg_stats_csv given but not found: {args.reg_stats_csv} — '
+                f'falling back to sorted-filename-order matching. '
+                f'Verify slice_z in the output CSV is correct for this core.'
+            )
+        else:
+            reg_df = pd.read_csv(args.reg_stats_csv)
+            slice_id_to_z = dict(
+                zip(reg_df['Slice_ID'].astype(int), reg_df['Slice_Z'].astype(int))
+            )
+            all_z     = set(range(n_slices))
+            missing_z = all_z - set(slice_id_to_z.values())
+            if len(missing_z) == 1:
+                mask_ids     = {get_slice_id(p) for p in
+                                glob.glob(os.path.join(DAPI_MASK_DIR, '*_DAPI_cp_masks_warped.tif'))}
+                unmapped_ids = mask_ids - set(slice_id_to_z.keys())
+                if len(unmapped_ids) == 1:
+                    anchor_id = unmapped_ids.pop()
+                    anchor_z  = missing_z.pop()
+                    slice_id_to_z[anchor_id] = anchor_z
+                    logger.info(f'Anchor slice inferred: ID={anchor_id} → Z={anchor_z}')
+            logger.info(f'Slice ID→Z mapping: {len(slice_id_to_z)} entries')
     else:
-        logger.warning('Registration stats CSV not found — using sorted-order matching.')
+        logger.warning(
+            'No --reg_stats_csv provided — using sorted-filename-order matching. '
+            'This assumes Slice_ID order matches true Z stack order; verify slice_z '
+            'in the output CSV if your registration reordered slices.'
+        )
 
     mask_files = sorted(
         glob.glob(os.path.join(DAPI_MASK_DIR, '*_DAPI_cp_masks_warped.tif')),

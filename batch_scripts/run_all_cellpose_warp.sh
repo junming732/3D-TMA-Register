@@ -24,11 +24,16 @@ CELLPOSE_FLAGS="--plot_qc"
 # Warp script extra flags
 WARP_FLAGS="--plot_qc"
 
+# Registration variant to read deformation maps from — must match the
+# INPUT_DIR_NAME used in run_all_denoising.sh / denoise_volume.py so mask
+# warping and volume denoising stay aligned to the same registration run.
+DEFORM_DIR_NAME="Filter_AKAZE_TissueMask_BSpline"
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
-CP_SCRIPT="${PROJECT_ROOT}/registration/cellpose_segmentation.py"
-WARP_SCRIPT="${PROJECT_ROOT}/registration/warp_cellpose_masks.py"
+CP_SCRIPT="${PROJECT_ROOT}/spacial_analysis/cellpose_segmentation.py"
+WARP_SCRIPT="${PROJECT_ROOT}/spacial_analysis/warp_cellpose_masks.py"
 
 LOG_ROOT="${PROJECT_ROOT}/log/full_pipeline"
 LOG_CP="${LOG_ROOT}/cellpose"
@@ -105,7 +110,7 @@ for i in $(seq $START $END); do
 
     if [ $CP_OK -eq 1 ]; then
         MASK_DIR="${DATASPACE}CellPose_DAPI/${CORE_NAME}"
-        DEFORM_DIR="${DATASPACE}Filter_AKAZE_RoMaV2_Linear_Warp_map/${CORE_NAME}/deformation_maps"
+        DEFORM_DIR="${DATASPACE}${DEFORM_DIR_NAME}/${CORE_NAME}/deformation_maps"
         OUT_DIR="${DATASPACE}CellPose_DAPI_Warped/${CORE_NAME}"
 
         if [ ! -d "${MASK_DIR}" ]; then
