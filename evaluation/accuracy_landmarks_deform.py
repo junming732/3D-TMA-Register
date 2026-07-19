@@ -1,46 +1,66 @@
 """
-valis_accuracy_landmarks.py
-─────────────────────────────────────────
-Compute landmark-based TRE for the VALIS pipeline.
+accuracy_landmarks_deform.py
+───────────────────────────────────
+Compute registration accuracy using rough annotations as landmarks, for
+either deformation-map-based registration pipeline: BSpline (AKAZE +
+TissueMask BSpline) or RoMaV2 (AKAZE + RoMaV2 dense warp), selected via
+--pipeline.
 
-VALIS stores its transforms in a pickled Registrar object — no separate
-deformation .npz files needed.  This script:
-  1. Reloads the pickled registrar saved by valis_register_core2.py
-  2. For each annotation, finds the matching Slide object by slice index
-  3. Calls slide_obj.warp_xy() to forward-warp the raw (x, y) point
-  4. Computes TRE identically to registration_accuracy_landmarks.py
-     so results are directly comparable across pipelines
+This merges what were previously two near-identical scripts
+(accuracy_landmarks_bspline.py, accuracy_landmarks_roma.py) — a diff between
+them showed zero remaining logic difference after landmark_accuracy_common.py
+/ landmark_accuracy_deform_common.py were extracted, only path/label strings.
+See PIPELINE_CONFIGS below for exactly what differs between the two.
 
-Coordinate notes
+NOT used for VALIS — that pipeline stores its transform in a pickled
+Registrar object and loads overlay images per-slice rather than from a
+merged volume, so it isn't a config-only difference; see
+valis_accuracy_landmarks.py.
+
+Each mclass groups annotations that mark the **same anatomical structure**
+across z-levels.  After warping every annotation point into registered space,
+all points of the same mclass should overlap.  The spread of those warped
+points is a direct measure of registration accuracy.
+
+Metrics computed
 ────────────────
-- VALIS uses the THUMBNAIL resolution internally for transforms.
-  warp_xy() accepts coordinates in the *original full-resolution* image
-  space and returns coordinates in registered (full-resolution) space,
-  handling the scale internally — so no manual scaling is needed.
-- z-index mapping: slice_idx = z_json - 1  (same as all other pipelines,
-  see z_json_to_slice_idx in landmark_accuracy_common.py)
-- VALIS sorts/orders slides by filename; imgs_ordered=True was NOT set in
-  valis_register_core2.py, so VALIS may have reordered slices by similarity.
-  This script matches annotations to slides by the TMA slice number in the
-  filename, not by position, to be robust to reordering.
+Per mclass (per structure):
+  - Pairwise Euclidean distance between all warped points (in pixels and µm)
+  - Mean, median, max, std of pairwise distances
+
+Per-slice (relative to its neighbours):
+
+Global summary:
+  - Mean / median / max target registration error (TRE) across all landmarks
+
+Outputs
+───────
+  registration_accuracy_landmarks.csv   — one row per annotation point
+  registration_accuracy_summary.csv     — one row per mclass
+  registration_accuracy_plot.png        — scatter + boxplot
+
+All written to:
+  <OUTPUT_FOLDER>/<verify_subdir>/   (verify_subdir is pipeline-specific, see below)
 
 Usage
 ─────
-    python valis_accuracy_landmarks.py \
-        --core_name Core_09 \
+    python accuracy_landmarks_deform.py \
+        --core_name core_09 --pipeline bspline \
         --annotation_json /path/to/rough_annotation_core_09.json \
-        [--pixel_size_um 0.4961] \
-        [--landmark_id all]
+        [--pixel_size_um 0.4961]   # physical pixel size (default from registration script)
+        [--landmark_id all]             # 'all' or comma-separated ints
+
+    python accuracy_landmarks_deform.py --core_name core_09 --pipeline roma \
+        --annotation_json /path/to/rough_annotation_core_09.json
 """
 
-import os, re, sys, json, glob, argparse, pickle
+import os, re, sys, json, glob, argparse, yaml
 import numpy as np
 import pandas as pd
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
-from matplotlib.colors import TABLEAU_COLORS
 from collections import defaultdict
 
 # ── config.py ─────────────────────────────────────────────────────────────────
@@ -51,82 +71,110 @@ import config
 from landmark_accuracy_common import (
     z_json_to_slice_idx, get_slice_number, make_two_channel_rgb, _annotate_overlay_ax,
 )
+from landmark_accuracy_deform_common import (
+    load_slice_filter, find_deform_npz, warp_point, load_slice_channel_from_vol,
+)
+
+# ─── PIPELINE CONFIG — the only real difference between BSpline and RoMaV2 ────
+PIPELINE_CONFIGS = {
+    'bspline': dict(
+        label               = 'Pipeline A',
+        work_output_dir     = 'Filter_AKAZE_TissueMask_BSpline',
+        verify_subdir       = 'annotation_verification_bspline',
+        vol_filename_suffix = '_AKAZE_TissueMask_Aligned.ome.tif',
+        plot_filename_suffix = '',
+    ),
+    'roma': dict(
+        label               = 'Pipeline C',
+        work_output_dir     = 'Filter_AKAZE_RoMaV2_Linear_Warp_map_hr_isolated',
+        verify_subdir       = 'annotation_verification_Romav2',
+        vol_filename_suffix = '_AKAZE_RoMaV2_Linear_Aligned.ome.tif',
+        plot_filename_suffix = '_Romav2',
+    ),
+}
 
 # ─── CLI ──────────────────────────────────────────────────────────────────────
 parser = argparse.ArgumentParser()
 parser.add_argument('--core_name',       type=str, required=True)
 parser.add_argument('--annotation_json', type=str, required=True)
-parser.add_argument('--pixel_size_um',   type=float, default=0.4961)
-parser.add_argument('--landmark_id',          type=str,   default='all')
-parser.add_argument('--work_output_dir', type=str, default='VALIS_Baseline_Eval',
-                    help='Folder under DATASPACE holding VALIS registration output '
-                         '(default: VALIS_Baseline_Eval). Override to point at a '
-                         'different experiment run.')
+parser.add_argument('--pipeline',        type=str, required=True,
+                    choices=sorted(PIPELINE_CONFIGS.keys()),
+                    help='Which deformation-map-based registration pipeline to evaluate.')
+parser.add_argument('--pixel_size_um',   type=float, default=0.4961,
+                    help='Pixel size in µm (default 0.4961, from registration script).')
+parser.add_argument('--landmark_id',          type=str, default='all')
+parser.add_argument('--work_output_dir', type=str, default=None,
+                    help='Override the folder under DATASPACE holding this pipeline\'s '
+                         'registration output (default: PIPELINE_CONFIGS[--pipeline]'
+                         '[\'work_output_dir\']). Use this to point at a different '
+                         'experiment run without editing PIPELINE_CONFIGS.')
+parser.add_argument('--verify_subdir', type=str, default=None,
+                    help='Override the annotation_verification subfolder name '
+                         '(default: PIPELINE_CONFIGS[--pipeline][\'verify_subdir\']).')
 args = parser.parse_args()
 
-TARGET_CORE   = args.core_name
-PIXEL_SIZE_UM = args.pixel_size_um
+PCFG = PIPELINE_CONFIGS[args.pipeline]
+if args.work_output_dir is not None:
+    PCFG = {**PCFG, 'work_output_dir': args.work_output_dir}
+if args.verify_subdir is not None:
+    PCFG = {**PCFG, 'verify_subdir': args.verify_subdir}
+
+TARGET_CORE    = args.core_name
+PIXEL_SIZE_UM  = args.pixel_size_um
 
 import logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(levelname)s | %(message)s')
 logger = logging.getLogger(__name__)
 
-# ─── PATHS — mirrors valis_register_core2.py exactly ─────────────────────────
-WORK_OUTPUT   = os.path.join(config.DATASPACE, args.work_output_dir)
-# VALIS creates <dst_dir>/<name>/ internally, so the actual output is one level deeper
-OUTPUT_FOLDER = os.path.join(WORK_OUTPUT, TARGET_CORE, TARGET_CORE)
-VERIFY_OUTPUT = os.path.join(OUTPUT_FOLDER, "annotation_verification_valis")
+# ─── PATHS — mirrors registration script ──────────────────────────────────────
+DATA_BASE_PATH = os.path.join(config.DATASPACE, "TMA_Cores_Grouped_Rotate_Conformed")
+INPUT_FOLDER   = os.path.join(DATA_BASE_PATH, TARGET_CORE)
+WORK_OUTPUT    = os.path.join(config.DATASPACE, PCFG['work_output_dir'])
+OUTPUT_FOLDER  = os.path.join(WORK_OUTPUT, TARGET_CORE)
+DEFORM_FOLDER     = os.path.join(OUTPUT_FOLDER, "deformation_maps")
+VERIFY_OUTPUT     = os.path.join(OUTPUT_FOLDER, PCFG['verify_subdir'])
+SLICE_FILTER_YAML = os.path.join(config.DATASPACE, "slice_filter.yaml")
 os.makedirs(VERIFY_OUTPUT, exist_ok=True)
 
-# VALIS saves the pickled registrar in <output_dir>/data/<name>.pickle
-PICKLE_PATH = os.path.join(OUTPUT_FOLDER, "data", f"{TARGET_CORE}.pickle")
-REG_SLIDES_DIR = os.path.join(OUTPUT_FOLDER, "..", "registered_slides")
-REG_SLIDES_DIR = os.path.normpath(REG_SLIDES_DIR)
-
 logger.info(f"Core         : {TARGET_CORE}")
-logger.info(f"Pickle       : {PICKLE_PATH}")
+logger.info(f"Deform folder: {DEFORM_FOLDER}")
 logger.info(f"Output       : {VERIFY_OUTPUT}")
 
-# ─── SLICE INDEX → SLIDE NAME MAPPING ────────────────────────────────────────
-# Built after loading the registrar from registrar.slide_dict, which maps
-# slide name → Slide object for every file VALIS registered.
-# We sort slide names by TMA number (same sort as the raw file list) so that
-# position in that sorted order == slice_idx.
-# get_slice_number imported from landmark_accuracy_common (safe here even
-# though this script passes bare slide names, not full paths — it applies
-# os.path.basename() internally, which is a no-op on an already-bare name).
-
-# ─── LOAD PICKLED REGISTRAR ───────────────────────────────────────────────────
-if not os.path.isfile(PICKLE_PATH):
-    # VALIS sometimes names the pickle differently — search for it
-    candidates = glob.glob(os.path.join(OUTPUT_FOLDER, "data", "*.pickle"))
-    if candidates:
-        PICKLE_PATH = candidates[0]
-        logger.warning(f"Using pickle found at: {PICKLE_PATH}")
-    else:
-        logger.error(f"No pickle file found in {os.path.join(OUTPUT_FOLDER, 'data')}")
-        logger.error("Run valis_register_core2.py first to generate the registrar.")
-        sys.exit(1)
-
-logger.info("Loading pickled VALIS registrar …")
-try:
-    from valis import registration
-    registrar = registration.load_registrar(PICKLE_PATH)
-    logger.info("  Registrar loaded successfully.")
-except Exception as e:
-    logger.error(f"Failed to load registrar: {e}")
+# ─── FILE LIST — mirrors registration script ──────────────────────────────────
+FILE_LIST = sorted(glob.glob(os.path.join(INPUT_FOLDER, "*.ome.tif")), key=get_slice_number)
+if not FILE_LIST:
+    logger.error(f"No .ome.tif files in {INPUT_FOLDER}")
     sys.exit(1)
+logger.info(f"Found {len(FILE_LIST)} slices")
 
-# Build slice_idx → Slide mapping from the registrar itself — no file scanning needed.
-# registrar.slide_dict maps slide name → Slide object.
-# Sort by TMA number so position == slice_idx, same as other pipelines.
-slide_names_sorted = sorted(registrar.slide_dict.keys(), key=get_slice_number)
-idx_to_slide = {i: registrar.slide_dict[name]
-                for i, name in enumerate(slide_names_sorted)}
-logger.info(f"Registrar contains {len(idx_to_slide)} slides:")
-for i, name in enumerate(slide_names_sorted):
-    logger.info(f"  slice_idx={i:02d}  ->  {name}")
+# ─── FILTERED SLICE LIST + SLICE→VOL_Z MAP ────────────────────────────────────
+# The registered volume only contains filtered slices, so Z indices in the
+# volume correspond to positions in FILTERED_FILE_LIST, not FILE_LIST.
+# Mirrors the working RoMaV2 accuracy script exactly.
 
+allowed_positions = load_slice_filter(SLICE_FILTER_YAML, TARGET_CORE)
+
+if allowed_positions is not None:
+    FILTERED_FILE_LIST = [f for i, f in enumerate(FILE_LIST) if i in allowed_positions]
+    logger.info(f"Slice filter active: {len(FILTERED_FILE_LIST)}/{len(FILE_LIST)} slices kept.")
+else:
+    FILTERED_FILE_LIST = FILE_LIST
+    logger.info("No slice filter — using all slices.")
+
+# slice_idx (0-based position into FILE_LIST) → vol_z (position in the
+# registered volume, which only contains filtered slices). See
+# z_json_to_slice_idx in landmark_accuracy_common.py for the annotation-JSON
+# to slice_idx conversion (z_json - 1).
+file_to_orig_pos = {f: i for i, f in enumerate(FILE_LIST)}
+SLICE_IDX_TO_VOL_Z = {
+    file_to_orig_pos[f]: vol_z
+    for vol_z, f in enumerate(FILTERED_FILE_LIST)
+}
+logger.info(f"Slice→vol_z map: {SLICE_IDX_TO_VOL_Z}")
+
+
+# ─── DEFORMATION HELPERS ──────────────────────────────────────────────────────
+# find_deform_npz / warp_point imported from landmark_accuracy_deform_common.
 
 # ─── LOAD ANNOTATIONS ─────────────────────────────────────────────────────────
 with open(args.annotation_json) as fh:
@@ -136,14 +184,11 @@ annotations = ann_data
 logger.info(f"Loaded {len(annotations)} annotations.")
 
 if args.landmark_id.lower() != 'all':
-    keep        = set(int(m) for m in args.landmark_id.split(','))
+    keep = set(int(m) for m in args.landmark_id.split(','))
     annotations = [a for a in annotations if a['landmark_id'] in keep]
     logger.info(f"After mclass filter: {len(annotations)} annotations.")
 
-# ─── WARP EVERY LANDMARK USING VALIS ─────────────────────────────────────────
-# warp_xy(xy): xy is (N,2) float64 in original full-res image space
-#              returns (N,2) in registered space
-
+# ─── WARP EVERY LANDMARK INTO REGISTERED SPACE ───────────────────────────────
 records = []
 
 for ann in annotations:
@@ -154,24 +199,21 @@ for ann in annotations:
     mc        = ann['landmark_id']
     ann_id    = ann['landmark_id']
 
-    if slice_idx not in idx_to_slide:
-        logger.warning(f"  id={ann_id} z_json={z_json}: slice_idx={slice_idx} "
-                       f"not in registrar ({len(idx_to_slide)} slides) — skipping.")
+    npz_path  = find_deform_npz(slice_idx, TARGET_CORE, DEFORM_FOLDER)
+
+    if npz_path is None:
+        logger.warning(f"  id={ann_id} z_json={z_json}: no deform .npz — skipping.")
         continue
 
-    slide_obj = idx_to_slide[slice_idx]
-
     try:
-        xy_raw    = np.array([[x_raw, y_raw]], dtype=np.float64)
-        xy_warped = slide_obj.warp_xy(xy_raw)
-        wx, wy    = float(xy_warped[0, 0]), float(xy_warped[0, 1])
+        wx, wy = warp_point(x_raw, y_raw, npz_path)
     except Exception as e:
-        logger.warning(f"  id={ann_id} z_json={z_json}: warp_xy failed ({e}) — skipping.")
+        logger.warning(f"  id={ann_id} z_json={z_json}: warp failed ({e}) — skipping.")
         continue
 
     records.append({
         'id':        ann_id,
-        'landmark_id':    mc,
+        'landmark_id': mc,
         'z_json':    z_json,
         'slice_idx': slice_idx,
         'x_raw':     x_raw,
@@ -184,7 +226,7 @@ df = pd.DataFrame(records)
 logger.info(f"Successfully warped {len(df)} / {len(annotations)} landmarks.")
 
 if df.empty:
-    logger.error("No landmarks warped. Check the registrar and file matching.")
+    logger.error("No landmarks could be warped. Check deformation .npz files.")
     sys.exit(1)
 
 # ─── COMPUTE TRE (Fitzpatrick et al. 1998 — consecutive pairwise) ─────────────
@@ -274,21 +316,22 @@ logger.info(f"  std   TRE      : {all_tre_px.std():.2f} px  = {all_tre_um.std():
 logger.info("──────────────────────────────────────────────────────────────")
 
 # ─── SAVE CSVs ────────────────────────────────────────────────────────────────
-detail_csv  = os.path.join(VERIFY_OUTPUT, f"{TARGET_CORE}_VALIS_landmark_accuracy_detail.csv")
-summary_csv = os.path.join(VERIFY_OUTPUT, f"{TARGET_CORE}_VALIS_landmark_accuracy_summary.csv")
+detail_csv  = os.path.join(VERIFY_OUTPUT, f"{TARGET_CORE}_landmark_accuracy_detail.csv")
+summary_csv = os.path.join(VERIFY_OUTPUT, f"{TARGET_CORE}_landmark_accuracy_summary.csv")
 df_detail.to_csv(detail_csv,   index=False)
 df_summary.to_csv(summary_csv, index=False)
 logger.info(f"Detail CSV  → {detail_csv}")
 logger.info(f"Summary CSV → {summary_csv}")
 
 # ─── PLOTS ────────────────────────────────────────────────────────────────────
+from matplotlib.colors import TABLEAU_COLORS
 colour_list   = list(TABLEAU_COLORS.values())
 all_mclasses  = sorted(df_detail['landmark_id'].unique())
 mclass_colour = {mc: colour_list[i % len(colour_list)] for i, mc in enumerate(all_mclasses)}
 
 # 1 row, 2 columns. Increased figsize to accommodate larger fonts.
 fig, axes = plt.subplots(1, 2, figsize=(16, 7))
-fig.suptitle(f"Pipeline B {TARGET_CORE} — Landmark Registration Accuracy  "
+fig.suptitle(f"{PCFG['label']}: {TARGET_CORE} — Landmark Registration Accuracy  "
              f"(pixel size = {PIXEL_SIZE_UM} µm)",
              fontsize=18, fontweight='bold')
 
@@ -296,7 +339,7 @@ fig.suptitle(f"Pipeline B {TARGET_CORE} — Landmark Registration Accuracy  "
 ax = axes[0]
 for mc in all_mclasses:
     grp = df_detail[df_detail['landmark_id'] == mc].sort_values('z_json_a').reset_index(drop=True)
-    # Convert from 0-based slice_idx to 1-based slice index for labels
+    # Convert from 0-based slice_idx to 1-based slice index
     x_labels = [f"{int(r.slice_idx_a) + 1}→{int(r.slice_idx_b) + 1}" for _, r in grp.iterrows()]
     x_pos    = np.arange(len(grp))
     ax.plot(x_pos, grp['TRE_um'], 'o-',
@@ -309,8 +352,7 @@ for mc in all_mclasses:
 ax.axhline(all_tre_um.mean(), color='black', linestyle='--', lw=2,
            label=f"global mean {all_tre_um.mean():.1f} µm")
 ax.set_title("TRE per consecutive slice pair", fontsize=15)
-# Removed the explicit z_json_a -> z_json_b text from the axis label
-ax.set_xlabel("slice pair", fontsize=13)
+ax.set_xlabel("slice pair", fontsize=13)  # Removed z_json_a -> z_json_b reference
 ax.set_ylabel("TRE (µm)", fontsize=13)
 ax.tick_params(axis='both', labelsize=11)
 ax.legend(fontsize=11, ncol=2)
@@ -344,14 +386,14 @@ plt.tight_layout()
 # Provide a slight buffer at the top so the main title doesn't overlap the subplots
 plt.subplots_adjust(top=0.88)
 
-plot_path = os.path.join(VERIFY_OUTPUT, f"{TARGET_CORE}_landmark_accuracy_plot_Valis.png")
+plot_path = os.path.join(VERIFY_OUTPUT, f"{TARGET_CORE}_landmark_accuracy_plot{PCFG['plot_filename_suffix']}.png")
 fig.savefig(plot_path, dpi=150, bbox_inches='tight')
 plt.close(fig)
 logger.info(f"Plot → {plot_path}")
 
-# ─── PRINT SUMMARY ────────────────────────────────────────────────────────────
+# ─── PRINT SUMMARY TABLE ──────────────────────────────────────────────────────
 print("\n" + "="*70)
-print(f"  {TARGET_CORE}  —  VALIS Landmark Registration Accuracy")
+print(f"  {TARGET_CORE}  —  Landmark Registration Accuracy")
 print("="*70)
 print(df_summary.to_string(index=False))
 print("="*70)
@@ -364,62 +406,41 @@ print("="*70 + "\n")
 # Layout: 2 rows × N columns per figure.
 #   Row 0 — DAPI overlay  (channel 0)
 #   Row 1 — CK overlay    (channel CK_CHANNEL_IDX)
+# Both rows use the same red/green blend and identical annotations so the
+# error vector is visible against both stains.
 
 DAPI_CHANNEL_IDX = 0
 CK_CHANNEL_IDX   = 6
 
+# load_slice_channel_from_vol, make_two_channel_rgb, _annotate_overlay_ax
+# imported from landmark_accuracy_common / landmark_accuracy_deform_common.
 
-def load_slice_channel_valis(slice_idx, channel_idx):
-    slide_obj = idx_to_slide.get(slice_idx)
-    if slide_obj is None:
-        return None
 
-    # Find registered output file instead of raw src_f
-    src_basename = os.path.splitext(os.path.basename(slide_obj.src_f))[0]
-    candidates = glob.glob(os.path.join(REG_SLIDES_DIR, f"*{src_basename}*"))
-    if not candidates:
-        logger.warning(f"No registered file found for slice_idx={slice_idx} "
-                       f"(looking for *{src_basename}* in {REG_SLIDES_DIR})")
-        return None
-    reg_path = candidates[0]
-
+def plot_adjacent_slice_overlays(df_detail,
+                                 dapi_crop_half=50,
+                                 ck_crop_half=150,
+                                 dpi=120):
+    """
+    For each mclass with ≥2 z-levels, produce one PNG with:
+      Row 0 — DAPI (ch 0) overlay — tighter crop (dapi_crop_half=50)
+      Row 1 — CK   (ch 6) overlay — wider crop  (ck_crop_half=150)
+    Generates multiple files (max 3 columns) if the number of pairs is large.
+    """
     try:
         import tifffile
-        img = tifffile.imread(reg_path)
-        if img.ndim == 2:
-            ch = img
-        elif img.ndim == 3:
-            ch = img[channel_idx]
-        else:
-            ch = img[0, channel_idx]
-        ch = ch.astype(np.float32)
-        p2, p98 = np.percentile(ch, 2), np.percentile(ch, 98)
-        if p98 > p2:
-            ch = np.clip((ch - p2) / (p98 - p2), 0, 1)
-        return ch
-    except Exception as e:
-        logger.warning(f"Could not load registered slice_idx={slice_idx}: {e}")
-        return None
-
-
-# make_two_channel_rgb, _annotate_overlay_ax imported from landmark_accuracy_common.
-
-
-def plot_adjacent_slice_overlays_valis(df_detail,
-                                       dapi_crop_half=50,
-                                       ck_crop_half=150,
-                                       dpi=120):
-    """
-    For each mclass with ≥2 z-levels, produce one PNG with a horizontal grid layout:
-      Row 0 — DAPI (ch 0) cyan/magenta overlay — tighter crop (dapi_crop_half=50)
-      Row 1 — CK   (ch 6) cyan/magenta overlay — wider crop  (ck_crop_half=150)
-    Each column corresponds to an adjacent slice pair.
-    """
-    try:
-        import tifffile  # noqa
     except ImportError:
         logger.warning("tifffile not installed — skipping adjacent-slice overlays.")
         return
+
+    reg_path = os.path.join(OUTPUT_FOLDER,
+                            f"{TARGET_CORE}{PCFG['vol_filename_suffix']}")
+    if not os.path.isfile(reg_path):
+        logger.warning(f"Registered volume not found at {reg_path} — skipping overlays.")
+        return
+
+    logger.info(f"Loading registered volume from {reg_path} ...")
+    reg_vol = tifffile.imread(reg_path)  
+    logger.info(f"Registered volume shape: {reg_vol.shape}")
 
     max_cols = 3
 
@@ -429,31 +450,24 @@ def plot_adjacent_slice_overlays_valis(df_detail,
         if n_pairs < 1:
             continue
 
-        # Split pairs into chunks to prevent overly wide figures
         chunks = [grp_sorted.iloc[i:i + max_cols] for i in range(0, n_pairs, max_cols)]
 
         for chunk_idx, chunk in enumerate(chunks):
             n_cols = len(chunk)
             
-            # ─── GEOMETRY FIX ────────────────────────────────────────────────
-            # Maintained original grid direction (2 Rows x n_cols Columns).
-            # Expanded baseline canvas width to (10 * n_cols) and height to 21 inches.
-            # This allocates a 10x10.5 inch space per square subplot, giving the
-            # long figure title natural room to fit without generating white side margins.
+            # Expanded canvas size to 10x21 inches (10x10 per square subplot + title clearance).
+            # This balances the layout grid's aspect ratio and completely eliminates side padding.
             fig, axes = plt.subplots(2, n_cols,
                                      figsize=(10 * n_cols, 21),
                                      squeeze=False)
 
             part_str = f" (Part {chunk_idx + 1}/{len(chunks)})" if len(chunks) > 1 else ""
-            
-            # Expanded main title font size with newline padding
             fig.suptitle(
-                f"Pipeline B: {TARGET_CORE} | landmark {mc}{part_str}\n"
+                f"{PCFG['label']}: {TARGET_CORE} | landmark {mc}{part_str}\n"
                 f"Adjacent-slice overlay",
                 fontsize=28, fontweight='bold'
             )
 
-            # Enumerate slice pairs along the horizontal columns
             for col, (_, pair_row) in enumerate(chunk.iterrows()):
                 sidx_a = int(pair_row['slice_idx_a'])
                 sidx_b = int(pair_row['slice_idx_b'])
@@ -471,15 +485,13 @@ def plot_adjacent_slice_overlays_valis(df_detail,
                 mid_x   = (wx_a + wx_b) / 2
                 mid_y   = (wy_a + wy_b) / 2
 
-                # Enumerate channel stains along the vertical rows
                 for row_idx, (ch_idx, ch_label, ch_crop) in enumerate([
                         (DAPI_CHANNEL_IDX, "DAPI", dapi_crop_half),
                         (CK_CHANNEL_IDX,   "CK",   ck_crop_half)]):
 
-                    # Maintained original matrix array indexing layout
                     ax    = axes[row_idx][col]
-                    img_a = load_slice_channel_valis(sidx_a, ch_idx)
-                    img_b = load_slice_channel_valis(sidx_b, ch_idx)
+                    img_a = load_slice_channel_from_vol(reg_vol, sidx_a, ch_idx, SLICE_IDX_TO_VOL_Z)
+                    img_b = load_slice_channel_from_vol(reg_vol, sidx_b, ch_idx, SLICE_IDX_TO_VOL_Z)
 
                     if img_a is None and img_b is None:
                         ax.set_title(f"{ch_label}  z {z_a}→{z_b}\n(unavailable)", fontsize=20)
@@ -501,16 +513,18 @@ def plot_adjacent_slice_overlays_valis(df_detail,
                                          x0, x1, y0, y1, z_a, z_b,
                                          dist_px, dist_um, ch_label)
 
-            # Restrict subplots to 95% height to prevent overlapping with the main title text
+            # Restrict subplots to 95% height to prevent overlapping with the large fig title
             plt.tight_layout(rect=[0, 0, 1, 0.95])
             
             file_suffix  = f"_pt{chunk_idx + 1}" if len(chunks) > 1 else ""
             overlay_path = os.path.join(
-                VERIFY_OUTPUT, f"{TARGET_CORE}_VALIS_adjacent_overlay_mclass{mc}{file_suffix}.png"
+                VERIFY_OUTPUT, f"{TARGET_CORE}_adjacent_overlay_mclass{mc}{file_suffix}.png"
             )
             fig.savefig(overlay_path, dpi=dpi, bbox_inches='tight')
             plt.close(fig)
             logger.info(f"Adjacent overlay (mclass {mc}{part_str}) → {overlay_path}")
-plot_adjacent_slice_overlays_valis(df_detail)
+
+
+plot_adjacent_slice_overlays(df_detail)
 
 logger.info("Done.")

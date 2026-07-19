@@ -15,8 +15,6 @@
 START=1
 END=30
 
-VENV_PATH="/home/junming/3D-TMA-Register/venv_312"
-
 # CellPose extra flags
 GPU_FLAGS="--use_gpu"
 CELLPOSE_FLAGS="--plot_qc"
@@ -42,6 +40,13 @@ LOG_WARP="${LOG_ROOT}/warp"
 # ─────────────────────────────────────────────────────────────────────────────
 # SETUP
 # ─────────────────────────────────────────────────────────────────────────────
+# Read VENV_PATH with system python3, BEFORE activating any venv
+VENV_PATH="$(python3 -c "import sys; sys.path.insert(0,'${PROJECT_ROOT}'); import config; print(config.VENV_PATH)")"
+if [ -z "${VENV_PATH}" ]; then
+    echo "[ERROR] Could not read VENV_PATH from config.py -- aborting."
+    exit 1
+fi
+
 source "${VENV_PATH}/bin/activate"
 
 # Derive DATASPACE directly from config.py so this script never drifts out of sync

@@ -24,12 +24,12 @@ for a single TMA core using three spatial analysis modules:
 
 Inputs
 ------
-  Phenotypes/<CORE>/<CORE>_phenotypes_typed.csv   — 2D per-slice records
-  Phenotypes/<CORE>/<CORE>_3d_typed.csv           — 3D reconstructed cells
+  <phenotype_dir_name>/<CORE>/<CORE>_phenotypes_typed.csv   — 2D per-slice records
+  <phenotype_dir_name>/<CORE>/<CORE>_3d_typed.csv           — 3D reconstructed cells
 
 Outputs
 -------
-  TME_Analysis/<CORE>/
+  <output_dir_name>/<CORE>/
     cell_density_2d.csv
     cell_density_3d.csv
     nn_distances_2d.csv
@@ -47,6 +47,8 @@ Usage
 -----
     python compare_2d_3d_tme.py --core_name Core_01
     python compare_2d_3d_tme.py --core_name Core_01 --radius_um 50
+    python compare_2d_3d_tme.py --core_name Core_01 \
+        --phenotype_dir_name Phenotypes_Bspline --output_dir_name TME_Analysis_Bspline
 """
 
 import os
@@ -86,6 +88,12 @@ parser.add_argument('--section_um',  type=float, default=4.5,
                     help='Section thickness in µm (default: 4.5).')
 parser.add_argument('--min_cells',   type=int,   default=10,
                     help='Min cells of a type required for analysis (default: 10).')
+parser.add_argument('--phenotype_dir_name', type=str, default='Phenotypes_Bspline',
+                    help='Folder under DATASPACE containing the typed phenotype CSVs '
+                         'from assign_phenotypes.py (default: Phenotypes_Bspline).')
+parser.add_argument('--output_dir_name',    type=str, default='TME_Analysis_Bspline',
+                    help='Folder under DATASPACE to write TME comparison output into '
+                         '(default: TME_Analysis_Bspline).')
 args = parser.parse_args()
 
 TARGET_CORE  = args.core_name
@@ -97,10 +105,8 @@ MIN_CELLS    = args.min_cells
 # ─────────────────────────────────────────────────────────────────────────────
 # PATHS
 # ─────────────────────────────────────────────────────────────────────────────
-# PHENO_DIR   = os.path.join(config.DATASPACE, 'Phenotypes', TARGET_CORE)
-# OUT_DIR     = os.path.join(config.DATASPACE, 'TME_Analysis', TARGET_CORE)
-PHENO_DIR   = os.path.join(config.DATASPACE, 'Phenotypes_Bspline', TARGET_CORE)
-OUT_DIR     = os.path.join(config.DATASPACE, 'TME_Analysis_Bspline', TARGET_CORE)
+PHENO_DIR   = os.path.join(config.DATASPACE, args.phenotype_dir_name, TARGET_CORE)
+OUT_DIR     = os.path.join(config.DATASPACE, args.output_dir_name,    TARGET_CORE)
 FIG_DIR     = os.path.join(OUT_DIR, 'figures')
 os.makedirs(OUT_DIR,  exist_ok=True)
 os.makedirs(FIG_DIR,  exist_ok=True)

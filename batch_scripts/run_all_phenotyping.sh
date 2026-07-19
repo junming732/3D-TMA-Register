@@ -17,8 +17,6 @@
 START=1
 END=30
 
-VENV_PATH="/home/junming/3D-TMA-Register/venv_312"
-
 # Phenotyping flags
 MIN_AREA_PX=200     # minimum nucleus area in pixels (consistent with CellPose min_size)
 PLOT_QC=true        # set to false to skip QC plots and save time
@@ -38,7 +36,7 @@ REG_STATS_CSV=""
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
-PHENO_SCRIPT="${PROJECT_ROOT}/registration/phenotype_cells.py"
+PHENO_SCRIPT="${PROJECT_ROOT}/spacial_analysis/phenotype_cells.py"
 
 LOG_ROOT="${PROJECT_ROOT}/log/full_pipeline"
 LOG_PHENO="${LOG_ROOT}/phenotyping_bspline"
@@ -46,6 +44,13 @@ LOG_PHENO="${LOG_ROOT}/phenotyping_bspline"
 # -----------------------------------------------------------------------------
 # SETUP
 # -----------------------------------------------------------------------------
+# Read VENV_PATH with system python3, BEFORE activating any venv
+VENV_PATH="$(python3 -c "import sys; sys.path.insert(0,'${PROJECT_ROOT}'); import config; print(config.VENV_PATH)")"
+if [ -z "${VENV_PATH}" ]; then
+    echo "[ERROR] Could not read VENV_PATH from config.py -- aborting."
+    exit 1
+fi
+
 source "${VENV_PATH}/bin/activate"
 
 DATASPACE="$(python -c "import sys; sys.path.insert(0,'${PROJECT_ROOT}'); import config; print(config.DATASPACE)")"

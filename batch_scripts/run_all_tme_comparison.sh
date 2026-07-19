@@ -5,18 +5,16 @@
 # Step 7: 2D vs 3D TME spatial analysis
 #
 # Requires Steps 5-6 (phenotyping + cell-type assignment) to have completed.
-# Reads from Phenotypes/<CORE>/<CORE>_phenotypes_typed.csv
-#           Phenotypes/<CORE>/<CORE>_3d_typed.csv
-# Writes  to TME_Analysis/<CORE>/
+# Reads from ${PHENOTYPE_DIR_NAME}/<CORE>/<CORE>_phenotypes_typed.csv
+#           ${PHENOTYPE_DIR_NAME}/<CORE>/<CORE>_3d_typed.csv
+# Writes  to ${OUTPUT_DIR_NAME}/<CORE>/
 # =============================================================================
 
 # -----------------------------------------------------------------------------
 # CONFIGURATION
 # -----------------------------------------------------------------------------
-START=26
-END=26
-
-VENV_PATH="/home/junming/3D-TMA-Register/venv_312"
+START=1
+END=30
 
 # Neighbourhood radius for spatial interaction scoring (µm)
 RADIUS_UM=50
@@ -25,18 +23,30 @@ RADIUS_UM=50
 # Types below this threshold are skipped for that core.
 MIN_CELLS=10
 
+# Registration-variant-dependent folders — must match whatever produced your
+# current inputs. Change these to point at a different registration run
+# without editing compare_2d_3d_tme.py.
+PHENOTYPE_DIR_NAME="Phenotypes_Bspline"
+OUTPUT_DIR_NAME="TME_Analysis_Bspline"
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
-ANALYSIS_SCRIPT="${PROJECT_ROOT}/registration/compare_2d_3d_tme.py"
+ANALYSIS_SCRIPT="${PROJECT_ROOT}/spacial_analysis/compare_2d_3d_tme.py"
 
 LOG_ROOT="${PROJECT_ROOT}/log/full_pipeline"
-#LOG_TME="${LOG_ROOT}/tme_comparison"
 LOG_TME="${LOG_ROOT}/tme_comparison_Bspline"
 
 # -----------------------------------------------------------------------------
 # SETUP
 # -----------------------------------------------------------------------------
+# Read VENV_PATH with system python3, BEFORE activating any venv
+VENV_PATH="$(python3 -c "import sys; sys.path.insert(0,'${PROJECT_ROOT}'); import config; print(config.VENV_PATH)")"
+if [ -z "${VENV_PATH}" ]; then
+    echo "[ERROR] Could not read VENV_PATH from config.py -- aborting."
+    exit 1
+fi
+
 source "${VENV_PATH}/bin/activate"
 
 DATASPACE="$(python -c "import sys; sys.path.insert(0,'${PROJECT_ROOT}'); import config; print(config.DATASPACE)")"
@@ -84,8 +94,7 @@ for i in $(seq $START $END); do
     # ------------------------------------------------------------------
     # PREREQUISITE CHECK 1: typed 2D phenotype CSV
     # ------------------------------------------------------------------
-    #TYPED_2D="${DATASPACE}Phenotypes/${CORE_NAME}/${CORE_NAME}_phenotypes_typed.csv"
-    TYPED_2D="${DATASPACE}Phenotypes_Bspline/${CORE_NAME}/${CORE_NAME}_phenotypes_typed.csv"
+    TYPED_2D="${DATASPACE}${PHENOTYPE_DIR_NAME}/${CORE_NAME}/${CORE_NAME}_phenotypes_typed.csv"
     if [ ! -f "${TYPED_2D}" ]; then
         echo "  [SKIP] Typed 2D phenotype CSV not found -- run assign_phenotypes.py first."
         echo "         Expected: ${TYPED_2D}"
@@ -97,8 +106,7 @@ for i in $(seq $START $END); do
     # ------------------------------------------------------------------
     # PREREQUISITE CHECK 2: typed 3D cell catalogue
     # ------------------------------------------------------------------
-    # TYPED_3D="${DATASPACE}Phenotypes/${CORE_NAME}/${CORE_NAME}_3d_typed.csv"
-    TYPED_3D="${DATASPACE}Phenotypes_Bspline/${CORE_NAME}/${CORE_NAME}_3d_typed.csv"
+    TYPED_3D="${DATASPACE}${PHENOTYPE_DIR_NAME}/${CORE_NAME}/${CORE_NAME}_3d_typed.csv"
     if [ ! -f "${TYPED_3D}" ]; then
         echo "  [SKIP] Typed 3D cell catalogue not found -- run assign_phenotypes.py first."
         echo "         Expected: ${TYPED_3D}"
@@ -114,6 +122,8 @@ for i in $(seq $START $END); do
         --core_name  "${CORE_NAME}" \
         --radius_um  "${RADIUS_UM}" \
         --min_cells  "${MIN_CELLS}" \
+        --phenotype_dir_name "${PHENOTYPE_DIR_NAME}" \
+        --output_dir_name    "${OUTPUT_DIR_NAME}" \
         > "${LOG_TME}/${CORE_NAME}.log" 2>&1
 
     EXIT_CODE=$?
@@ -155,5 +165,5 @@ for i in $(seq $START $END); do
 done
 echo "------------------------------------------------------------"
 echo "  Logs   : ${LOG_TME}/"
-# echo "  Output : ${DATASPACE}TME_Analysis/<CORE>/"
+echo "  Output : ${DATASPACE}${OUTPUT_DIR_NAME}/<CORE>/"
 echo "============================================================"

@@ -34,7 +34,14 @@ Outputs
 
 Usage
 -----
-    python assign_phenotypes.py --core_name Core_01 [--dapi_channel CD3]
+    python assign_phenotypes.py --core_name Core_01 [--min_confidence 0.5]
+                                [--phenotype_dir_name Phenotypes_Bspline]
+                                [--linking_dir_name CellPose_DAPI_3D_Bspline]
+                                [--output_dir_name Phenotypes_Bspline]
+
+    3D linking (link_3d_cells.py) only ever runs on DAPI, so there is no
+    channel selection here — the *_dir_name flags make this script
+    independent of which registration algorithm produced its inputs.
 """
 
 import os
@@ -62,32 +69,34 @@ parser = argparse.ArgumentParser(
 )
 parser.add_argument('--core_name',    type=str, required=True,
                     help='TMA core identifier, e.g. Core_01.')
-parser.add_argument('--linking_channel', type=str, default='DAPI',
-                    help='Channel used for 3D linking in link_3d_cells.py (default: DAPI). '
-                         'Determines which 2D→3D map CSV is loaded.')
 parser.add_argument('--min_confidence', type=float, default=0.5,
                     help='Minimum fraction of 2D slices agreeing on a cell type '
                          'for the 3D consensus to be accepted (default: 0.5).')
+parser.add_argument('--phenotype_dir_name', type=str, default='Phenotypes_Bspline',
+                    help='Folder under DATASPACE containing <CORE>_phenotypes.csv '
+                         '(default: Phenotypes_Bspline).')
+parser.add_argument('--linking_dir_name',   type=str, default='CellPose_DAPI_3D_Bspline',
+                    help='Folder under DATASPACE containing the 2D→3D map and 3D stats '
+                         'CSVs from link_3d_cells.py (default: CellPose_DAPI_3D_Bspline).')
+parser.add_argument('--output_dir_name',    type=str, default='Phenotypes_Bspline',
+                    help='Folder under DATASPACE to write typed output into '
+                         '(default: Phenotypes_Bspline).')
 args = parser.parse_args()
 
 TARGET_CORE     = args.core_name
-LINK_CHANNEL    = args.linking_channel
 MIN_CONFIDENCE  = args.min_confidence
 
 # -----------------------------------------------------------------------------
 # PATHS
 # -----------------------------------------------------------------------------
-# PHENOTYPE_DIR = os.path.join(config.DATASPACE, 'Phenotypes',  TARGET_CORE)
-# LINKING_DIR   = os.path.join(config.DATASPACE, f'CellPose_{LINK_CHANNEL}_3D', TARGET_CORE)
-# OUTPUT_DIR    = os.path.join(config.DATASPACE, 'Phenotypes',  TARGET_CORE)
-PHENOTYPE_DIR = os.path.join(config.DATASPACE, 'Phenotypes_Bspline',  TARGET_CORE)
-LINKING_DIR   = os.path.join(config.DATASPACE, f'CellPose_{LINK_CHANNEL}_3D_Bspline', TARGET_CORE)
-OUTPUT_DIR    = os.path.join(config.DATASPACE, 'Phenotypes_Bspline',  TARGET_CORE)
+PHENOTYPE_DIR = os.path.join(config.DATASPACE, args.phenotype_dir_name, TARGET_CORE)
+LINKING_DIR   = os.path.join(config.DATASPACE, args.linking_dir_name,  TARGET_CORE)
+OUTPUT_DIR    = os.path.join(config.DATASPACE, args.output_dir_name,   TARGET_CORE)
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 PHENOTYPE_CSV = os.path.join(PHENOTYPE_DIR, f'{TARGET_CORE}_phenotypes.csv')
-MAP_CSV       = os.path.join(LINKING_DIR,   f'{TARGET_CORE}_{LINK_CHANNEL}_2d_to_3d_map.csv')
-STATS_3D_CSV  = os.path.join(LINKING_DIR,   f'{TARGET_CORE}_{LINK_CHANNEL}_3d_stats.csv')
+MAP_CSV       = os.path.join(LINKING_DIR,   f'{TARGET_CORE}_DAPI_2d_to_3d_map.csv')
+STATS_3D_CSV  = os.path.join(LINKING_DIR,   f'{TARGET_CORE}_DAPI_3d_stats.csv')
 
 for path, label in [(PHENOTYPE_CSV, 'Phenotype CSV'),
                     (MAP_CSV,       '2D→3D map CSV'),

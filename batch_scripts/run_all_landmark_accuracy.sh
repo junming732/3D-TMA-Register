@@ -7,6 +7,11 @@
 #   - Pipeline B: VALIS
 #   - Pipeline C: RoMaV2
 # Includes automated LaTeX table generation parsing the output CSVs.
+#
+# BSpline and RoMaV2 are evaluated by the same script, accuracy_landmarks_deform.py,
+# selected via --pipeline (they share all logic except path/label config — see
+# PIPELINE_CONFIGS in that file). VALIS has its own script since its transform
+# representation and overlay-loading mechanism genuinely differ.
 # =============================================================================
 
 # -----------------------------------------------------------------------------
@@ -15,15 +20,20 @@
 START=1
 END=30
 
-VENV_PATH="/home/junming/3D-TMA-Register/venv_312"
-
 # Paths
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
-SCRIPT_BSPLINE="${PROJECT_ROOT}/registration/accuracy_landmarks_bspline.py"
-SCRIPT_VALIS="${PROJECT_ROOT}/registration/valis_accuracy_landmarks.py"
-SCRIPT_ROMA="${PROJECT_ROOT}/registration/accuracy_landmarks_roma.py"
+SCRIPT_DEFORM="${PROJECT_ROOT}/evaluation/accuracy_landmarks_deform.py"
+SCRIPT_VALIS="${PROJECT_ROOT}/evaluation/valis_accuracy_landmarks.py"
+
+# Registration-variant output folders — this is the ONLY place these are set.
+# Drives both the actual evaluation runs below (via --work_output_dir) and the
+# LaTeX table's path construction, so they can't drift out of sync with each
+# other. To point at a different experiment run, change these three only.
+BSPLINE_DIR_NAME="Filter_AKAZE_TissueMask_BSpline"
+ROMA_DIR_NAME="Filter_AKAZE_RoMaV2_Linear_Warp_map_multi_channel_3ch_fusion"
+VALIS_DIR_NAME="VALIS_Baseline_Eval"
 
 ANNOTATION_DIR="${PROJECT_ROOT}/annotations"
 
@@ -38,6 +48,13 @@ MCLASS="all"
 # -----------------------------------------------------------------------------
 # SETUP & VALIDATION
 # -----------------------------------------------------------------------------
+# Read VENV_PATH with system python3, BEFORE activating any venv
+VENV_PATH="$(python3 -c "import sys; sys.path.insert(0,'${PROJECT_ROOT}'); import config; print(config.VENV_PATH)")"
+if [ -z "${VENV_PATH}" ]; then
+    echo "[ERROR] Could not read VENV_PATH from config.py -- aborting."
+    exit 1
+fi
+
 source "${VENV_PATH}/bin/activate" || { echo "[ERROR] Failed to activate venv"; exit 1; }
 
 mkdir -p "${LOG_LANDMARK}"
@@ -92,20 +109,16 @@ for i in $(seq $START $END); do
         continue
     fi
 
+    # Generic runner: takes a label and the full command to execute, so the
+    # same function handles accuracy_landmarks_deform.py (both pipelines)
+    # and valis_accuracy_landmarks.py uniformly.
     run_pipeline() {
-        local pipe_name=$1
-        local py_script=$2
+        local pipe_name=$1; shift
         local log_file="${LOG_LANDMARK}/${CORE_NAME}_${pipe_name}.log"
 
         echo "  [RUN] Evaluating Pipeline: ${pipe_name} (using $(basename "${ANN_JSON}")) ..."
 
-        python "${py_script}" \
-            --core_name "${CORE_NAME}" \
-            --annotation_json "${ANN_JSON}" \
-            --pixel_size_um "${PIXEL_SIZE_UM}" \
-            --landmark_id "${MCLASS}" \
-            > "${log_file}" 2>&1
-
+        "$@" > "${log_file}" 2>&1
         local exit_code=$?
 
         if [ $exit_code -ne 0 ]; then
@@ -119,9 +132,23 @@ for i in $(seq $START $END); do
     }
 
     # Execute all three pipelines
-    run_pipeline "BSpline" "${SCRIPT_BSPLINE}"
-    run_pipeline "VALIS"   "${SCRIPT_VALIS}"
-    run_pipeline "RoMaV2"  "${SCRIPT_ROMA}"
+    run_pipeline "BSpline" python "${SCRIPT_DEFORM}" \
+        --core_name "${CORE_NAME}" --pipeline bspline \
+        --annotation_json "${ANN_JSON}" \
+        --pixel_size_um "${PIXEL_SIZE_UM}" --landmark_id "${MCLASS}" \
+        --work_output_dir "${BSPLINE_DIR_NAME}"
+
+    run_pipeline "RoMaV2" python "${SCRIPT_DEFORM}" \
+        --core_name "${CORE_NAME}" --pipeline roma \
+        --annotation_json "${ANN_JSON}" \
+        --pixel_size_um "${PIXEL_SIZE_UM}" --landmark_id "${MCLASS}" \
+        --work_output_dir "${ROMA_DIR_NAME}"
+
+    run_pipeline "VALIS" python "${SCRIPT_VALIS}" \
+        --core_name "${CORE_NAME}" \
+        --annotation_json "${ANN_JSON}" \
+        --pixel_size_um "${PIXEL_SIZE_UM}" --landmark_id "${MCLASS}" \
+        --work_output_dir "${VALIS_DIR_NAME}"
 
     if [ $CORE_ALL_OK -eq 1 ]; then
         CORE_STATUS[$CORE_NAME]="OK"
@@ -131,25 +158,34 @@ for i in $(seq $START $END); do
 
     # --- LATEX SUMMARY GENERATION ---
     echo "  [LOG] Generating LaTeX summary table..."
-    
+
     export CORE_NAME
     export DATASPACE
     export LOG_LANDMARK
-    
+    export BSPLINE_DIR_NAME
+    export ROMA_DIR_NAME
+    export VALIS_DIR_NAME
+
     python - << 'EOF'
 import os
 import pandas as pd
 import numpy as np
 
-core_name = os.environ.get("CORE_NAME")
-dataspace = os.environ.get("DATASPACE")
-log_dir   = os.environ.get("LOG_LANDMARK")
-out_tex   = os.path.join(log_dir, f"{core_name}_latex_summary.tex")
+core_name        = os.environ.get("CORE_NAME")
+dataspace        = os.environ.get("DATASPACE")
+log_dir          = os.environ.get("LOG_LANDMARK")
+bspline_dir_name = os.environ.get("BSPLINE_DIR_NAME")
+roma_dir_name    = os.environ.get("ROMA_DIR_NAME")
+valis_dir_name   = os.environ.get("VALIS_DIR_NAME")
+out_tex          = os.path.join(log_dir, f"{core_name}_latex_summary.tex")
 
-# Construct CSV paths based on individual pipeline logic
-path_A = f"{dataspace}/Filter_AKAZE_TissueMask_BSpline/{core_name}/annotation_verification_bspline/{core_name}_landmark_accuracy_detail.csv"
-path_B = f"{dataspace}/VALIS_Baseline_Eval/{core_name}/{core_name}/annotation_verification_valis/{core_name}_VALIS_landmark_accuracy_detail.csv"
-path_C = f"{dataspace}/Filter_AKAZE_RoMaV2_Linear_Warp_map/{core_name}/annotation_verification_Romav2/{core_name}_landmark_accuracy_detail.csv"
+# Construct CSV paths — folder names are read from the batch script's config
+# vars (BSPLINE_DIR_NAME/ROMA_DIR_NAME/VALIS_DIR_NAME) rather than hardcoded
+# here, so this can't drift out of sync with the actual pipeline output paths
+# the way it previously did for RoMaV2 (was missing "_hr_isolated").
+path_A = f"{dataspace}/{bspline_dir_name}/{core_name}/annotation_verification_bspline/{core_name}_landmark_accuracy_detail.csv"
+path_B = f"{dataspace}/{valis_dir_name}/{core_name}/{core_name}/annotation_verification_valis/{core_name}_VALIS_landmark_accuracy_detail.csv"
+path_C = f"{dataspace}/{roma_dir_name}/{core_name}/annotation_verification_Romav2/{core_name}_landmark_accuracy_detail.csv"
 
 def get_df(p):
     return pd.read_csv(p) if os.path.exists(p) else None
@@ -169,7 +205,8 @@ if dfA is None and dfB is None and dfC is None:
 
 def extract_metrics(df, df_sum):
     if df is None or df.empty:
-        return {'mean': np.nan, 'median': np.nan, 'max': np.nan, 'std': np.nan,
+        return {'mean': np.nan, 'median': np.nan, 'q3': np.nan, 'p90': np.nan,
+                'max': np.nan, 'std': np.nan,
                 'n_landmarks': 0, 'n_pairs': 0, 'mclass_stats': None}
     # n_landmarks = total annotated points (sum of n_slices across mclasses)
     # n_pairs     = total consecutive pairs evaluated (sum of n_pairs across mclasses)
@@ -178,6 +215,8 @@ def extract_metrics(df, df_sum):
     return {
         'mean':        df['TRE_um'].mean(),
         'median':      df['TRE_um'].median(),
+        'q3':          df['TRE_um'].quantile(0.75),
+        'p90':         df['TRE_um'].quantile(0.90),
         'max':         df['TRE_um'].max(),
         'std':         df['TRE_um'].std(),
         'n_landmarks': n_landmarks,
@@ -239,6 +278,8 @@ n_mclasses = len(all_mclasses)
 tex.append(f"\\multicolumn{{4}}{{l}}{{\\textit{{Global --- {n_mclasses} structures, {tot_landmarks} annotated landmarks}}}} \\\\")
 tex.append(f"\\quad Mean \\gls{{tre}} ($\\mu$m)   & {' & '.join(bold_min([metA['mean'], metB['mean'], metC['mean']]))} \\\\")
 tex.append(f"\\quad Median \\gls{{tre}} ($\\mu$m) & {' & '.join(bold_min([metA['median'], metB['median'], metC['median']]))} \\\\")
+tex.append(f"\\quad Q3 (75th pct) \\gls{{tre}} ($\\mu$m) & {' & '.join(bold_min([metA['q3'], metB['q3'], metC['q3']]))} \\\\")
+tex.append(f"\\quad P90 \\gls{{tre}} ($\\mu$m)    & {' & '.join(bold_min([metA['p90'], metB['p90'], metC['p90']]))} \\\\")
 tex.append(f"\\quad Max \\gls{{tre}} ($\\mu$m)    & {' & '.join(bold_min([metA['max'], metB['max'], metC['max']]))} \\\\")
 tex.append(f"\\quad Std \\gls{{tre}} ($\\mu$m)    & {' & '.join(bold_min([metA['std'], metB['std'], metC['std']]))} \\\\")
 

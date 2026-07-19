@@ -10,7 +10,7 @@ Cores analysed
     Core_10, Core_11, Core_12, Core_13, Core_14, Core_15, Core_18, Core_24,
     Core_26
 
-Input CSVs expected per core (under TME_Analysis/<CORE>/)
+Input CSVs expected per core (under <tme_dir_name>/<CORE>/)
 ----------------------------------------------------------
     cell_density_2d.csv        — mean_density_per_mm2 per cell type
     cell_density_3d.csv        — density_per_mm3 per cell type
@@ -19,21 +19,30 @@ Input CSVs expected per core (under TME_Analysis/<CORE>/)
     entropy_summary.csv        — per-cell-type mean H ± std + KS/MWU tests
     summary_comparison.csv     — nn_dist_2d/3d/delta per type-pair
 
-Outputs (under TME_Analysis/Aggregate/)
+Outputs (under <tme_dir_name>/Aggregate/)
 ----------------------------------------
-    aggregate_density.csv
-    aggregate_nn_distances.csv
+    aggregate_density_2d.csv
+    aggregate_density_3d.csv
+    aggregate_nn_2d.csv
+    aggregate_nn_3d.csv
     aggregate_entropy.csv
     aggregate_summary.csv
+    ambiguous_exclusion_summary.csv    — per-core Ambiguous cell counts/percentages
+    ambiguous_exclusion_summary.txt    — human-readable version of the above
     figures/
-        fig_1_density_2d_vs_3d.png        — paired strip plot, 2D vs 3D density
-        fig_2_nn_distances.png      — per-source-type 2D vs 3D scatter across cores
-        fig_3_entropy_delta_boxplot.png    — boxplot of delta mean H per cell type
+        fig_1_celltype_fraction_2d_vs_3d.png  — per-cell-type scatter of 2D vs 3D
+                                                 composition fraction across cores,
+                                                 with Pearson r annotation
+        fig_2_nn_distances.png                — per-source-type 2D vs 3D median NN
+                                                 distance, individual cores overlaid
+        fig_3_entropy_delta_boxplot.png       — boxplot of relative entropy delta
+                                                 (3D − 2D) / 2D per cell type
 
 Usage
 -----
     python aggregate_tme.py
     python aggregate_tme.py --radius_um 50
+    python aggregate_tme.py --tme_dir_name TME_Analysis_Bspline
 """
 
 import os
@@ -64,6 +73,9 @@ parser = argparse.ArgumentParser(
 )
 parser.add_argument('--radius_um', type=float, default=50.0,
                     help='Neighbourhood radius used in compare_2d_3d_tme.py (default: 50).')
+parser.add_argument('--tme_dir_name', type=str, default='TME_Analysis_Bspline',
+                    help='Folder under DATASPACE containing per-core TME comparison '
+                         'output from compare_2d_3d_tme.py (default: TME_Analysis_Bspline).')
 args = parser.parse_args()
 RADIUS_UM = args.radius_um
 
@@ -76,8 +88,7 @@ CORE_NAMES = [f'Core_{str(c).zfill(2)}' for c in CORE_IDS]
 # ─────────────────────────────────────────────────────────────────────────────
 # PATHS
 # ─────────────────────────────────────────────────────────────────────────────
-# TME_DIR = os.path.join(config.DATASPACE, 'TME_Analysis')
-TME_DIR = os.path.join(config.DATASPACE, 'TME_Analysis_Bspline')
+TME_DIR = os.path.join(config.DATASPACE, args.tme_dir_name)
 OUT_DIR = os.path.join(TME_DIR, 'Aggregate')
 FIG_DIR = os.path.join(OUT_DIR, 'figures')
 os.makedirs(OUT_DIR, exist_ok=True)
