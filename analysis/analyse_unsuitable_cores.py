@@ -13,11 +13,18 @@ normalised — same recipe as prepare_3ch_fusion in
 akaze_romav2_multi_channel_warp.py), 'fusion_af_linear' (identical fusion,
 but AF uses the same linear stretch as af_linear instead of log — isolates
 whether the af_linear finding also helps once AF is folded into the fusion
-composite, not just alone), and 'color_lut' (7-channel, AF-excluded, colour-
-LUT weighted blend collapsed to gray — same recipe as
-prepare_color_lut_fusion in that script). 'dapi_linear' and 'ck_linear' are
-also available via --channels if you want them. For each selected
-candidate, it:
+composite, not just alone), 'fusion_equal' (identical RGB composite to
+'fusion', but collapsed to gray via a simple equal-weighted channel mean
+instead of cv2.cvtColor's default RGB2GRAY luma weights — those weights
+are calibrated for human colour perception and, applied to DAPI->R/AF->G/
+CK->B, weight AF almost 2x DAPI and ~5x CK, which has no particular
+justification for these channels; this candidate tests whether that
+default weighting is actually helping or hurting), 'color_lut' (7-channel,
+AF-excluded, colour-LUT weighted blend collapsed to gray — same recipe as
+prepare_color_lut_fusion in that script), and 'color_lut_equal' (same idea
+as fusion_equal, applied to the color_lut composite instead). 'dapi_linear'
+and 'ck_linear' are also available via --channels if you want them. For
+each selected candidate, it:
 
   1. Builds a per-channel contact-sheet montage across every slice in the
      core, so you can visually scan how each candidate looks slice-by-slice
@@ -51,6 +58,8 @@ Usage:
     python analyze_unsuitable_cores.py
     python analyze_unsuitable_cores.py --core_ids 16,17,21,23,27
     python analyze_unsuitable_cores.py --core_ids 16 --channels dapi,ck,af_linear
+    python analyze_unsuitable_cores.py --core_ids 1-30
+    python analyze_unsuitable_cores.py --core_ids 1-15,18-30   # ranges + individual, mixed
 """
 
 import os
@@ -80,14 +89,38 @@ import config
 # ─────────────────────────────────────────────────────────────────────────────
 parser = argparse.ArgumentParser(description="Diagnostics for flagged unsuitable cores.")
 parser.add_argument('--core_ids', type=str, default="16,17,21,23,27",
-                    help="Comma-separated core numbers, e.g. '16,17,21,23,27'.")
+                    help="Comma-separated core numbers and/or 'lo-hi' ranges, "
+                         "e.g. '16,17,21,23,27' or '1-30' or '1-15,18-30'.")
 parser.add_argument('--channels', type=str,
-                    default="dapi,ck,af,af_linear,fusion,fusion_af_linear,color_lut",
+                    default="dapi,ck,af,af_linear,fusion,fusion_af_linear,fusion_equal,"
+                            "color_lut,color_lut_equal",
                     help="Comma-separated candidates: dapi,ck,af,af_linear,ck_linear,"
-                         "dapi_linear,fusion,fusion_af_linear,color_lut")
+                         "dapi_linear,fusion,fusion_af_linear,fusion_equal,"
+                         "color_lut,color_lut_equal")
 args = parser.parse_args()
 
-CORE_IDS = [int(c.strip()) for c in args.core_ids.split(',') if c.strip()]
+def parse_core_ids(spec: str) -> list:
+    """
+    Parse a comma-separated core-ID spec supporting individual numbers and
+    'lo-hi' ranges, e.g. '1-15,18-30' or '16,17,21,23,27'. Same range syntax
+    already used for slice_filter.yaml elsewhere in this pipeline. Preserves
+    the order given (ranges expand in order, no dedup/sort — repeat entries
+    are the caller's responsibility to avoid).
+    """
+    ids = []
+    for part in spec.split(','):
+        part = part.strip()
+        if not part:
+            continue
+        if '-' in part:
+            lo, hi = part.split('-', 1)
+            ids.extend(range(int(lo.strip()), int(hi.strip()) + 1))
+        else:
+            ids.append(int(part))
+    return ids
+
+
+CORE_IDS = parse_core_ids(args.core_ids)
 CORE_NAMES = [f"Core_{n:02d}" for n in CORE_IDS]
 
 DAPI_CHANNEL_IDX = 0
@@ -103,10 +136,12 @@ CHANNEL_LABEL = {
     'dapi_linear': 'DAPI (linear, no log)', 'ck_linear': 'CK (linear, no log)',
     'af_linear': 'AF (linear, no log)',
     'fusion': 'Fusion (DAPI+AF+CK)', 'fusion_af_linear': 'Fusion (AF linear)',
-    'color_lut': 'Color LUT (7ch)',
+    'fusion_equal': 'Fusion (equal-weight gray)',
+    'color_lut': 'Color LUT (7ch)', 'color_lut_equal': 'Color LUT (equal-weight gray)',
 }
 VALID_CANDIDATES = {'dapi', 'ck', 'af', 'dapi_linear', 'ck_linear', 'af_linear',
-                    'fusion', 'fusion_af_linear', 'color_lut'}
+                    'fusion', 'fusion_af_linear', 'fusion_equal',
+                    'color_lut', 'color_lut_equal'}
 
 # Same 7-index colour LUT as akaze_romav2_multi_channel_warp.py (AF excluded)
 COLOR_LUT = {
@@ -245,12 +280,21 @@ def prepare_color_lut_fusion(vol):
 def get_display_and_gray(channel_key, vol):
     """
     Returns (display_img, gray_img) for a candidate:
-      - dapi/ck/af   -> both are the same grayscale log-normalised channel.
-      - fusion       -> display is the colour RGB composite; gray is its
-                        grayscale flattening, used for AKAZE/overlay.
-      - color_lut    -> same idea, RGB colour-LUT composite.
+      - dapi/ck/af           -> both are the same grayscale log-normalised channel.
+      - fusion/fusion_equal  -> display is the colour RGB composite; gray is its
+                                grayscale flattening, used for AKAZE/overlay.
+      - color_lut/_equal     -> same idea, RGB colour-LUT composite.
     AKAZE needs a single channel, so gray is always what gets matched on;
     display is only for the montage/overlay figures.
+
+    The '_equal' variants use the identical RGB composite as their non-'_equal'
+    counterpart, differing only in how it's collapsed to gray: a plain
+    per-channel mean instead of cv2.cvtColor's default RGB2GRAY luma weights
+    (0.299/0.587/0.114) — weights calibrated for human colour perception,
+    with no particular justification for DAPI/AF/CK channels mapped into
+    R/G/B slots. Kept as separate, directly-comparable candidates rather
+    than a global toggle, consistent with how fusion vs fusion_af_linear
+    isolates one variable at a time.
     """
     if channel_key in CHANNEL_IDX:
         idx = CHANNEL_IDX[channel_key]
@@ -259,15 +303,18 @@ def get_display_and_gray(channel_key, vol):
         else:
             gray = log_normalize(vol[idx].astype(np.float32))
         return gray, gray
-    if channel_key == 'fusion':
+    if channel_key in ('fusion', 'fusion_equal'):
         rgb = prepare_3ch_fusion(vol)
     elif channel_key == 'fusion_af_linear':
         rgb = prepare_3ch_fusion_af_linear(vol)
-    elif channel_key == 'color_lut':
+    elif channel_key in ('color_lut', 'color_lut_equal'):
         rgb = prepare_color_lut_fusion(vol)
     else:
         raise ValueError(channel_key)
-    gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
+    if channel_key in ('fusion_equal', 'color_lut_equal'):
+        gray = rgb.astype(np.float32).mean(axis=2).astype(np.uint8)
+    else:
+        gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
     return rgb, gray
 
 
@@ -433,7 +480,8 @@ def build_channel_montage(core_name, channel_key, file_list, slice_ids, out_dir)
     n_rows = int(np.ceil(n / n_cols))
     fig, axes = plt.subplots(n_rows, n_cols, figsize=(3 * n_cols, 3 * n_rows))
     axes = np.atleast_1d(axes).ravel()
-    is_rgb = channel_key in ('fusion', 'fusion_af_linear', 'color_lut')
+    is_rgb = channel_key in ('fusion', 'fusion_af_linear', 'fusion_equal',
+                             'color_lut', 'color_lut_equal')
 
     for i, (f, sid) in enumerate(zip(file_list, slice_ids)):
         vol = load_as_chw(f)
