@@ -32,7 +32,7 @@ OUTPUT_DIR_NAME="TME_Analysis_Bspline"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
-ANALYSIS_SCRIPT="${PROJECT_ROOT}/spacial_analysis/compare_2d_3d_tme.py"
+ANALYSIS_SCRIPT="${PROJECT_ROOT}/spatial_analysis/compare_2d_3d_tme.py"
 
 LOG_ROOT="${PROJECT_ROOT}/log/full_pipeline"
 LOG_TME="${LOG_ROOT}/tme_comparison_Bspline"

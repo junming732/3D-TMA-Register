@@ -36,7 +36,7 @@ OUTPUT_DIR_NAME="Phenotypes_Bspline"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
-ASSIGN_SCRIPT="${PROJECT_ROOT}/spacial_analysis/assign_phenotypes.py"
+ASSIGN_SCRIPT="${PROJECT_ROOT}/spatial_analysis/assign_phenotypes.py"
 
 LOG_ROOT="${PROJECT_ROOT}/log/full_pipeline"
 LOG_ASSIGN="${LOG_ROOT}/assign_phenotypes_Bspline"

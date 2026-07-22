@@ -37,7 +37,7 @@ OUTPUT_DIR_NAME="Denoised_bspline"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
-DENOISE_SCRIPT="${PROJECT_ROOT}/spacial_analysis/denoise_volume.py"
+DENOISE_SCRIPT="${PROJECT_ROOT}/spatial_analysis/denoise_volume.py"
 
 LOG_ROOT="${PROJECT_ROOT}/log/full_pipeline"
 LOG_DENOISE="${LOG_ROOT}/denoising"

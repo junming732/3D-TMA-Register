@@ -30,8 +30,8 @@ DEFORM_DIR_NAME="Filter_AKAZE_TissueMask_BSpline"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
-CP_SCRIPT="${PROJECT_ROOT}/spacial_analysis/cellpose_segmentation.py"
-WARP_SCRIPT="${PROJECT_ROOT}/spacial_analysis/warp_cellpose_masks.py"
+CP_SCRIPT="${PROJECT_ROOT}/spatial_analysis/cellpose_segmentation.py"
+WARP_SCRIPT="${PROJECT_ROOT}/spatial_analysis/warp_cellpose_masks.py"
 
 LOG_ROOT="${PROJECT_ROOT}/log/full_pipeline"
 LOG_CP="${LOG_ROOT}/cellpose"
