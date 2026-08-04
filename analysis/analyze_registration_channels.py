@@ -4,8 +4,8 @@ analyze_registration_channels.py
 
 Standalone analysis of the row-level output from analyse_unsuitable_cores.py.
 
-Takes the two *_akaze_summary.csv files (one for flagged/"unsuitable" cores,
-one for the rest) and answers three questions:
+Takes a single, combined *_akaze_summary.csv (all cores run together) and
+answers three questions:
 
   1. EVIDENCE   — which channel actually has the highest AKAZE success rate,
                   compared across the unsuitable group and the other group?
@@ -21,13 +21,23 @@ one for the rest) and answers three questions:
 
 Usage:
     python analyze_registration_channels.py \
-        --unsuitable unsuitable_cores_akaze_summary.csv \
-        --other other_cores_akaze_summary.csv \
+        --input "all_cores_summary_by_channel(dapi_clahe).csv" \
         --out-dir ./registration_analysis \
         --primary-channel CK
 
+--input only needs a filename: the script looks it up automatically inside
+config.DATASPACE/Unsuitable_Core_Diagnostics (the same folder the upstream
+script writes it to). Pass a path containing "/" (or an absolute path) to
+point somewhere else instead.
+
+Which cores count as "Unsuitable" (difficult) vs "Other" (easy) is no longer
+inferred from which file a row came from — since everything is in one CSV
+now — but from the DIFFICULT_CORES list below. Edit that list to match
+whichever cores you currently consider flagged/difficult, or override it
+per-run with --difficult-cores (comma-separated core names).
+
 All three outputs land in --out-dir. Nothing here needs the original TIFFs
-or masks — it only reads the two summary CSVs.
+or masks — it only reads the summary CSV.
 """
 
 import argparse
@@ -41,39 +51,99 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.colors import LinearSegmentedColormap
 
+try:
+    import config
+    CSV_DIR = os.path.join(config.DATASPACE, "Unsuitable_Core_Diagnostics")
+except ImportError:
+    # config.py isn't importable from wherever this script is being run from
+    # (e.g. different working directory / not on PYTHONPATH). --input will
+    # just be used as-is (relative or absolute path) in that case.
+    config = None
+    CSV_DIR = None
+
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# EASY / DIFFICULT CORE CLASSIFICATION
+# ─────────────────────────────────────────────────────────────────────────
+# Edit this list to whatever cores you currently consider flagged/"difficult"
+# (previously the ones that lived in the separate unsuitable_cores CSV).
+# Every other Core found in the combined CSV is treated as "Other" (easy).
+# Names must match the values in the CSV's "Core" column exactly.
+# Can also be overridden per-run with --difficult-cores.
+DIFFICULT_CORES = [
+    "Core_16",
+    "Core_17",
+    "Core_21",
+    "Core_23",
+    "Core_27",
+]
+# Everything else in the range 1-30 (core_01, core_02, ... core_30, minus
+# the ones above) is automatically treated as "Other"/normal — you don't
+# need to list them, that's handled by the isin() check below.
+
 
 # ─────────────────────────────────────────────────────────────────────────
 # CLI
 # ─────────────────────────────────────────────────────────────────────────
 parser = argparse.ArgumentParser(description="Analyze registration-channel diagnostics.")
-parser.add_argument("--unsuitable", default="unsuitable_cores_akaze_summary.csv",
-                     help="Path to the per-pair CSV for flagged/unsuitable cores.")
-parser.add_argument("--other", default="other_cores_akaze_summary.csv",
-                     help="Path to the per-pair CSV for the remaining cores.")
-parser.add_argument("--out-dir", default="./registration_analysis",
-                     help="Directory to write PNGs/CSVs into.")
+parser.add_argument("--input", default="all_cores_summary_by_channel(dapi_clahe).csv",
+                     help="CSV filename (just the filename, unless you want to point "
+                          "somewhere else). Looked up inside "
+                          f"{CSV_DIR!r} (config.DATASPACE/Unsuitable_Core_Diagnostics) "
+                          "unless you pass an absolute path or a path containing '/'.")
+parser.add_argument("--out-dir", default=None,
+                     help="Directory to write PNGs/CSVs into. Defaults to a "
+                          "'registration_analysis' subfolder inside the same "
+                          "directory the input CSV was found in (CSV_DIR).")
 parser.add_argument("--primary-channel", default="CK",
                      help="Channel to treat as the default/primary choice for the rescue analysis.")
 parser.add_argument("--min-inliers-trust", type=int, default=15,
                      help="Inlier count below which a 'success' is flagged as low-confidence "
                           "in the rescue table (informational only, doesn't filter rows).")
+parser.add_argument("--difficult-cores", default=None,
+                     help="Comma-separated list of Core names to treat as 'Unsuitable'/difficult, "
+                          "overriding the DIFFICULT_CORES list defined at the top of this script.")
 args = parser.parse_args()
 
+difficult_cores = (
+    [c.strip() for c in args.difficult_cores.split(",") if c.strip()]
+    if args.difficult_cores is not None
+    else DIFFICULT_CORES
+)
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# LOAD
+# ─────────────────────────────────────────────────────────────────────────
+def resolve_input_path(name):
+    # Absolute path or one that already includes a directory -> use as-is.
+    if os.path.isabs(name) or os.path.dirname(name):
+        return name
+    if CSV_DIR is None:
+        raise RuntimeError(
+            "Couldn't import 'config' to locate Unsuitable_Core_Diagnostics, and "
+            f"'{name}' has no directory in it. Either run this script from "
+            "somewhere config.py is importable, or pass a full/relative path via --input."
+        )
+    return os.path.join(CSV_DIR, name)
+
+
+input_path = resolve_input_path(args.input)
+
+out_dir = args.out_dir
+if out_dir is None:
+    out_dir = os.path.join(os.path.dirname(input_path) or ".", "registration_analysis")
+args.out_dir = out_dir
 os.makedirs(args.out_dir, exist_ok=True)
 
+df = pd.read_csv(input_path)
+df["Group"] = np.where(df["Core"].isin(difficult_cores), "Unsuitable", "Other")
 
-# ─────────────────────────────────────────────────────────────────────────
-# LOAD + MERGE
-# ─────────────────────────────────────────────────────────────────────────
-def load(path, group_label):
-    df = pd.read_csv(path)
-    df["Group"] = group_label
-    return df
-
-
-un = load(args.unsuitable, "Unsuitable")
-ot = load(args.other, "Other")
-df = pd.concat([un, ot], ignore_index=True)
+unknown = set(difficult_cores) - set(df["Core"].unique())
+if unknown:
+    print(f"[warning] These difficult_cores entries don't match any Core in the CSV: "
+          f"{sorted(unknown)}")
 
 # Slice-pair ordering: "Z00_ID1_to_Z01_ID2" -> 0
 def z_order(pair_str):
@@ -89,8 +159,11 @@ if args.primary_channel not in CHANNELS:
 
 merged_path = os.path.join(args.out_dir, "merged_akaze_summary.csv")
 df.to_csv(merged_path, index=False)
+n_unsuitable = df.loc[df["Group"] == "Unsuitable", "Core"].nunique()
+n_other = df.loc[df["Group"] == "Other", "Core"].nunique()
+print(f"[load] Read {input_path}")
 print(f"[merge] {len(df)} rows ({df['Core'].nunique()} cores, "
-      f"{un['Core'].nunique()} unsuitable / {ot['Core'].nunique()} other) -> {merged_path}")
+      f"{n_unsuitable} unsuitable / {n_other} other) -> {merged_path}")
 
 
 # ─────────────────────────────────────────────────────────────────────────

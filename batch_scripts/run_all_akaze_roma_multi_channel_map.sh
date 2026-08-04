@@ -18,7 +18,7 @@ PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
 REG_SCRIPT="${PROJECT_ROOT}/registration/akaze_romav2_multi_channel_warp.py"
 
-REGISTRATION_MODE="3ch_fusion"   # ck_only | 3ch_fusion | color_lut
+REGISTRATION_MODE="dapi_clahe"   # ck_only | 3ch_fusion | color_lut | dapi_clahe | ck_clahe
 
 LOG_ROOT="${PROJECT_ROOT}/log/full_pipeline"
 LOG_REG="${LOG_ROOT}/registration/akaze_roma_${REGISTRATION_MODE}"

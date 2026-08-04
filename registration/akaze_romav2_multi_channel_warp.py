@@ -95,8 +95,9 @@ parser = argparse.ArgumentParser(
 )
 parser.add_argument('--core_name', type=str, required=True)
 parser.add_argument('--registration_mode',  type=str, default='ck_only',
-                    choices=['ck_only', '3ch_fusion', 'color_lut'],
-                    help='Which image is fed to RomaV2')
+                    choices=['ck_only', '3ch_fusion', 'color_lut', 'dapi_clahe', 'ck_clahe'],
+                    help="Which image is fed to RomaV2. 'dapi_clahe'/'ck_clahe' use "
+                         "skimage's equalize_adapthist instead of log/linear percentile ")
 
 args = parser.parse_args()
 
@@ -107,6 +108,11 @@ TARGET_CORE = args.core_name
 #   'ck_only'    — RoMaV2 also uses CK linear (original behaviour)
 #   '3ch_fusion' — RoMaV2 uses weighted DAPI + AF + CK fusion
 #   'color_lut'  — RoMaV2 uses 7-channel (AF excluded) color-LUT weighted-average -> gray
+#   'dapi_clahe' — RoMaV2 uses DAPI + CLAHE, matching VALIS's default fluorescence
+#                  preprocessing (preprocessing.ChannelGetter) exactly
+#   'ck_clahe'   — RoMaV2 uses CK + CLAHE (isolates CLAHE's effect alone, same
+#                  channel as 'ck_only' but with VALIS-style contrast enhancement
+#                  instead of log/linear percentile stretch)
 ROMA_MODE = args.registration_mode
 
 logging.basicConfig(level=logging.INFO,
@@ -251,6 +257,23 @@ def prepare_ck(img_arr: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
 
     return norm_lin, norm_log
 
+
+def clahe_normalize(img_arr: np.ndarray) -> np.ndarray:
+    """
+    Matches VALIS's default fluorescence preprocessing exactly —
+    preprocessing.ChannelGetter.process_image(adaptive_eq=True):
+        rescale to [0,1] -> skimage.exposure.equalize_adapthist -> rescale to uint8
+    No log/linear percentile stretch first; CLAHE's local contrast
+    normalization replaces that step entirely, same as VALIS. Used for
+    ROMA_MODE 'dapi_clahe' / 'ck_clahe' — testing whether matching VALIS's
+    own preprocessing (not just channel choice) closes the accuracy gap.
+    """
+    from skimage import exposure
+    img_float = img_arr.astype(np.float32)
+    img01 = exposure.rescale_intensity(img_float, out_range=(0, 1))
+    eq    = exposure.equalize_adapthist(img01)
+    return exposure.rescale_intensity(eq, out_range=(0, 255)).astype(np.uint8)
+
 DAPI_CHANNEL_IDX = 0
 AF_CHANNEL_IDX   = 7
 
@@ -312,6 +335,10 @@ def prepare_roma_input(multichannel_np):
         return prepare_3ch_fusion(multichannel_np)
     elif ROMA_MODE == 'color_lut':
         return prepare_color_lut_fusion(multichannel_np)
+    elif ROMA_MODE == 'dapi_clahe':
+        return clahe_normalize(multichannel_np[DAPI_CHANNEL_IDX].astype(np.float32))
+    elif ROMA_MODE == 'ck_clahe':
+        return clahe_normalize(multichannel_np[CK_CHANNEL_IDX].astype(np.float32))
     else:  # 'ck_only'
         lin, _ = prepare_ck(multichannel_np[CK_CHANNEL_IDX].astype(np.float32))
         return lin
@@ -1030,6 +1057,12 @@ def register_slice(fixed_np: np.ndarray, moving_np: np.ndarray,
     elif ROMA_MODE == 'color_lut':
         fixed_roma_input  = prepare_color_lut_fusion(fixed_np)
         moving_roma_input = prepare_color_lut_fusion(moving_np)
+    elif ROMA_MODE == 'dapi_clahe':
+        fixed_roma_input  = clahe_normalize(fixed_np[DAPI_CHANNEL_IDX].astype(np.float32))
+        moving_roma_input = clahe_normalize(moving_np[DAPI_CHANNEL_IDX].astype(np.float32))
+    elif ROMA_MODE == 'ck_clahe':
+        fixed_roma_input  = clahe_normalize(fixed_ck)
+        moving_roma_input = clahe_normalize(moving_ck)
     else:  
         fixed_roma_input  = fixed_lin
         moving_roma_input = moving_lin
