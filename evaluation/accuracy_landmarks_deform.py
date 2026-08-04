@@ -194,15 +194,24 @@ records = []
 for ann in annotations:
     z_json    = ann['z']
     slice_idx = z_json_to_slice_idx(z_json)
+    
+    # 1. Verify the original slice was kept in the registered volume
+    vol_z = SLICE_IDX_TO_VOL_Z.get(slice_idx)
+    
+    if vol_z is None:
+        logger.warning(f"  id={ann['landmark_id']} z_json={z_json}: slice filtered out — skipping.")
+        continue
+        
     x_raw     = ann['x']
     y_raw     = ann['y']
     mc        = ann['landmark_id']
     ann_id    = ann['landmark_id']
 
-    npz_path  = find_deform_npz(slice_idx, TARGET_CORE, DEFORM_FOLDER)
+    # 2. Fetch the deformation map using the mapped vol_z index
+    npz_path  = find_deform_npz(vol_z, TARGET_CORE, DEFORM_FOLDER)
 
     if npz_path is None:
-        logger.warning(f"  id={ann_id} z_json={z_json}: no deform .npz — skipping.")
+        logger.warning(f"  id={ann_id} z_json={z_json}: no deform .npz (vol_z={vol_z}) — skipping.")
         continue
 
     try:
