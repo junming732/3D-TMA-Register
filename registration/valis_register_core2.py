@@ -59,7 +59,13 @@ def load_slice_filter(yaml_path, core_name):
 
 def get_slice_number(filename):
     match = re.search(r"TMA_(\d+)_", os.path.basename(filename))
-    return int(match.group(1)) if match else 0
+    if not match:
+        raise ValueError(
+            f"Could not parse slice number from filename: {os.path.basename(filename)} "
+            f"(expected pattern 'TMA_<digits>_'). Fix the regex or the filename convention "
+            f"before continuing — silently defaulting to slice 0 will corrupt slice filtering."
+        )
+    return int(match.group(1))
 
 
 def main():
@@ -110,11 +116,13 @@ def main():
     allowed_positions = load_slice_filter(SLICE_FILTER_YAML, args.core_name)
     if allowed_positions is not None:
         original_count = len(valid_files)
-        valid_files    = [f for f in valid_files if get_slice_number(f) in allowed_positions]
+        kept_ids       = [get_slice_number(f) for i, f in enumerate(valid_files) if i in allowed_positions]
+        valid_files    = [f for i, f in enumerate(valid_files) if i in allowed_positions]
         excluded       = original_count - len(valid_files)
         logger.info(
             f"Slice filter active: keeping {len(valid_files)}/{original_count} slices "
-            f"(positions {sorted(allowed_positions)}), {excluded} excluded."
+            f"(0-indexed positions {sorted(allowed_positions)} -> TMA IDs {kept_ids}), "
+            f"{excluded} excluded."
         )
         if len(valid_files) == 0:
             logger.error("Slice filter excluded all slices.")
@@ -128,11 +136,19 @@ def main():
         shutil.rmtree(staging_dir)
     os.makedirs(staging_dir, exist_ok=True)
     
+    # valid_files is already sorted numerically by get_slice_number() (see sample_files
+    # above). imgs_ordered=True makes VALIS trust the *alphabetical* order it sees in
+    # src_dir, so we zero-pad the symlink names here to force alphabetical order to
+    # match numeric slice order. The original files on disk are untouched — only the
+    # symlink names in staging_dir are padded.
+    pad_width = max(3, len(str(get_slice_number(valid_files[-1]))))
     for file_path in valid_files:
-        target_link = os.path.join(staging_dir, os.path.basename(file_path))
+        slice_num = get_slice_number(file_path)
+        padded_name = f"{slice_num:0{pad_width}d}_{os.path.basename(file_path)}"
+        target_link = os.path.join(staging_dir, padded_name)
         os.symlink(file_path, target_link)
-        
-    logger.info(f"Staged {len(valid_files)} files in {staging_dir}")
+
+    logger.info(f"Staged {len(valid_files)} files in {staging_dir} (zero-padded for ordering)")
 
     # -------------------------------------------------------------------------
     # 3. Automated VALIS Pipeline
@@ -146,7 +162,8 @@ def main():
         registrar = registration.Valis(
             src_dir=staging_dir,
             dst_dir=output_dir,
-            name=args.core_name
+            name=args.core_name,
+            imgs_ordered=True
         )
         
         registrar.register()

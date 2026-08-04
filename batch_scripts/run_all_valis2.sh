@@ -6,7 +6,7 @@ START=1
 END=30
 
 # Directory for log files
-LOG_DIR="log/valis2"
+LOG_DIR="log/valis2_filter"
 
 # YOUR ACTUAL ENVIRONMENT PATH
 VENV_PATH="/home/junming/3D-TMA-Register/venv_312"
