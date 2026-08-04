@@ -1,22 +1,26 @@
 """
 render_3d_cells.py
 ====================
-Render selected 3D reconstructed cells as real, surface-rendered interactive
-3D meshes (marching cubes), reading directly from link_3d_cells.py's saved
-3D label volume — no need to re-run or touch link_3d_cells.py itself.
+Render selected 3D reconstructed cells as real, surface rendered
+interactive 3D meshes using marching cubes. It reads directly from the 3D
+label volume saved by link_3d_cells.py, so there is no need to re-run or
+touch link_3d_cells.py itself.
 
-By default, renders the exact same set of cells sampled for the 2D tile QC
-montages in link_3d_cells.py (same random seed, same min_confirmed filter,
-same sample size), so the two QC views correspond 1:1 for direct comparison.
-Use --cell_ids to render specific cells on demand instead (e.g. ones a
-pathologist flags after reviewing the 2D tiles).
+By default, it renders the same set of cells that link_3d_cells.py sampled
+for its 2D tile QC montages. It uses the same random seed, the same
+min_confirmed filter, and the same sample size, so the two QC views line up
+1 to 1 for direct comparison. Use --cell_ids to render specific cells on
+demand instead, for example ones a pathologist flags after reviewing the
+2D tiles.
 
-Output: one self-contained, interactive HTML per cell (rotate/zoom in any
-browser) — meant to replace downloading a downsampled volume and opening it
-in FIJI's 3D viewer for a quick per-cell sanity check.
+Output is one self-contained, interactive HTML file per cell, rotatable and
+zoomable in any browser. This is meant to replace the workflow of
+downloading a downsampled volume and opening it in FIJI's 3D viewer just to
+do a quick per-cell sanity check.
 
-Requires plotly (not otherwise used elsewhere in this pipeline) and
-scikit-image (already a dependency via other scripts' skimage.transform use).
+This script requires plotly, which is not otherwise used elsewhere in this
+pipeline, and scikit-image, which is already a dependency through other
+scripts.
 
 Usage
 -----
@@ -50,7 +54,15 @@ PIXEL_SIZE_XY_UM     = 0.4961
 SECTION_THICKNESS_UM = 4.5
 
 N_SAMPLES_DEFAULT = 50   # matches link_3d_cells.py's N_TILE_SAMPLES
-PAD_VOXELS        = 3    # padding around each cell's bounding box, in voxels
+PAD_VOXELS        = 3    # padding around each cell's bounding box, in voxels (no-neighbors mode)
+
+# Colors cycled through for surrounding/neighbor cells, so each one is visually
+# distinct from the main (mediumseagreen) cell and from each other — mirrors
+# the per-label coloring pathologists already see in the 2D tile QC montages.
+NEIGHBOR_PALETTE = [
+    '#6699CC', '#CC99CC', '#CCCC66', '#66CCCC', '#CC9966', '#9999CC',
+    '#99CC99', '#CC6699', '#99CCCC', '#CCB266',
+]
 
 
 def parse_cell_ids(spec: str) -> list:
@@ -93,6 +105,19 @@ parser.add_argument('--input_dir_name', type=str, default='CellPose_DAPI_3D_Bspl
                     help='Folder under DATASPACE containing link_3d_cells.py output '
                          '(default: CellPose_DAPI_3D_Bspline) — must match whatever '
                          '--output_dir_name link_3d_cells.py was run with.')
+parser.add_argument('--no_neighbors', dest='show_neighbors', action='store_false',
+                    help='Disable rendering of surrounding cells for context (they are '
+                         'rendered by default, in different colors, so each HTML matches '
+                         "the neighboring-cell context visible in the 2D tile QC montages).")
+parser.add_argument('--context_pad_voxels', type=int, default=20,
+                    help='Padding (in voxels) around the main cell\'s bounding box used to '
+                         'find and render surrounding cells when --no_neighbors is not set '
+                         '(default: 20). Ignored if neighbors are disabled, in which case '
+                         f'the tighter default padding of {PAD_VOXELS} voxels is used instead.')
+parser.add_argument('--max_neighbors', type=int, default=25,
+                    help='Cap on how many surrounding cells to render per figure, to keep '
+                         'HTML file size / clutter in check (default: 25).')
+parser.set_defaults(show_neighbors=True)
 args = parser.parse_args()
 
 TARGET_CORE = args.core_name
@@ -166,10 +191,14 @@ for cid3d in cell_ids:
         n_skip += 1
         continue
 
-    z0, z1 = max(0, zs.min() - PAD_VOXELS), min(binary.shape[0], zs.max() + PAD_VOXELS + 1)
-    y0, y1 = max(0, ys.min() - PAD_VOXELS), min(binary.shape[1], ys.max() + PAD_VOXELS + 1)
-    x0, x1 = max(0, xs.min() - PAD_VOXELS), min(binary.shape[2], xs.max() + PAD_VOXELS + 1)
+    pad = args.context_pad_voxels if args.show_neighbors else PAD_VOXELS
+    z0, z1 = max(0, zs.min() - pad), min(binary.shape[0], zs.max() + pad + 1)
+    y0, y1 = max(0, ys.min() - pad), min(binary.shape[1], ys.max() + pad + 1)
+    x0, x1 = max(0, xs.min() - pad), min(binary.shape[2], xs.max() + pad + 1)
     sub = binary[z0:z1, y0:y1, x0:x1]
+    # Same crop, but keeping the original label IDs (not just this cell's binary
+    # mask) — this is how we find which other cells fall within the context window.
+    label_sub = label_vol[z0:z1, y0:y1, x0:x1]
 
     try:
         verts, faces, normals, _ = marching_cubes(
@@ -186,25 +215,67 @@ for cid3d in cell_ids:
 
     # verts columns are (z, y, x) in um (spacing order above); map explicitly
     # so the depth axis is z, not whatever Plotly's default would assume.
-    fig = go.Figure(data=[go.Mesh3d(
+    mesh_traces = [go.Mesh3d(
         x=verts[:, 2], y=verts[:, 1], z=verts[:, 0],
         i=faces[:, 0], j=faces[:, 1], k=faces[:, 2],
-        color='mediumseagreen', opacity=1.0,
+        color='mediumseagreen', opacity=1.0, name=f'cell {cid3d}', showlegend=True,
         lighting=dict(ambient=0.5, diffuse=0.8, specular=0.3, roughness=0.5),
         lightposition=dict(x=100, y=200, z=0),
-    )])
+    )]
+
+    n_neighbors_rendered = 0
+    if args.show_neighbors:
+        # Any other cell_id_3d present in this (wider) crop is a surrounding cell —
+        # render each in its own color, semi-transparent, so the main cell still
+        # stands out while giving the same neighboring-cell context a pathologist
+        # would see around this cell in the 2D tile QC montages.
+        neighbor_ids = [n for n in np.unique(label_sub) if n not in (0, cid3d)]
+        if len(neighbor_ids) > args.max_neighbors:
+            logger.info(f'    cell_id_3d={cid3d}: {len(neighbor_ids)} neighbors found, '
+                       f'capping at {args.max_neighbors}.')
+            neighbor_ids = neighbor_ids[:args.max_neighbors]
+
+        for i, nid in enumerate(neighbor_ids):
+            n_mask = (label_sub == nid)
+            n_zs = np.where(n_mask.any(axis=(1, 2)))[0]
+            if len(n_zs) < 2:
+                # Neighbor only clips the edge of the crop with no z-extent here —
+                # nothing 3D to render for it within this context window.
+                continue
+            try:
+                n_verts, n_faces, _, _ = marching_cubes(
+                    n_mask.astype(np.float32), level=0.5,
+                    spacing=(SECTION_THICKNESS_UM, PIXEL_SIZE_XY_UM, PIXEL_SIZE_XY_UM),
+                )
+            except (ValueError, RuntimeError):
+                continue
+            color = NEIGHBOR_PALETTE[i % len(NEIGHBOR_PALETTE)]
+            mesh_traces.append(go.Mesh3d(
+                x=n_verts[:, 2], y=n_verts[:, 1], z=n_verts[:, 0],
+                i=n_faces[:, 0], j=n_faces[:, 1], k=n_faces[:, 2],
+                color=color, opacity=0.35, name=f'neighbor {int(nid)}', showlegend=True,
+                lighting=dict(ambient=0.7, diffuse=0.6, specular=0.1, roughness=0.7),
+            ))
+            n_neighbors_rendered += 1
+
+    fig = go.Figure(data=mesh_traces)
+    title = f'3D cell {cid3d}  |  span={span} slices  |  vol={vol_um3:.0f} µm³'
+    if args.show_neighbors:
+        title += f'  |  {n_neighbors_rendered} neighboring cell(s) shown for context'
     fig.update_layout(
-        title=f'3D cell {cid3d}  |  span={span} slices  |  vol={vol_um3:.0f} µm³',
+        title=title,
         scene=dict(
             xaxis_title='x (µm)', yaxis_title='y (µm)', zaxis_title='z (µm)',
             aspectmode='data',   # true physical proportions, not equal-axis distortion
         ),
+        legend=dict(itemsizing='constant'),
         margin=dict(l=0, r=0, t=40, b=0),
     )
 
     out_path = os.path.join(RENDER_DIR, f'cell_{cid3d:06d}_3d.html')
     fig.write_html(out_path, include_plotlyjs='cdn')
-    logger.info(f'  cell_id_3d={cid3d}  (span={span}, vol={vol_um3:.0f} µm³) -> {out_path}')
+    neighbor_note = f', +{n_neighbors_rendered} neighbors' if args.show_neighbors else ''
+    logger.info(f'  cell_id_3d={cid3d}  (span={span}, vol={vol_um3:.0f} µm³{neighbor_note}) -> {out_path}')
     n_ok += 1
 
 logger.info('=' * 60)
