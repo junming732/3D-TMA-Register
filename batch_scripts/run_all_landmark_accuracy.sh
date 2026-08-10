@@ -15,10 +15,53 @@
 # =============================================================================
 
 # -----------------------------------------------------------------------------
+# CLI ARGS
+# -----------------------------------------------------------------------------
+usage() {
+    cat <<USAGE
+Usage: $0 [--pipeline bspline|roma|valis|all] [--start N] [--end N]
+
+  --pipeline   Which pipeline(s) to run. Default: all
+               (useful for e.g. iterating on RoMaV2 only: --pipeline roma)
+  --start      First core index (default 1)
+  --end        Last core index (default 30)
+USAGE
+    exit 1
+}
+
+PIPELINE_SEL="all"
+CLI_START=""
+CLI_END=""
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --pipeline) PIPELINE_SEL="$2"; shift 2 ;;
+        --start)    CLI_START="$2"; shift 2 ;;
+        --end)      CLI_END="$2"; shift 2 ;;
+        -h|--help)  usage ;;
+        *) echo "[ERROR] Unknown argument: $1"; usage ;;
+    esac
+done
+
+case "$PIPELINE_SEL" in
+    bspline|roma|valis|all) ;;
+    *) echo "[ERROR] --pipeline must be one of: bspline, roma, valis, all"; exit 1 ;;
+esac
+
+RUN_BSPLINE=0; RUN_ROMA=0; RUN_VALIS=0
+case "$PIPELINE_SEL" in
+    all)     RUN_BSPLINE=1; RUN_ROMA=1; RUN_VALIS=1 ;;
+    bspline) RUN_BSPLINE=1 ;;
+    roma)    RUN_ROMA=1 ;;
+    valis)   RUN_VALIS=1 ;;
+esac
+N_PIPELINES=$((RUN_BSPLINE + RUN_ROMA + RUN_VALIS))
+
+# -----------------------------------------------------------------------------
 # CONFIGURATION
 # -----------------------------------------------------------------------------
-START=1
-END=30
+START=${CLI_START:-1}
+END=${CLI_END:-30}
 
 # Paths
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -32,8 +75,8 @@ SCRIPT_VALIS="${PROJECT_ROOT}/evaluation/valis_accuracy_landmarks.py"
 # LaTeX table's path construction, so they can't drift out of sync with each
 # other. To point at a different experiment run, change these three only.
 BSPLINE_DIR_NAME="Filter_AKAZE_TissueMask_BSpline"
-ROMA_DIR_NAME="Filter_AKAZE_RoMaV2_Linear_Warp_map_multi_channel_3ch_fusion"
-VALIS_DIR_NAME="VALIS_Baseline_Eval"
+ROMA_DIR_NAME="Filter_AKAZE_RoMaV2_Linear_Warp_map_multi_channel_ck_clahe"
+VALIS_DIR_NAME="VALIS_Filter_Eval"
 
 ANNOTATION_DIR="${PROJECT_ROOT}/annotations"
 
@@ -76,6 +119,7 @@ declare -A CORE_STATUS
 echo "============================================================"
 echo "  Landmark Accuracy Evaluation Pipeline"
 echo "  Cores     : Core_$(printf "%02d" $START) -> Core_$(printf "%02d" $END)"
+echo "  Pipeline  : ${PIPELINE_SEL}"
 echo "  Dataspace : ${DATASPACE}"
 echo "  Start time: $(date)"
 echo "============================================================"
@@ -104,19 +148,21 @@ for i in $(seq $START $END); do
 
     if [ ! -f "${ANN_JSON}" ]; then
         echo "  [SKIP] No annotation file found for ${CORE_NAME}"
-        SKIP=$((SKIP + 3))
+        SKIP=$((SKIP + N_PIPELINES))
         CORE_STATUS[$CORE_NAME]="MISSING_JSON"
         continue
     fi
 
-    # Generic runner: takes a label and the full command to execute, so the
-    # same function handles accuracy_landmarks_deform.py (both pipelines)
-    # and valis_accuracy_landmarks.py uniformly.
+    # Generic runner: takes a label, the registration-variant dir name (so the
+    # log filename encodes exactly which config produced it — important since
+    # ROMA_DIR_NAME changes often while iterating on roma configs), and the
+    # full command to execute.
     run_pipeline() {
         local pipe_name=$1; shift
-        local log_file="${LOG_LANDMARK}/${CORE_NAME}_${pipe_name}.log"
+        local dir_name=$1; shift
+        local log_file="${LOG_LANDMARK}/${CORE_NAME}_${pipe_name}_${dir_name}.log"
 
-        echo "  [RUN] Evaluating Pipeline: ${pipe_name} (using $(basename "${ANN_JSON}")) ..."
+        echo "  [RUN] Evaluating Pipeline: ${pipe_name} [${dir_name}] (using $(basename "${ANN_JSON}")) ..."
 
         "$@" > "${log_file}" 2>&1
         local exit_code=$?
@@ -124,31 +170,37 @@ for i in $(seq $START $END); do
         if [ $exit_code -ne 0 ]; then
             FAIL=$((FAIL + 1))
             CORE_ALL_OK=0
-            echo "  [FAIL] ${pipe_name} failed. Check log: ${log_file}"
+            echo "  [FAIL] ${pipe_name} [${dir_name}] failed. Check log: ${log_file}"
         else
             DONE=$((DONE + 1))
-            echo "  [OK]   ${pipe_name} complete."
+            echo "  [OK]   ${pipe_name} [${dir_name}] complete."
         fi
     }
 
-    # Execute all three pipelines
-    run_pipeline "BSpline" python "${SCRIPT_DEFORM}" \
-        --core_name "${CORE_NAME}" --pipeline bspline \
-        --annotation_json "${ANN_JSON}" \
-        --pixel_size_um "${PIXEL_SIZE_UM}" --landmark_id "${MCLASS}" \
-        --work_output_dir "${BSPLINE_DIR_NAME}"
+    # Execute only the selected pipeline(s)
+    if [ "$RUN_BSPLINE" -eq 1 ]; then
+        run_pipeline "BSpline" "${BSPLINE_DIR_NAME}" python "${SCRIPT_DEFORM}" \
+            --core_name "${CORE_NAME}" --pipeline bspline \
+            --annotation_json "${ANN_JSON}" \
+            --pixel_size_um "${PIXEL_SIZE_UM}" --landmark_id "${MCLASS}" \
+            --work_output_dir "${BSPLINE_DIR_NAME}"
+    fi
 
-    run_pipeline "RoMaV2" python "${SCRIPT_DEFORM}" \
-        --core_name "${CORE_NAME}" --pipeline roma \
-        --annotation_json "${ANN_JSON}" \
-        --pixel_size_um "${PIXEL_SIZE_UM}" --landmark_id "${MCLASS}" \
-        --work_output_dir "${ROMA_DIR_NAME}"
+    if [ "$RUN_ROMA" -eq 1 ]; then
+        run_pipeline "RoMaV2" "${ROMA_DIR_NAME}" python "${SCRIPT_DEFORM}" \
+            --core_name "${CORE_NAME}" --pipeline roma \
+            --annotation_json "${ANN_JSON}" \
+            --pixel_size_um "${PIXEL_SIZE_UM}" --landmark_id "${MCLASS}" \
+            --work_output_dir "${ROMA_DIR_NAME}"
+    fi
 
-    run_pipeline "VALIS" python "${SCRIPT_VALIS}" \
-        --core_name "${CORE_NAME}" \
-        --annotation_json "${ANN_JSON}" \
-        --pixel_size_um "${PIXEL_SIZE_UM}" --landmark_id "${MCLASS}" \
-        --work_output_dir "${VALIS_DIR_NAME}"
+    if [ "$RUN_VALIS" -eq 1 ]; then
+        run_pipeline "VALIS" "${VALIS_DIR_NAME}" python "${SCRIPT_VALIS}" \
+            --core_name "${CORE_NAME}" \
+            --annotation_json "${ANN_JSON}" \
+            --pixel_size_um "${PIXEL_SIZE_UM}" --landmark_id "${MCLASS}" \
+            --work_output_dir "${VALIS_DIR_NAME}"
+    fi
 
     if [ $CORE_ALL_OK -eq 1 ]; then
         CORE_STATUS[$CORE_NAME]="OK"
@@ -325,7 +377,7 @@ done
 # -----------------------------------------------------------------------------
 # SUMMARY
 # -----------------------------------------------------------------------------
-MAX_RUNS=$((TOTAL * 3))
+MAX_RUNS=$((TOTAL * N_PIPELINES))
 
 echo ""
 echo "============================================================"

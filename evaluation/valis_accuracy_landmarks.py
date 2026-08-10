@@ -120,12 +120,16 @@ except Exception as e:
 # Build slice_idx → Slide mapping from the registrar itself — no file scanning needed.
 # registrar.slide_dict maps slide name → Slide object.
 # Sort by TMA number so position == slice_idx, same as other pipelines.
-slide_names_sorted = sorted(registrar.slide_dict.keys(), key=get_slice_number)
-idx_to_slide = {i: registrar.slide_dict[name]
-                for i, name in enumerate(slide_names_sorted)}
+idx_to_slide = {}
+for name, slide_obj in registrar.slide_dict.items():
+    tma_num = get_slice_number(name)
+    slice_idx = tma_num - 1  # 0-based to match z_json_to_slice_idx
+    idx_to_slide[slice_idx] = slide_obj
+
 logger.info(f"Registrar contains {len(idx_to_slide)} slides:")
-for i, name in enumerate(slide_names_sorted):
-    logger.info(f"  slice_idx={i:02d}  ->  {name}")
+# Sort by the actual slice_idx keys for clean, ordered logging
+for s_idx in sorted(idx_to_slide.keys()):
+    logger.info(f"  slice_idx={s_idx:02d}  ->  {idx_to_slide[s_idx].src_f}")
 
 
 # ─── LOAD ANNOTATIONS ─────────────────────────────────────────────────────────
