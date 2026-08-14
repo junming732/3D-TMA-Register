@@ -2,57 +2,68 @@
 Diagnostics for flagged 'unsuitable' cores.
 ============================================
 
-For a small set of cores that have been flagged as problematic (default:
-16, 17, 21, 23, 27), this script analyzes candidate images per slice
-(default set, all seven): DAPI, CK, AF (each log-normalised individually),
-'af_linear' (AF with a straight percentile stretch, no log1p — log
-compresses differences most at high values, which is exactly where AF's
-real signal is bunched, so this variant tests whether skipping it helps),
-'fusion' (DAPI+AF+CK weighted-blend collapsed to gray, AF still log-
-normalised — same recipe as prepare_3ch_fusion in
-akaze_romav2_multi_channel_warp.py), 'fusion_af_linear' (identical fusion,
-but AF uses the same linear stretch as af_linear instead of log — isolates
-whether the af_linear finding also helps once AF is folded into the fusion
-composite, not just alone), 'fusion_equal' (identical RGB composite to
-'fusion', but collapsed to gray via a simple equal-weighted channel mean
-instead of cv2.cvtColor's default RGB2GRAY luma weights — those weights
-are calibrated for human colour perception and, applied to DAPI->R/AF->G/
-CK->B, weight AF almost 2x DAPI and ~5x CK, which has no particular
-justification for these channels; this candidate tests whether that
-default weighting is actually helping or hurting), 'color_lut' (7-channel,
-AF-excluded, colour-LUT weighted blend collapsed to gray — same recipe as
-prepare_color_lut_fusion in that script), and 'color_lut_equal' (same idea
-as fusion_equal, applied to the color_lut composite instead). 'dapi_linear'
-and 'ck_linear' are also available via --channels if you want them. For
-each selected candidate, it:
+For a small set of flagged problem cores (default: 16, 17, 21, 23, 27),
+this script tests different ways of preparing each slice's image before
+alignment. The default set covers seven candidates:
 
-  1. Builds a per-channel contact-sheet montage across every slice in the
-     core, so you can visually scan how each candidate looks slice-by-slice
-     — useful for spotting exactly where signal drops out.
+  - DAPI, CK, AF: each log-normalized individually.
+  - af_linear: AF with a straight percentile stretch instead of log. Log
+    compresses differences most at high values. That is exactly where
+    AF's real signal sits. So this checks whether skipping log helps.
+  - fusion: DAPI, AF, and CK blended together and collapsed to
+    grayscale, with AF still log-normalized. Same recipe as
+    prepare_3ch_fusion.
+  - fusion_af_linear: the same fusion, but AF uses the linear stretch
+    from af_linear instead of log. This checks whether that change
+    still helps once AF is part of the composite, not just on its own.
+  - fusion_equal: the same composite as fusion, but collapsed to gray
+    using a plain average across channels instead of the default
+    grayscale conversion. The default weighting is built for how humans
+    perceive color. On these channels it ends up weighting AF almost
+    twice as much as DAPI, and about five times as much as CK, with no
+    real reason for that. This checks whether the default weighting
+    actually helps or just adds noise.
+  - color_lut: a 7 channel blend that excludes AF, using a different
+    weighting, then collapsed to gray. Same recipe as
+    prepare_color_lut_fusion.
+  - color_lut_equal: the same equal weighting idea as fusion_equal,
+    applied to the color_lut composite.
 
-  2. For every adjacent slice pair, builds a magenta/green overlay per
-     candidate (fixed=magenta, moving=green; white/grey = well aligned) plus
-     a combined side-by-side figure (one panel per selected candidate) for
-     that pair, so misalignment is visible before any registration is
-     attempted.
+dapi_clahe and ck_clahe use adaptive histogram equalization instead of a
+log or linear stretch. This matches how VALIS preprocesses fluorescence
+images by default, so it tests whether matching VALIS's own
+preprocessing closes the accuracy gap between the two pipelines.
+dapi_linear and ck_linear are also available through --channels.
 
-  3. Runs AKAZE (masked, same detector/matcher/RANSAC settings as the L0
-     channel-comparison script) independently on every selected candidate
-     for every adjacent pair, and records N_Matches / N_Inliers / success.
-     Also measures masked NCC on CK log before and after each candidate's
-     own estimated affine (same reference channel for every candidate, so
-     they're all scored against the same real-alignment yardstick — a
-     candidate can produce a geometrically 'successful' transform with few
-     inliers that still doesn't actually improve tissue alignment, which
-     match/inlier counts alone wouldn't catch). Plus an inlier-match
-     visualization — so you can see, per problem core, which candidate (if
-     any) actually has enough keypoints to register on, and whether doing
-     so actually helped.
+For each candidate, the script does three things:
 
-Tissue masks are loaded from the precomputed '<stem>_tissue_mask.png'
-sibling files (see crop_conform_mask_tma.py); if one is missing for a given
-slice, matching falls back to no masking for that slice with a warning
-(better to still show you the result than silently skip a problem core).
+  1. It builds a contact sheet montage per channel across all slices in
+     the core. This lets you scan slice by slice and spot exactly where
+     signal drops out.
+
+  2. For every adjacent slice pair, it builds a magenta and green
+     overlay per candidate. Fixed is magenta, moving is green, and
+     white or grey means good alignment. It also builds a combined side
+     by side figure so misalignment is visible before any registration
+     is attempted.
+
+  3. It runs AKAZE feature matching on every candidate for every
+     adjacent pair, using the same masking and settings as the L0
+     channel comparison script. It records the match count, inlier
+     count, and whether it succeeded. It also measures masked NCC on CK
+     log before and after each candidate's estimated transform, always
+     against the same reference. That gives every candidate a common
+     basis for comparison. This matters because a candidate can produce
+     a transform that looks fine geometrically but has very few
+     inliers, and still fails to actually improve tissue alignment.
+     Match counts alone would miss that. The script also produces an
+     inlier visualization, so you can see, per core, which candidate
+     has enough keypoints to register on, and whether it actually
+     helped.
+
+Tissue masks come from precomputed '<stem>_tissue_mask.png' files. If
+one is missing for a slice, that slice skips masking and prints a
+warning instead of being silently dropped.
 
 Usage:
     python analyze_unsuitable_cores.py
@@ -92,11 +103,11 @@ parser.add_argument('--core_ids', type=str, default="16,17,21,23,27",
                     help="Comma-separated core numbers and/or 'lo-hi' ranges, "
                          "e.g. '16,17,21,23,27' or '1-30' or '1-15,18-30'.")
 parser.add_argument('--channels', type=str,
-                    default="dapi,ck,af,af_linear,fusion,fusion_af_linear,fusion_equal,"
-                            "color_lut,color_lut_equal",
+                    default="dapi,ck,af,af_linear,dapi_clahe,ck_clahe,fusion,"
+                            "fusion_af_linear,fusion_equal,color_lut,color_lut_equal",
                     help="Comma-separated candidates: dapi,ck,af,af_linear,ck_linear,"
-                         "dapi_linear,fusion,fusion_af_linear,fusion_equal,"
-                         "color_lut,color_lut_equal")
+                         "dapi_linear,dapi_clahe,ck_clahe,fusion,fusion_af_linear,"
+                         "fusion_equal,color_lut,color_lut_equal")
 args = parser.parse_args()
 
 def parse_core_ids(spec: str) -> list:
@@ -129,17 +140,22 @@ AF_CHANNEL_IDX   = 7
 CHANNEL_IDX = {
     'dapi': DAPI_CHANNEL_IDX, 'ck': CK_CHANNEL_IDX, 'af': AF_CHANNEL_IDX,
     'dapi_linear': DAPI_CHANNEL_IDX, 'ck_linear': CK_CHANNEL_IDX, 'af_linear': AF_CHANNEL_IDX,
+    'dapi_clahe': DAPI_CHANNEL_IDX, 'ck_clahe': CK_CHANNEL_IDX,
 }
 LINEAR_CANDIDATES = {'dapi_linear', 'ck_linear', 'af_linear'}
+CLAHE_CANDIDATES  = {'dapi_clahe', 'ck_clahe'}
 CHANNEL_LABEL = {
     'dapi': 'DAPI', 'ck': 'CK', 'af': 'AF',
     'dapi_linear': 'DAPI (linear, no log)', 'ck_linear': 'CK (linear, no log)',
     'af_linear': 'AF (linear, no log)',
+    'dapi_clahe': 'DAPI (CLAHE, matches VALIS ChannelGetter)',
+    'ck_clahe': 'CK (CLAHE)',
     'fusion': 'Fusion (DAPI+AF+CK)', 'fusion_af_linear': 'Fusion (AF linear)',
     'fusion_equal': 'Fusion (equal-weight gray)',
     'color_lut': 'Color LUT (7ch)', 'color_lut_equal': 'Color LUT (equal-weight gray)',
 }
 VALID_CANDIDATES = {'dapi', 'ck', 'af', 'dapi_linear', 'ck_linear', 'af_linear',
+                    'dapi_clahe', 'ck_clahe',
                     'fusion', 'fusion_af_linear', 'fusion_equal',
                     'color_lut', 'color_lut_equal'}
 
@@ -230,6 +246,20 @@ def linear_normalize(channel_f32, lo=0.1, hi=99.9):
                          cv2.NORM_MINMAX).astype(np.uint8)
 
 
+def clahe_normalize(channel_f32):
+    """
+    Matches VALIS's default fluorescence preprocessing exactly —
+    preprocessing.ChannelGetter.process_image(adaptive_eq=True):
+        rescale to [0,1] -> skimage.exposure.equalize_adapthist -> rescale to uint8
+    No log/linear percentile stretch first; CLAHE's local contrast
+    normalization replaces that step entirely, same as VALIS.
+    """
+    from skimage import exposure
+    img01 = exposure.rescale_intensity(channel_f32, out_range=(0, 1))
+    eq    = exposure.equalize_adapthist(img01)
+    return exposure.rescale_intensity(eq, out_range=(0, 255)).astype(np.uint8)
+
+
 def _prepare_single(img_arr, lo=0.1, hi=99.5):
     """Matches akaze_romav2_multi_channel_warp.py's _prepare_single exactly
     (note: hi=99.5 here, vs 99.9 in log_normalize above — kept distinct so
@@ -298,7 +328,9 @@ def get_display_and_gray(channel_key, vol):
     """
     if channel_key in CHANNEL_IDX:
         idx = CHANNEL_IDX[channel_key]
-        if channel_key in LINEAR_CANDIDATES:
+        if channel_key in CLAHE_CANDIDATES:
+            gray = clahe_normalize(vol[idx].astype(np.float32))
+        elif channel_key in LINEAR_CANDIDATES:
             gray = linear_normalize(vol[idx].astype(np.float32))
         else:
             gray = log_normalize(vol[idx].astype(np.float32))
@@ -625,7 +657,7 @@ def main():
         sys.exit(1)
 
     df = pd.DataFrame(all_rows)
-    csv_path = os.path.join(OUT_BASE, "unsuitable_cores_akaze_summary.csv")
+    csv_path = os.path.join(OUT_BASE, "all_cores_akaze_summary(dapi_clahe).csv")
     df.to_csv(csv_path, index=False)
 
     summary = df.groupby(['Core', 'Channel']).agg(
@@ -635,7 +667,7 @@ def main():
         mean_ncc_improv_pct=('NCC_Improvement_Pct', 'mean'),
     ).reset_index()
     logger.info("Per-core, per-channel summary:\n" + summary.to_string(index=False))
-    summary.to_csv(os.path.join(OUT_BASE, "unsuitable_cores_summary_by_channel.csv"), index=False)
+    summary.to_csv(os.path.join(OUT_BASE, "all_cores_summary_by_channel(dapi_clahe).csv"), index=False)
 
     logger.info(f"Done. Results in {OUT_BASE}")
 
