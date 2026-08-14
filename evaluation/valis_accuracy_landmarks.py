@@ -51,6 +51,7 @@ import config
 from landmark_accuracy_common import (
     z_json_to_slice_idx, get_slice_number, make_two_channel_rgb, _annotate_overlay_ax,
 )
+from channel_patterns import PATTERN_REGISTRY
 
 # ─── CLI ──────────────────────────────────────────────────────────────────────
 parser = argparse.ArgumentParser()
@@ -62,7 +63,20 @@ parser.add_argument('--work_output_dir', type=str, default='VALIS_Baseline_Eval'
                     help='Folder under DATASPACE holding VALIS registration output '
                          '(default: VALIS_Baseline_Eval). Override to point at a '
                          'different experiment run.')
+parser.add_argument('--overlay_channels', type=str, default='dapi,ck',
+                    help="Comma-separated list of channel patterns to render as rows "
+                         "in the adjacent-slice overlay, in the order given. Choices: "
+                         f"{sorted(PATTERN_REGISTRY.keys())}. Default 'dapi,ck' reproduces "
+                         "the original two-row (DAPI/CK) overlay.")
+parser.add_argument('--skip_overlays', action='store_true',
+                    help='Skip the adjacent-slice overlay PNGs entirely (CSV/summary plot only).')
 args = parser.parse_args()
+
+OVERLAY_PATTERNS = [p.strip() for p in args.overlay_channels.split(',') if p.strip()]
+_bad = [p for p in OVERLAY_PATTERNS if p not in PATTERN_REGISTRY]
+if _bad:
+    parser.error(f"Unknown --overlay_channels pattern(s) {_bad}. "
+                 f"Choices: {sorted(PATTERN_REGISTRY.keys())}")
 
 TARGET_CORE   = args.core_name
 PIXEL_SIZE_UM = args.pixel_size_um
@@ -365,58 +379,127 @@ print(f"  GLOBAL  mean TRE = {all_tre_um.mean():.2f} µm  |  "
 print("="*70 + "\n")
 
 # ─── ADJACENT-SLICE OVERLAYS ──────────────────────────────────────────────────
-# Layout: 2 rows × N columns per figure.
-#   Row 0 — DAPI overlay  (channel 0)
-#   Row 1 — CK overlay    (channel CK_CHANNEL_IDX)
+# Layout: len(OVERLAY_PATTERNS) rows × N columns per figure — one row per
+# --overlay_channels pattern (dapi, ck, dapi_clahe, ck_clahe, color_lut,
+# 3ch_fusion; see channel_patterns.PATTERN_REGISTRY).
 
-DAPI_CHANNEL_IDX = 0
-CK_CHANNEL_IDX   = 6
+_valis_full_img_cache = {}  # slice_idx -> full loaded array (or None), avoids
+                            # re-reading the same registered TIFF once per
+                            # channel for multi-channel patterns like color_lut.
 
 
-def load_slice_channel_valis(slice_idx, channel_idx):
+def _resolve_valis_reg_path(slice_idx):
     slide_obj = idx_to_slide.get(slice_idx)
     if slide_obj is None:
         return None
-
-    # Find registered output file instead of raw src_f
     src_basename = os.path.splitext(os.path.basename(slide_obj.src_f))[0]
     candidates = glob.glob(os.path.join(REG_SLIDES_DIR, f"*{src_basename}*"))
     if not candidates:
         logger.warning(f"No registered file found for slice_idx={slice_idx} "
                        f"(looking for *{src_basename}* in {REG_SLIDES_DIR})")
         return None
-    reg_path = candidates[0]
+    return candidates[0]
 
+
+def _load_valis_full_image(slice_idx):
+    if slice_idx in _valis_full_img_cache:
+        return _valis_full_img_cache[slice_idx]
+    reg_path = _resolve_valis_reg_path(slice_idx)
+    img = None
+    if reg_path is not None:
+        try:
+            import tifffile
+            img = tifffile.imread(reg_path)
+        except Exception as e:
+            logger.warning(f"Could not load registered slice_idx={slice_idx}: {e}")
+    _valis_full_img_cache[slice_idx] = img
+    return img
+
+
+def _extract_channel(img, channel_idx):
     try:
-        import tifffile
-        img = tifffile.imread(reg_path)
         if img.ndim == 2:
-            ch = img
+            return img
         elif img.ndim == 3:
-            ch = img[channel_idx]
+            return img[channel_idx]
         else:
-            ch = img[0, channel_idx]
-        ch = ch.astype(np.float32)
-        p2, p98 = np.percentile(ch, 2), np.percentile(ch, 98)
-        if p98 > p2:
-            ch = np.clip((ch - p2) / (p98 - p2), 0, 1)
-        return ch
+            return img[0, channel_idx]
     except Exception as e:
-        logger.warning(f"Could not load registered slice_idx={slice_idx}: {e}")
+        logger.warning(f"Could not extract channel {channel_idx}: {e}")
         return None
+
+
+def load_slice_channel_valis(slice_idx, channel_idx):
+    """
+    Stretched loader — matches the ORIGINAL script behaviour exactly:
+    2nd/98th-pct contrast stretch to float32 [0, 1]. Used only by the
+    original 'dapi'/'ck' patterns so their default output is unchanged.
+    """
+    img = _load_valis_full_image(slice_idx)
+    if img is None:
+        return None
+    ch = _extract_channel(img, channel_idx)
+    if ch is None:
+        return None
+    ch = ch.astype(np.float32)
+    p2, p98 = np.percentile(ch, 2), np.percentile(ch, 98)
+    if p98 > p2:
+        ch = np.clip((ch - p2) / (p98 - p2), 0, 1)
+    return ch
+
+
+def load_slice_channel_valis_raw(slice_idx, channel_idx):
+    """
+    Raw (unstretched) loader — for pattern builders (clahe_normalize,
+    prepare_color_lut_fusion, prepare_3ch_fusion, ...) that do their own
+    log1p/percentile normalisation on raw intensities. Feeding them the
+    already-[0,1]-stretched output of load_slice_channel_valis would
+    double-stretch and diverge from what the registration script actually
+    computed — same reasoning as channel_patterns.load_slice_channel_raw_from_vol.
+    """
+    img = _load_valis_full_image(slice_idx)
+    if img is None:
+        return None
+    ch = _extract_channel(img, channel_idx)
+    if ch is None:
+        return None
+    return ch.astype(np.float32)
+
+
+def _load_pattern_image_valis(sidx, pattern_name):
+    """
+    Build the single (H, W) grayscale image for `pattern_name` at slice_idx
+    `sidx` for the VALIS pipeline. Mirrors
+    accuracy_landmarks_deform.py's _load_pattern_image, adapted to VALIS's
+    per-slide-file loading instead of a merged registered volume.
+    """
+    cfg = PATTERN_REGISTRY[pattern_name]
+    loader = (load_slice_channel_valis if cfg['loader'] == 'stretched'
+              else load_slice_channel_valis_raw)
+    channel_imgs = {}
+    for ch_idx in cfg['channels']:
+        img = loader(sidx, ch_idx)
+        if img is None:
+            return None
+        channel_imgs[ch_idx] = img
+    result = cfg['builder'](channel_imgs)
+
+    # make_two_channel_rgb expects float32 [0, 1] (the 'stretched' contract).
+    # Raw-loader builders return uint8 [0, 255] — normalise here so every
+    # pattern shares the same contract regardless of which loader it used.
+    if result.dtype == np.uint8:
+        result = result.astype(np.float32) / 255.0
+    return result
 
 
 # make_two_channel_rgb, _annotate_overlay_ax imported from landmark_accuracy_common.
 
 
-def plot_adjacent_slice_overlays_valis(df_detail,
-                                       dapi_crop_half=50,
-                                       ck_crop_half=150,
-                                       dpi=120):
+def plot_adjacent_slice_overlays_valis(df_detail, patterns, dpi=120):
     """
-    For each mclass with ≥2 z-levels, produce one PNG with a horizontal grid layout:
-      Row 0 — DAPI (ch 0) cyan/magenta overlay — tighter crop (dapi_crop_half=50)
-      Row 1 — CK   (ch 6) cyan/magenta overlay — wider crop  (ck_crop_half=150)
+    For each mclass with ≥2 z-levels, produce one PNG with one row per
+    entry in `patterns`, each row showing the red/green (slice A / slice B)
+    overlay for that pattern at its own default crop half-width.
     Each column corresponds to an adjacent slice pair.
     """
     try:
@@ -425,7 +508,11 @@ def plot_adjacent_slice_overlays_valis(df_detail,
         logger.warning("tifffile not installed — skipping adjacent-slice overlays.")
         return
 
-    max_cols = 3
+    max_cols   = 3
+    n_rows     = len(patterns)
+    row_height = 10.5  # inches per row, matches accuracy_landmarks_deform.py
+
+    logger.info(f"Overlay patterns: {patterns}")
 
     for mc, grp in df_detail.groupby('landmark_id'):
         grp_sorted = grp.sort_values('z_json_a').reset_index(drop=True)
@@ -438,33 +525,26 @@ def plot_adjacent_slice_overlays_valis(df_detail,
 
         for chunk_idx, chunk in enumerate(chunks):
             n_cols = len(chunk)
-            
-            # ─── GEOMETRY FIX ────────────────────────────────────────────────
-            # Maintained original grid direction (2 Rows x n_cols Columns).
-            # Expanded baseline canvas width to (10 * n_cols) and height to 21 inches.
-            # This allocates a 10x10.5 inch space per square subplot, giving the
-            # long figure title natural room to fit without generating white side margins.
-            fig, axes = plt.subplots(2, n_cols,
-                                     figsize=(10 * n_cols, 21),
+
+            fig, axes = plt.subplots(n_rows, n_cols,
+                                     figsize=(10 * n_cols, row_height * n_rows),
                                      squeeze=False)
 
             part_str = f" (Part {chunk_idx + 1}/{len(chunks)})" if len(chunks) > 1 else ""
-            
-            # Expanded main title font size with newline padding
+
             fig.suptitle(
                 f"Pipeline B: {TARGET_CORE} | landmark {mc}{part_str}\n"
                 f"Adjacent-slice overlay",
                 fontsize=28, fontweight='bold'
             )
 
-            # Enumerate slice pairs along the horizontal columns
             for col, (_, pair_row) in enumerate(chunk.iterrows()):
                 sidx_a = int(pair_row['slice_idx_a'])
                 sidx_b = int(pair_row['slice_idx_b'])
-                
+
                 z_a    = sidx_a + 1
                 z_b    = sidx_b + 1
-                
+
                 wx_a   = float(pair_row['x_warped_a'])
                 wy_a   = float(pair_row['y_warped_a'])
                 wx_b   = float(pair_row['x_warped_b'])
@@ -475,15 +555,14 @@ def plot_adjacent_slice_overlays_valis(df_detail,
                 mid_x   = (wx_a + wx_b) / 2
                 mid_y   = (wy_a + wy_b) / 2
 
-                # Enumerate channel stains along the vertical rows
-                for row_idx, (ch_idx, ch_label, ch_crop) in enumerate([
-                        (DAPI_CHANNEL_IDX, "DAPI", dapi_crop_half),
-                        (CK_CHANNEL_IDX,   "CK",   ck_crop_half)]):
+                for row_idx, pattern_name in enumerate(patterns):
+                    cfg      = PATTERN_REGISTRY[pattern_name]
+                    ch_crop  = cfg['crop_half']
+                    ch_label = cfg['label']
 
-                    # Maintained original matrix array indexing layout
                     ax    = axes[row_idx][col]
-                    img_a = load_slice_channel_valis(sidx_a, ch_idx)
-                    img_b = load_slice_channel_valis(sidx_b, ch_idx)
+                    img_a = _load_pattern_image_valis(sidx_a, pattern_name)
+                    img_b = _load_pattern_image_valis(sidx_b, pattern_name)
 
                     if img_a is None and img_b is None:
                         ax.set_title(f"{ch_label}  z {z_a}→{z_b}\n(unavailable)", fontsize=20)
@@ -507,7 +586,7 @@ def plot_adjacent_slice_overlays_valis(df_detail,
 
             # Restrict subplots to 95% height to prevent overlapping with the main title text
             plt.tight_layout(rect=[0, 0, 1, 0.95])
-            
+
             file_suffix  = f"_pt{chunk_idx + 1}" if len(chunks) > 1 else ""
             overlay_path = os.path.join(
                 VERIFY_OUTPUT, f"{TARGET_CORE}_VALIS_adjacent_overlay_mclass{mc}{file_suffix}.png"
@@ -515,6 +594,11 @@ def plot_adjacent_slice_overlays_valis(df_detail,
             fig.savefig(overlay_path, dpi=dpi, bbox_inches='tight')
             plt.close(fig)
             logger.info(f"Adjacent overlay (mclass {mc}{part_str}) → {overlay_path}")
-plot_adjacent_slice_overlays_valis(df_detail)
+
+
+if not args.skip_overlays:
+    plot_adjacent_slice_overlays_valis(df_detail, OVERLAY_PATTERNS)
+else:
+    logger.info("--skip_overlays set — skipping adjacent-slice overlay PNGs.")
 
 logger.info("Done.")

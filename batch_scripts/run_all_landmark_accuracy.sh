@@ -19,12 +19,19 @@
 # -----------------------------------------------------------------------------
 usage() {
     cat <<USAGE
-Usage: $0 [--pipeline bspline|roma|valis|all] [--start N] [--end N]
+Usage: $0 [--pipeline bspline|roma|valis|all] [--start N] [--end N] [--overlay_channels PATTERNS] [--skip_overlays]
 
-  --pipeline   Which pipeline(s) to run. Default: all
-               (useful for e.g. iterating on RoMaV2 only: --pipeline roma)
-  --start      First core index (default 1)
-  --end        Last core index (default 30)
+  --pipeline          Which pipeline(s) to run. Default: all
+                       (useful for e.g. iterating on RoMaV2 only: --pipeline roma)
+  --start             First core index (default 1)
+  --end               Last core index (default 30)
+  --overlay_channels  Comma-separated channel patterns for the adjacent-slice overlay
+                       PNGs (bspline, roma, AND valis — all three scripts share the
+                       same channel_patterns.py registry) — one row per pattern.
+                       Choices: dapi, ck, dapi_clahe, ck_clahe, color_lut, 3ch_fusion.
+                       Default: dapi,ck
+  --skip_overlays     Skip the adjacent-slice overlay PNGs for all selected pipelines
+                       (CSV/summary plot only).
 USAGE
     exit 1
 }
@@ -32,12 +39,16 @@ USAGE
 PIPELINE_SEL="all"
 CLI_START=""
 CLI_END=""
+OVERLAY_CHANNELS="dapi,ck"
+SKIP_OVERLAYS=0
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --pipeline) PIPELINE_SEL="$2"; shift 2 ;;
-        --start)    CLI_START="$2"; shift 2 ;;
-        --end)      CLI_END="$2"; shift 2 ;;
+        --pipeline)         PIPELINE_SEL="$2"; shift 2 ;;
+        --start)            CLI_START="$2"; shift 2 ;;
+        --end)              CLI_END="$2"; shift 2 ;;
+        --overlay_channels) OVERLAY_CHANNELS="$2"; shift 2 ;;
+        --skip_overlays)    SKIP_OVERLAYS=1; shift ;;
         -h|--help)  usage ;;
         *) echo "[ERROR] Unknown argument: $1"; usage ;;
     esac
@@ -75,7 +86,7 @@ SCRIPT_VALIS="${PROJECT_ROOT}/evaluation/valis_accuracy_landmarks.py"
 # LaTeX table's path construction, so they can't drift out of sync with each
 # other. To point at a different experiment run, change these three only.
 BSPLINE_DIR_NAME="Filter_AKAZE_TissueMask_BSpline"
-ROMA_DIR_NAME="Filter_AKAZE_RoMaV2_Linear_Warp_map_multi_channel_ck_clahe"
+ROMA_DIR_NAME="Filter_AKAZE_RoMaV2_Linear_Warp_map_multi_channel_color_lut"
 VALIS_DIR_NAME="VALIS_Filter_Eval"
 
 ANNOTATION_DIR="${PROJECT_ROOT}/annotations"
@@ -107,6 +118,14 @@ DATASPACE="$(python -c "import sys; sys.path.insert(0,'${PROJECT_ROOT}'); import
 if [ -z "${DATASPACE}" ]; then
     echo "[ERROR] Could not read DATASPACE from config.py"
     exit 1
+fi
+
+# Extra args forwarded to accuracy_landmarks_deform.py AND valis_accuracy_landmarks.py —
+# both now share the same --overlay_channels / --skip_overlays flags and the
+# same channel_patterns.py registry.
+DEFORM_OVERLAY_ARGS=(--overlay_channels "${OVERLAY_CHANNELS}")
+if [ "$SKIP_OVERLAYS" -eq 1 ]; then
+    DEFORM_OVERLAY_ARGS+=(--skip_overlays)
 fi
 
 TOTAL=$((END - START + 1))
@@ -183,7 +202,8 @@ for i in $(seq $START $END); do
             --core_name "${CORE_NAME}" --pipeline bspline \
             --annotation_json "${ANN_JSON}" \
             --pixel_size_um "${PIXEL_SIZE_UM}" --landmark_id "${MCLASS}" \
-            --work_output_dir "${BSPLINE_DIR_NAME}"
+            --work_output_dir "${BSPLINE_DIR_NAME}" \
+            "${DEFORM_OVERLAY_ARGS[@]}"
     fi
 
     if [ "$RUN_ROMA" -eq 1 ]; then
@@ -191,7 +211,8 @@ for i in $(seq $START $END); do
             --core_name "${CORE_NAME}" --pipeline roma \
             --annotation_json "${ANN_JSON}" \
             --pixel_size_um "${PIXEL_SIZE_UM}" --landmark_id "${MCLASS}" \
-            --work_output_dir "${ROMA_DIR_NAME}"
+            --work_output_dir "${ROMA_DIR_NAME}" \
+            "${DEFORM_OVERLAY_ARGS[@]}"
     fi
 
     if [ "$RUN_VALIS" -eq 1 ]; then
@@ -199,7 +220,8 @@ for i in $(seq $START $END); do
             --core_name "${CORE_NAME}" \
             --annotation_json "${ANN_JSON}" \
             --pixel_size_um "${PIXEL_SIZE_UM}" --landmark_id "${MCLASS}" \
-            --work_output_dir "${VALIS_DIR_NAME}"
+            --work_output_dir "${VALIS_DIR_NAME}" \
+            "${DEFORM_OVERLAY_ARGS[@]}"
     fi
 
     if [ $CORE_ALL_OK -eq 1 ]; then
