@@ -38,6 +38,11 @@ except ImportError:
     sys.exit(1)
 
 
+import os
+os.environ["TMPDIR"] = os.path.join(config.WORKSPACE, "vips_tmp")
+os.makedirs(os.environ["TMPDIR"], exist_ok=True)
+
+
 def load_slice_filter(yaml_path, core_name):
     if not os.path.exists(yaml_path):
         return None
