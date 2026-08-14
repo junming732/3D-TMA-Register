@@ -327,7 +327,7 @@ def measure_slice(
     volume_slice: np.ndarray,
     min_area:     int = 200,
     slice_id:     int = 0,
-) -> pd.DataFrame:
+) -> tuple[pd.DataFrame, dict]:
     """
     For one slice: measure per-cell median intensity for each marker,
     derive a per-slice threshold from cell medians, and classify cells.
@@ -341,12 +341,12 @@ def measure_slice(
 
     Returns
     -------
-    pd.DataFrame with one row per cell.
+    Tuple of (pd.DataFrame with one row per cell, dict of channel images).
     """
     labels = np.unique(mask)
     labels = labels[labels != 0]
     if len(labels) == 0:
-        return pd.DataFrame()
+        return pd.DataFrame(), {}
 
     label_list = labels.tolist()
     areas      = np.array(ndi.sum(np.ones_like(mask), mask, label_list), dtype=np.int32)
@@ -354,7 +354,7 @@ def measure_slice(
     label_list = [l for l, k in zip(label_list, keep) if k]
     areas      = areas[keep]
     if len(label_list) == 0:
-        return pd.DataFrame()
+        return pd.DataFrame(), {}
 
     # Expand nuclear mask 4 px (~2 µm) to capture membrane signal
     cell_mask = expand_labels(mask, distance=4)

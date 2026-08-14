@@ -23,3 +23,7 @@ akaze_plots*
 thesis_figs
 annotations/
 log/
+
+*.csv
+*.md
+.snakemake

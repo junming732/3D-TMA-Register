@@ -915,16 +915,33 @@ def main() -> None:
 
     # ── Load volume ────────────────────────────────────────────────────────
     logger.info('Loading registered volume ...')
-    vol = tifffile.imread(INPUT_VOL)
+    
+    # Force tifffile to read ALL pages, preventing the 2D single-page error
+    try:
+        vol = tifffile.imread(INPUT_VOL, key=slice(None))
+    except Exception:
+        vol = tifffile.imread(INPUT_VOL) # Fallback for standard files
 
+    # Robust Reshaping for VALIS vs RoMaV2/B-Spline compatibility
     if vol.ndim == 3:
-        vol = vol[np.newaxis, np.newaxis]   # (1, 1, H, W) — single slice, single ch
+        # VALIS loads as (Total_Pages, H, W). We must fold it into (Z, C, H, W).
+        inferred_channels = len(CHANNEL_NAMES_ORDERED)
+        total_images, H, W = vol.shape
+        
+        if total_images % inferred_channels == 0:
+            inferred_slices = total_images // inferred_channels
+            vol = vol.reshape((inferred_slices, inferred_channels, H, W))
+            logger.info(f"Re-folded VALIS flat stack into Z={inferred_slices}, C={inferred_channels}")
+        else:
+            vol = vol[:, np.newaxis, :, :] 
+
     elif vol.ndim == 4:
-        # Ensure ZCYX order
+        # Standard RoMaV2/B-Spline pipeline (already 4D)
         if vol.shape[0] != 1 and vol.shape[1] == 1:
             vol = np.moveaxis(vol, 0, 1)    # was CZYX → ZCYX
 
     n_slices, n_channels, H, W = vol.shape
+    
     logger.info(f'Volume shape: Z={n_slices}  C={n_channels}  H={H}  W={W}')
     logger.info(f'Parallel workers per slice: {args.workers}')
 

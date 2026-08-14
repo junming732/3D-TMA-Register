@@ -1,0 +1,122 @@
+# =============================================================================
+# config.yaml
+# Single source of truth for core list, registration variant, and per-stage
+# parameters. Mirrors the *_DIR_NAME config vars already used at the top of
+# each run_all_*.sh batch script — this file replaces those, one place
+# instead of one copy per batch script.
+# =============================================================================
+
+# ---------------------------------------------------------------------------
+# CORES
+# ---------------------------------------------------------------------------
+core_start: 9
+core_end: 19
+# Cores to exclude entirely (e.g. known-bad cores from analyse_unsuitable_cores.py)
+excluded_cores: [10,11,12,13,14,15,17,18]
+
+# ---------------------------------------------------------------------------
+# REGISTRATION
+# ---------------------------------------------------------------------------
+# Which registration script/mode produced the volumes everything downstream
+# reads. "romav2" is fully wired to akaze_romav2_multi_channel_warp.py below.
+# "bspline" is a placeholder — folder names match what denoise_volume.py /
+# phenotype_cells.py / link_3d_cells.py already default to, but the actual
+# registration script that PRODUCES Filter_AKAZE_TissueMask_BSpline isn't
+# available yet; fill in registration_script/registration_shell_extra once
+# you have it.
+registration_variant: "romav2"   # "bspline" | "romav2"
+
+registration:
+  bspline:
+    script: "registration/akaze_tissue_mask_bspline.py"  
+    output_dir_name: "Filter_AKAZE_TissueMask_BSpline"
+    vol_filename_suffix: "_AKAZE_TissueMask_Aligned.ome.tif"
+    extra_args: ""   # TODO: fill in this script's actual CLI flags
+    # Short label used to name every downstream stage folder for this variant
+    # (see the "{tag}" placeholders under cellpose/denoise/link_3d/phenotype/
+    # tme_comparison below). Change this and every downstream folder name
+    # changes with it — no need to touch each *_dir_name individually.
+    tag: "Bspline"
+  romav2:
+    script: "registration/akaze_romav2_multi_channel_warp_new.py"
+    output_dir_name: "Filter_AKAZE_RoMaV2_Linear_Warp_map_multi_channel_color_lut"
+    vol_filename_suffix: "_AKAZE_RoMaV2_Linear_Aligned.ome.tif"
+    extra_args: "--registration_mode color_lut"
+    # Other valid --registration_mode values: 3ch_fusion, color_lut, dapi_clahe, ck_clahe
+    # (output_dir_name must match the mode: folder is suffixed
+    # _multi_channel_{mode}, e.g. ..._multi_channel_dapi_clahe)
+    # If you switch --registration_mode above, update this tag to match
+    # (e.g. "RomaV2_3chFusion") so downstream folder names stay accurate.
+    tag: "RomaV2_ColorLut"
+
+# ---------------------------------------------------------------------------
+# CELLPOSE SEGMENTATION + MASK WARP
+# ---------------------------------------------------------------------------
+cellpose:
+  use_gpu: true
+  plot_qc: true
+  mask_dir_name: "CellPose_DAPI"
+  # {tag} is substituted with registration.<variant>.tag at load time, e.g.
+  # "CellPose_DAPI_Warped_RomaV2_CkOnly" when registration_variant: romav2
+  warped_dir_name: "CellPose_DAPI_Warped_{tag}"
+
+# ---------------------------------------------------------------------------
+# DENOISING
+# ---------------------------------------------------------------------------
+denoise:
+  pixel_um: 0.4961
+  dust_pct: 99
+  workers: 1
+  output_dir_name: "Denoised_{tag}"
+
+# ---------------------------------------------------------------------------
+# 3D LINKING (DAPI only)
+# ---------------------------------------------------------------------------
+link_3d:
+  min_slices: 1
+  max_slices: 5
+  min_area_px: 200
+  min_overlap: 30
+  min_confirmed: 2
+  min_iou: 0.15
+  min_intensity_frac: 0.3
+  coloc_radius_um: 50
+  output_dir_name: "CellPose_DAPI_3D_{tag}"
+
+# ---------------------------------------------------------------------------
+# PHENOTYPING
+# ---------------------------------------------------------------------------
+phenotype:
+  min_area_px: 200
+  output_dir_name: "Phenotypes_{tag}"
+  # Full path to a registration_stats CSV (Slice_ID/Slice_Z), or leave empty
+  # to use sorted-filename-order fallback matching (see phenotype_cells.py).
+  reg_stats_csv: ""
+
+# ---------------------------------------------------------------------------
+# CELL TYPE ASSIGNMENT
+# ---------------------------------------------------------------------------
+assign_phenotypes:
+  min_confidence: 0.5
+
+# ---------------------------------------------------------------------------
+# 2D vs 3D TME COMPARISON
+# ---------------------------------------------------------------------------
+tme_comparison:
+  radius_um: 50
+  min_cells: 10
+  output_dir_name: "TME_Analysis_{tag}"
+
+# ---------------------------------------------------------------------------
+# AGGREGATION (runs once across all cores, not per-core)
+# ---------------------------------------------------------------------------
+aggregate:
+  radius_um: 50
+
+# ---------------------------------------------------------------------------
+# OPTIONAL: 3D CELL RENDERING (QC only, not required for the main pipeline)
+# ---------------------------------------------------------------------------
+render_3d:
+  #enabled: true
+  min_confirmed: 2
+  n_samples: 50
