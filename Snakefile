@@ -166,7 +166,7 @@ rule evaluate_landmarks:
         "--annotation_json {params.annotation_json} "
         "--pixel_size_um {params.pixel_size_um} "
         "--work_output_dir {params.work_output_dir} "
-        "--skip_overlays > {log} 2>&1"
+        " > {log} 2>&1"
 
 
 # =============================================================================

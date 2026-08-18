@@ -259,7 +259,6 @@ if df.empty:
 # This matches our chained rolling registration exactly: each adjacent pair
 # was registered directly to each other, so pairwise distance is the direct
 # measure of that registration step's error.
-summary_rows = []
 detail_rows  = []
 
 for mc, grp in df.groupby('landmark_id'):
@@ -304,26 +303,7 @@ for mc, grp in df.groupby('landmark_id'):
             'TRE_um':        round(d_um, 3),
         })
 
-    summary_rows.append({
-        'landmark_id':        mc,
-        'n_slices':      len(pts),
-        'n_pairs':       len(pair_indices),
-        'mean_TRE_px':   round(mean_TRE_px, 3),
-        'median_TRE_px': round(np.median(pair_dist_px), 3),
-        'q3_TRE_px':     round(np.percentile(pair_dist_px, 75), 3),
-        'p90_TRE_px':    round(np.percentile(pair_dist_px, 90), 3),
-        'max_TRE_px':    round(pair_dist_px.max(), 3),
-        'std_TRE_px':    round(pair_dist_px.std(), 3) if len(pair_dist_px) > 1 else 0.0,
-        'mean_TRE_um':   round(mean_TRE_um, 3),
-        'median_TRE_um': round(np.median(pair_dist_um), 3),
-        'q3_TRE_um':     round(np.percentile(pair_dist_um, 75), 3),
-        'p90_TRE_um':    round(np.percentile(pair_dist_um, 90), 3),
-        'max_TRE_um':    round(pair_dist_um.max(), 3),
-        'std_TRE_um':    round(pair_dist_um.std(), 3) if len(pair_dist_um) > 1 else 0.0,
-    })
-
 df_detail  = pd.DataFrame(detail_rows)
-df_summary = pd.DataFrame(summary_rows).sort_values('landmark_id')
 
 # Global TRE across all consecutive pairs
 all_tre_px = df_detail['TRE_px'].values
@@ -337,6 +317,32 @@ logger.info(f"  P90            : {np.percentile(all_tre_px, 90):.2f} px  = {np.p
 logger.info(f"  max   TRE      : {all_tre_px.max():.2f} px  = {all_tre_um.max():.2f} µm")
 logger.info(f"  std   TRE      : {all_tre_px.std():.2f} px  = {all_tre_um.std():.2f} µm")
 logger.info("──────────────────────────────────────────────────────────────")
+
+# Row in df_detail that produced the global max TRE — names exactly which
+# landmark/pair drove the worst-case number, instead of leaving that lookup
+# to whoever reads the log.
+max_idx = df_detail['TRE_um'].idxmax()
+max_row = df_detail.loc[max_idx]
+
+df_summary = pd.DataFrame([{
+    'core':                TARGET_CORE,
+    'pipeline':            args.pipeline,
+    'n_pairs':             len(df_detail),
+    'mean_TRE_px':         round(all_tre_px.mean(), 3),
+    'mean_TRE_um':         round(all_tre_um.mean(), 3),
+    'median_TRE_px':       round(np.median(all_tre_px), 3),
+    'median_TRE_um':       round(np.median(all_tre_um), 3),
+    'q3_TRE_px':           round(np.percentile(all_tre_px, 75), 3),
+    'q3_TRE_um':           round(np.percentile(all_tre_um, 75), 3),
+    'p90_TRE_px':          round(np.percentile(all_tre_px, 90), 3),
+    'p90_TRE_um':          round(np.percentile(all_tre_um, 90), 3),
+    'max_TRE_px':          round(all_tre_px.max(), 3),
+    'max_TRE_um':          round(all_tre_um.max(), 3),
+    'max_TRE_landmark_id': int(max_row['landmark_id']),
+    'max_TRE_slice_pair':  f"{int(max_row['slice_idx_a']) + 1}\u2192{int(max_row['slice_idx_b']) + 1}",
+    'std_TRE_px':          round(all_tre_px.std(), 3),
+    'std_TRE_um':          round(all_tre_um.std(), 3),
+}])
 
 # ─── SAVE CSVs ────────────────────────────────────────────────────────────────
 detail_csv  = os.path.join(VERIFY_OUTPUT, f"{TARGET_CORE}_landmark_accuracy_detail.csv")
