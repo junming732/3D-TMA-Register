@@ -14,8 +14,9 @@
 # -----------------------------------------------------------------------------
 # CONFIGURATION
 # -----------------------------------------------------------------------------
-START=1
-END=30
+# START=1
+# END=30
+CORE_NUMS=(9 16 19)   # <-- explicit list of core numbers to run
 
 # Phenotyping flags
 MIN_AREA_PX=200     # minimum nucleus area in pixels (consistent with CellPose min_size)
@@ -24,9 +25,9 @@ PLOT_QC=true        # set to false to skip QC plots and save time
 # Registration-variant-dependent folders — must match whatever produced your
 # current inputs. Change these three (and REG_STATS_CSV below) to point at a
 # different registration run without editing phenotype_cells.py.
-DENOISED_DIR_NAME="Denoised_bspline"
-MASK_DIR_NAME="CellPose_DAPI_Warped_Bspline"
-OUTPUT_DIR_NAME="Phenotypes_Bspline"
+DENOISED_DIR_NAME="Denoised_valis"
+MASK_DIR_NAME="CellPose_DAPI_Warped_Valis"
+OUTPUT_DIR_NAME="Phenotypes_Valis"
 
 # Optional: full path to a registration_stats CSV (Slice_ID/Slice_Z columns) for
 # accurate slice-to-volume-index mapping. Leave empty to use sorted-filename-order
@@ -39,7 +40,7 @@ PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 PHENO_SCRIPT="${PROJECT_ROOT}/spatial_analysis/phenotype_cells.py"
 
 LOG_ROOT="${PROJECT_ROOT}/log/full_pipeline"
-LOG_PHENO="${LOG_ROOT}/phenotyping_bspline"
+LOG_PHENO="${LOG_ROOT}/phenotyping_valis"
 
 # -----------------------------------------------------------------------------
 # SETUP
@@ -62,7 +63,8 @@ echo "  DATASPACE : ${DATASPACE}"
 
 mkdir -p "${LOG_PHENO}"
 
-TOTAL=$((END - START + 1))
+# TOTAL=$((END - START + 1))
+TOTAL=${#CORE_NUMS[@]}
 DONE=0
 FAIL=0
 SKIP=0
@@ -77,7 +79,8 @@ fi
 
 echo "============================================================"
 echo "  Cell Phenotyping Pipeline"
-echo "  Cores     : Core_$(printf "%02d" $START) -> Core_$(printf "%02d" $END)"
+# echo "  Cores     : Core_$(printf "%02d" $START) -> Core_$(printf "%02d" $END)"
+echo "  Cores     : $(printf "Core_%02d " "${CORE_NUMS[@]}")"
 echo "  Min area  : ${MIN_AREA_PX} px"
 echo "  QC plots  : ${PLOT_QC}"
 echo "  Start time: $(date)"
@@ -86,10 +89,13 @@ echo "============================================================"
 # -----------------------------------------------------------------------------
 # MAIN LOOP
 # -----------------------------------------------------------------------------
-for i in $(seq $START $END); do
+# for i in $(seq $START $END); do
+IDX=0
+for i in "${CORE_NUMS[@]}"; do
 
     CORE_NAME="Core_$(printf "%02d" $i)"
-    IDX=$((i - START + 1))
+    # IDX=$((i - START + 1))
+    IDX=$((IDX + 1))
 
     echo ""
     echo "------------------------------------------------------------"
@@ -179,7 +185,8 @@ printf "  Results         : %d OK  |  %d FAILED  |  %d SKIPPED  (of %d)\n" \
 echo "------------------------------------------------------------"
 
 echo "  Per-core status:"
-for i in $(seq $START $END); do
+# for i in $(seq $START $END); do
+for i in "${CORE_NUMS[@]}"; do
     CORE_NAME="Core_$(printf "%02d" $i)"
     STATUS="${CORE_STATUS[$CORE_NAME]:-UNKNOWN}"
     printf "    %-12s  %s\n" "${CORE_NAME}" "${STATUS}"

@@ -13,8 +13,9 @@
 # -----------------------------------------------------------------------------
 # CONFIGURATION
 # -----------------------------------------------------------------------------
-START=1
-END=30
+# START=1
+# END=30
+CORE_NUMS=(9 16 19)   # <-- explicit list of core numbers to run
 
 # =============================================================================
 # ARGUMENT GUIDE — what each flag controls and why they do NOT conflict
@@ -63,19 +64,19 @@ COLOC_RADIUS_UM=50
 
 # Registration-variant-dependent folders — change these to point at a
 # different registration run without editing link_3d_cells.py.
-INPUT_DIR_NAME="CellPose_DAPI_Warped_Bspline"
-OUTPUT_DIR_NAME="CellPose_DAPI_3D_Bspline"
-DENOISED_DIR_NAME="Denoised_bspline"
+INPUT_DIR_NAME="CellPose_DAPI_Warped_Valis"
+OUTPUT_DIR_NAME="CellPose_DAPI_3D_Valis"
+DENOISED_DIR_NAME="Denoised_valis"
 # Leave empty to default to CellPose_<COLOC_CHANNEL>_3D_Bspline
 COLOC_DIR_NAME=""
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
-ANALYSIS_SCRIPT="${PROJECT_ROOT}/registration/link_3d_cells.py"
+ANALYSIS_SCRIPT="${PROJECT_ROOT}/spatial_analysis/link_3d_cells.py"
 
 LOG_ROOT="${PROJECT_ROOT}/log/full_pipeline"
-LOG_3D="${LOG_ROOT}/3d_linkage_bspline"
+LOG_3D="${LOG_ROOT}/3d_linkage_valis"
 
 # -----------------------------------------------------------------------------
 # SETUP
@@ -98,7 +99,8 @@ echo "  DATASPACE : ${DATASPACE}"
 
 mkdir -p "${LOG_3D}"
 
-TOTAL=$((END - START + 1))
+# TOTAL=$((END - START + 1))
+TOTAL=${#CORE_NUMS[@]}
 DONE=0
 FAIL=0
 SKIP=0
@@ -107,7 +109,8 @@ declare -A CORE_STATUS
 
 echo "============================================================"
 echo "  3D Cell Analysis Pipeline (DAPI)"
-echo "  Cores     : Core_$(printf "%02d" $START) -> Core_$(printf "%02d" $END)"
+# echo "  Cores     : Core_$(printf "%02d" $START) -> Core_$(printf "%02d" $END)"
+echo "  Cores     : $(printf "Core_%02d " "${CORE_NUMS[@]}")"
 echo "  Max slices: ${MAX_SLICES}"
 echo "  Start time: $(date)"
 echo "============================================================"
@@ -115,10 +118,13 @@ echo "============================================================"
 # -----------------------------------------------------------------------------
 # MAIN LOOP
 # -----------------------------------------------------------------------------
-for i in $(seq $START $END); do
+# for i in $(seq $START $END); do
+IDX=0
+for i in "${CORE_NUMS[@]}"; do
 
     CORE_NAME="Core_$(printf "%02d" $i)"
-    IDX=$((i - START + 1))
+    # IDX=$((i - START + 1))
+    IDX=$((IDX + 1))
 
     echo ""
     echo "------------------------------------------------------------"
@@ -209,7 +215,8 @@ printf "  Results         : %d OK  |  %d FAILED  |  %d SKIPPED  (of %d)\n" \
 echo "------------------------------------------------------------"
 
 echo "  Per-core status:"
-for i in $(seq $START $END); do
+# for i in $(seq $START $END); do
+for i in "${CORE_NUMS[@]}"; do
     CORE_NAME="Core_$(printf "%02d" $i)"
     STATUS="${CORE_STATUS[$CORE_NAME]:-UNKNOWN}"
     printf "    %-12s  %s\n" "${CORE_NAME}" "${STATUS}"
