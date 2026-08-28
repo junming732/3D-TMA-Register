@@ -61,6 +61,7 @@ current_dir = os.path.dirname(os.path.abspath(__file__))
 parent_dir  = os.path.dirname(current_dir)
 sys.path.append(parent_dir)
 import config
+from qc_reference import get_or_match_qc_cells
 
 logging.basicConfig(level=logging.INFO,
                     format='%(asctime)s | %(levelname)s | %(message)s')
@@ -110,6 +111,25 @@ parser.add_argument('--coloc_dir_name',     type=str, default=None,
                          'If omitted, defaults to CellPose_{coloc_channel}_3D_Bspline — this '
                          'assumes the co-localisation channel was linked with the same '
                          'registration variant as this (DAPI) run.')
+parser.add_argument('--set_qc_reference',   action='store_true',
+                    help='Make this run\'s tile-QC sample the shared cross-pipeline QC cell '
+                         'registry (overwriting it if one exists), so other pipelines match '
+                         'their QC picks to these physical cells. Off by default — every '
+                         'existing call site keeps behaving exactly as before unless this is '
+                         'explicitly passed.')
+parser.add_argument('--qc_pipeline_kind', type=str, default=None, choices=['valis', 'romav2'],
+                    help='Enables raw-space coordinate correction for cross-pipeline QC cell '
+                         'matching (see qc_reference.py / raw_space_transform.py) — converts '
+                         'centroids to the shared pre-registration image frame before '
+                         'comparing them, instead of comparing this pipeline\'s own registered '
+                         'coordinates directly. Requires --qc_transform_dir too. Omit both for '
+                         'the old behavior (direct centroid comparison — only valid for QC '
+                         'within one pipeline\'s own runs, not across different pipelines).')
+parser.add_argument('--qc_transform_dir', type=str, default=None,
+                    help='Directory containing this pipeline\'s per-z-slice transform .npz '
+                         'files. For valis: the point_transforms/ folder produced by '
+                         'export_valis_transform.py. For romav2: deformation_maps/, already '
+                         'produced by registration — no extra export step needed.')
 args = parser.parse_args()
 
 # -----------------------------------------------------------------------------
@@ -850,6 +870,56 @@ if args.plot_qc:
                      'z_b', 'id_2d_b', 'area_b_px', 'area_ratio']
         ).to_csv(os.path.join(QC_DIR, 'flagged_area_inconsistency.csv'), index=False)
 
+    # ── QC 4.5: Comprehensive Link Metrics Export ─────────────────────────────
+    # Aggregate all link metrics into a single dataset to enable cross-pipeline 
+    # statistical comparisons without requiring recalculation.
+    logger.info("QC: exporting complete link metrics dataset...")
+
+    all_metrics = []
+    
+    for cid3d, members in cell_members.items():
+        if len(members) < 2:
+            continue
+        for i in range(len(members) - 1):
+            z_a, id_a = members[i]
+            z_b, id_b = members[i + 1]
+            
+            if z_b != z_a + 1:
+                continue
+                
+            # 1. Overlap Fraction
+            overlap_px = edge_overlap_px.get((z_a, id_a, z_b, id_b), 0)
+            area_a     = cell_areas.get((z_a, id_a), 1)
+            area_b     = cell_areas.get((z_b, id_b), 1)
+            frac       = overlap_px / min(area_a, area_b)
+            
+            # 2. Centroid Drift
+            cy_a, cx_a = cell_centroids.get((z_a, id_a), (0, 0))
+            cy_b, cx_b = cell_centroids.get((z_b, id_b), (0, 0))
+            drift      = float(np.sqrt((cx_b - cx_a)**2 + (cy_b - cy_a)**2))
+            
+            # 3. Area Ratio
+            ratio = max(area_a, area_b) / min(area_a, area_b) if min(area_a, area_b) > 0 else 0.0
+            
+            all_metrics.append({
+                'cell_id_3d': cid3d,
+                'z_a': z_a,
+                'id_2d_a': id_a,
+                'z_b': z_b,
+                'id_2d_b': id_b,
+                'overlap_px': overlap_px,
+                'area_a_px': area_a,
+                'area_b_px': area_b,
+                'overlap_fraction': round(frac, 3),
+                'centroid_drift_px': round(drift, 2),
+                'area_ratio': round(ratio, 2)
+            })
+
+    if all_metrics:
+        metrics_csv_path = os.path.join(QC_DIR, 'all_link_metrics.csv')
+        pd.DataFrame(all_metrics).to_csv(metrics_csv_path, index=False)
+        logger.info(f"  Complete link metrics saved -> {metrics_csv_path}")
+
     # ── QC 5: Visual tile montages ────────────────────────────────────────────
     # For a random sample of multi-slice 3D cells, render a row of DAPI
     # intensity patches — one per slice — centred on the 2D nucleus centroid,
@@ -883,12 +953,19 @@ if args.plot_qc:
     if not multi_slice_ids:
         logger.warning("No multi-slice cells found — skipping tile QC.")
     else:
-        rng_tile   = np.random.default_rng(seed=0)
-        sample_ids = rng_tile.choice(
-            multi_slice_ids,
-            size=min(N_TILE_SAMPLES, len(multi_slice_ids)),
-            replace=False,
+        # Matches against (or, when --set_qc_reference is passed, writes) the
+        # shared cross-pipeline QC reference, so the same physical cells show
+        # up in every registration variant's QC. See qc_reference.py.
+        sample_ids = get_or_match_qc_cells(
+            core_name=TARGET_CORE, df_cells=df_cells, min_confirmed=args.min_confirmed,
+            n_samples=N_TILE_SAMPLES, pipeline_tag=args.input_dir_name,
+            dataspace=config.DATASPACE, seed=0,
+            set_reference=args.set_qc_reference, logger=logger,
+            pixel_size_um=PIXEL_SIZE_XY_UM, section_thickness_um=SECTION_THICKNESS_UM,
+            qc_pipeline_kind=args.qc_pipeline_kind, qc_transform_dir=args.qc_transform_dir,
         )
+        if not sample_ids:
+            logger.warning("QC reference matching returned no cells — skipping tile QC.")
 
         # Build two lookups used during neighbour rendering:
         #   z_to_multislice_2d : z -> set of 2D IDs belonging to any confirmed

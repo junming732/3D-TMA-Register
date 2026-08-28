@@ -24,7 +24,7 @@ excluded_cores: [10,11,12,13,14,15,17,18]
 # registration script that PRODUCES Filter_AKAZE_TissueMask_BSpline isn't
 # available yet; fill in registration_script/registration_shell_extra once
 # you have it.
-registration_variant: "romav2"   # "bspline" | "romav2"
+registration_variant: "romav2"   # "bspline" | "romav2" | "valis"
 
 registration:
   bspline:
@@ -39,15 +39,31 @@ registration:
     tag: "Bspline"
   romav2:
     script: "registration/akaze_romav2_multi_channel_warp_new.py"
-    output_dir_name: "Filter_AKAZE_RoMaV2_Linear_Warp_map_multi_channel_color_lut"
+    output_dir_name: "Filter_AKAZE_RoMaV2_Linear_Warp_map_multi_channel_clahe_visual_additive_3ch"
     vol_filename_suffix: "_AKAZE_RoMaV2_Linear_Aligned.ome.tif"
-    extra_args: "--registration_mode color_lut"
+    extra_args: "--registration_mode clahe_visual_additive_3ch"
     # Other valid --registration_mode values: 3ch_fusion, color_lut, dapi_clahe, ck_clahe
     # (output_dir_name must match the mode: folder is suffixed
     # _multi_channel_{mode}, e.g. ..._multi_channel_dapi_clahe)
     # If you switch --registration_mode above, update this tag to match
     # (e.g. "RomaV2_3chFusion") so downstream folder names stay accurate.
-    tag: "RomaV2_ColorLut"
+    tag: "RomaV2_clahe_visual_additive_3ch"
+  valis:
+    # This won't actually get invoked as long as VALIS_Filter_Eval's vol +
+    # deformation data already exist on disk (rule registration has no file
+    # inputs of its own — Snakemake only reruns it if its declared outputs
+    # are missing). Fill in the real script path if/when you do need a fresh
+    # Valis run through Snakemake.
+    script: "registration/valis_register.py"   # placeholder — verify if ever actually invoked
+    output_dir_name: "VALIS_Filter_Eval"
+    # Confirmed against your existing Core_09 output:
+    # VALIS_Filter_Eval/Core_09/Core_09_VALIS_baseline.ome.tiff
+    vol_filename_suffix: "_VALIS_baseline.ome.tiff"
+    extra_args: ""
+    # Matches the already-existing CellPose_DAPI_Warped_Valis folder's casing.
+    # Denoised_valis (lowercase) needs renaming to Denoised_Valis to match —
+    # see accompanying note.
+    tag: "Valis"
 
 # ---------------------------------------------------------------------------
 # CELLPOSE SEGMENTATION + MASK WARP

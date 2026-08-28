@@ -38,12 +38,14 @@ import numpy as np
 import pandas as pd
 import tifffile
 from skimage.measure import marching_cubes
+from scipy.ndimage import binary_dilation
 import plotly.graph_objects as go
 
 current_dir = os.path.dirname(os.path.abspath(__file__))
 parent_dir  = os.path.dirname(current_dir)
 sys.path.append(parent_dir)
 import config
+from qc_reference import get_or_match_qc_cells
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(levelname)s | %(message)s')
 logger = logging.getLogger(__name__)
@@ -80,6 +82,13 @@ def parse_cell_ids(spec: str) -> list:
     return ids
 
 
+def hex_to_rgba(hex_color: str, alpha: float) -> str:
+    """'#6699CC' + 0.35 -> 'rgba(102, 153, 204, 0.35)' for per-vertex Mesh3d alpha."""
+    hex_color = hex_color.lstrip('#')
+    r, g, b = (int(hex_color[i:i + 2], 16) for i in (0, 2, 4))
+    return f'rgba({r}, {g}, {b}, {alpha})'
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # CLI
 # ─────────────────────────────────────────────────────────────────────────────
@@ -109,15 +118,44 @@ parser.add_argument('--no_neighbors', dest='show_neighbors', action='store_false
                     help='Disable rendering of surrounding cells for context (they are '
                          'rendered by default, in different colors, so each HTML matches '
                          "the neighboring-cell context visible in the 2D tile QC montages).")
-parser.add_argument('--context_pad_voxels', type=int, default=20,
+parser.add_argument('--context_pad_voxels', type=int, default=35,
                     help='Padding (in voxels) around the main cell\'s bounding box used to '
                          'find and render surrounding cells when --no_neighbors is not set '
-                         '(default: 20). Ignored if neighbors are disabled, in which case '
+                         '(default: 35, raised from the original 20 so more surrounding '
+                         'cells show up). Ignored if neighbors are disabled, in which case '
                          f'the tighter default padding of {PAD_VOXELS} voxels is used instead.')
 parser.add_argument('--max_neighbors', type=int, default=25,
-                    help='Cap on how many surrounding cells to render per figure, to keep '
-                         'HTML file size / clutter in check (default: 25).')
-parser.set_defaults(show_neighbors=True)
+                    help='Cap on how many surrounding cells get their own rendered mesh, to '
+                         'keep HTML file size / clutter in check (default: 25). Does not '
+                         'limit which neighbors count toward touching-surface highlighting.')
+parser.add_argument('--no_contact_highlight', dest='contact_highlight', action='store_false',
+                    help='Disable touching-surface highlighting (on by default): the patch '
+                         'of each neighbor\'s own surface that touches the main cell is '
+                         'rendered more opaque than the rest of that neighbor, making the '
+                         'contact visible without adding a separate highlight color.')
+parser.add_argument('--contact_opacity', type=float, default=0.85,
+                    help='Opacity for the touching patch of a neighboring cell\'s surface '
+                         '(default: 0.85, vs the base neighbor opacity of 0.35 elsewhere).')
+parser.add_argument('--contact_dilation_voxels', type=int, default=1,
+                    help='How far (in voxels) to grow each touching zone so it reads as a '
+                         'visible patch rather than a single-voxel seam (default: 1).')
+parser.add_argument('--set_qc_reference',   action='store_true',
+                    help='Make this run\'s sample the shared cross-pipeline QC cell registry '
+                         '(overwriting it if one exists), so other pipelines match their QC '
+                         'picks to these physical cells. Off by default — every existing '
+                         'call site keeps behaving exactly as before unless this is '
+                         'explicitly passed.')
+parser.add_argument('--qc_pipeline_kind', type=str, default=None, choices=['valis', 'romav2'],
+                    help='Enables raw-space coordinate correction for cross-pipeline QC cell '
+                         'matching (see qc_reference.py / raw_space_transform.py). Requires '
+                         '--qc_transform_dir too. Omit both for the old behavior (direct '
+                         'centroid comparison — only valid within one pipeline\'s own runs).')
+parser.add_argument('--qc_transform_dir', type=str, default=None,
+                    help='Directory containing this pipeline\'s per-z-slice transform .npz '
+                         'files. For valis: the point_transforms/ folder produced by '
+                         'export_valis_transform.py. For romav2: deformation_maps/, already '
+                         'produced by registration — no extra export step needed.')
+parser.set_defaults(show_neighbors=True, contact_highlight=True)
 args = parser.parse_args()
 
 TARGET_CORE = args.core_name
@@ -152,14 +190,24 @@ if args.cell_ids:
     cell_ids = parse_cell_ids(args.cell_ids)
     logger.info(f'Rendering {len(cell_ids)} explicitly requested cell(s): {cell_ids}')
 else:
-    eligible = df_stats[df_stats['z_span_slices'] >= args.min_confirmed]['cell_id_3d'].values
-    if len(eligible) == 0:
-        logger.error(f'No cells with z_span_slices >= {args.min_confirmed} found.')
+    # Matches against (or, when --set_qc_reference is passed, writes) the
+    # shared cross-pipeline QC reference, so this lines up with
+    # link_3d_cells.py's 2D tile QC montages and with other registration
+    # pipelines' renders for the same core. See qc_reference.py.
+    cell_ids = get_or_match_qc_cells(
+        core_name=TARGET_CORE, df_cells=df_stats, min_confirmed=args.min_confirmed,
+        n_samples=args.n_samples, pipeline_tag=args.input_dir_name,
+        dataspace=config.DATASPACE, seed=0,
+        set_reference=args.set_qc_reference, logger=logger,
+        pixel_size_um=PIXEL_SIZE_XY_UM, section_thickness_um=SECTION_THICKNESS_UM,
+        qc_pipeline_kind=args.qc_pipeline_kind, qc_transform_dir=args.qc_transform_dir,
+    )
+    if not cell_ids:
+        logger.error('QC reference matching returned no cells to render.')
         sys.exit(1)
-    rng = np.random.default_rng(seed=0)   # same seed as link_3d_cells.py's tile QC sample
-    cell_ids = rng.choice(eligible, size=min(args.n_samples, len(eligible)), replace=False)
-    logger.info(f'No --cell_ids given — rendering the same {len(cell_ids)} cell(s) sampled '
-               f'for the 2D tile QC montages (seed=0, min_confirmed={args.min_confirmed}).')
+    logger.info(f'No --cell_ids given — rendering {len(cell_ids)} cell(s) from the shared '
+               f'QC reference (same physical cells as the 2D tile QC, and as other '
+               f'pipeline variants for this core).')
 
 # ─────────────────────────────────────────────────────────────────────────────
 # RENDER
@@ -213,28 +261,26 @@ for cid3d in cell_ids:
     span    = int(row['z_span_slices'].values[0])
     vol_um3 = float(row['volume_um3'].values[0])
 
-    # verts columns are (z, y, x) in um (spacing order above); map explicitly
-    # so the depth axis is z, not whatever Plotly's default would assume.
-    mesh_traces = [go.Mesh3d(
-        x=verts[:, 2], y=verts[:, 1], z=verts[:, 0],
-        i=faces[:, 0], j=faces[:, 1], k=faces[:, 2],
-        color='mediumseagreen', opacity=1.0, name=f'cell {cid3d}', showlegend=True,
-        lighting=dict(ambient=0.5, diffuse=0.8, specular=0.3, roughness=0.5),
-        lightposition=dict(x=100, y=200, z=0),
-    )]
+    # Any other cell_id_3d present in this (wider) crop is a surrounding cell.
+    all_neighbor_ids = [n for n in np.unique(label_sub) if n not in (0, cid3d)]
+    neighbor_ids = all_neighbor_ids
+    if args.show_neighbors and len(neighbor_ids) > args.max_neighbors:
+        logger.info(f'    cell_id_3d={cid3d}: {len(neighbor_ids)} neighbors found, '
+                   f'capping at {args.max_neighbors}.')
+        neighbor_ids = neighbor_ids[:args.max_neighbors]
 
-    n_neighbors_rendered = 0
+    # Dilating the main cell's own mask once, up front, is what "touching"
+    # means for every neighbor below: a neighbor voxel within
+    # contact_dilation_voxels of this is in contact with the main cell.
+    main_grown = (binary_dilation(sub, iterations=args.contact_dilation_voxels)
+                  if args.contact_highlight else None)
+
+    # Render each surrounding cell in its own color, semi-transparent — except
+    # for the patch of it that touches the main cell, which is rendered far
+    # more opaque (--contact_opacity) so the contact is visible without
+    # recoloring anything. Per-vertex alpha via rgba() strings in vertexcolor.
+    neighbor_traces, n_touching_neighbors = [], 0
     if args.show_neighbors:
-        # Any other cell_id_3d present in this (wider) crop is a surrounding cell —
-        # render each in its own color, semi-transparent, so the main cell still
-        # stands out while giving the same neighboring-cell context a pathologist
-        # would see around this cell in the 2D tile QC montages.
-        neighbor_ids = [n for n in np.unique(label_sub) if n not in (0, cid3d)]
-        if len(neighbor_ids) > args.max_neighbors:
-            logger.info(f'    cell_id_3d={cid3d}: {len(neighbor_ids)} neighbors found, '
-                       f'capping at {args.max_neighbors}.')
-            neighbor_ids = neighbor_ids[:args.max_neighbors]
-
         for i, nid in enumerate(neighbor_ids):
             n_mask = (label_sub == nid)
             n_zs = np.where(n_mask.any(axis=(1, 2)))[0]
@@ -250,18 +296,57 @@ for cid3d in cell_ids:
             except (ValueError, RuntimeError):
                 continue
             color = NEIGHBOR_PALETTE[i % len(NEIGHBOR_PALETTE)]
-            mesh_traces.append(go.Mesh3d(
+
+            touching = False
+            if args.contact_highlight:
+                contact_mask = main_grown & n_mask
+                if contact_mask.any():
+                    z_idx = np.clip(np.round(n_verts[:, 0] / SECTION_THICKNESS_UM).astype(int),
+                                    0, n_mask.shape[0] - 1)
+                    y_idx = np.clip(np.round(n_verts[:, 1] / PIXEL_SIZE_XY_UM).astype(int),
+                                    0, n_mask.shape[1] - 1)
+                    x_idx = np.clip(np.round(n_verts[:, 2] / PIXEL_SIZE_XY_UM).astype(int),
+                                    0, n_mask.shape[2] - 1)
+                    is_contact = contact_mask[z_idx, y_idx, x_idx]
+                    if is_contact.any():
+                        touching = True
+                        n_touching_neighbors += 1
+
+            mesh_kwargs = dict(
                 x=n_verts[:, 2], y=n_verts[:, 1], z=n_verts[:, 0],
                 i=n_faces[:, 0], j=n_faces[:, 1], k=n_faces[:, 2],
-                color=color, opacity=0.35, name=f'neighbor {int(nid)}', showlegend=True,
+                name=f'neighbor {int(nid)}', showlegend=True,
                 lighting=dict(ambient=0.7, diffuse=0.6, specular=0.1, roughness=0.7),
-            ))
-            n_neighbors_rendered += 1
+            )
+            if touching:
+                vertex_colors = np.where(
+                    is_contact,
+                    hex_to_rgba(color, args.contact_opacity),
+                    hex_to_rgba(color, 0.35),
+                )
+                mesh_kwargs['vertexcolor'] = vertex_colors
+            else:
+                mesh_kwargs['color']   = color
+                mesh_kwargs['opacity'] = 0.35
+            neighbor_traces.append(go.Mesh3d(**mesh_kwargs))
+    n_neighbors_rendered = len(neighbor_traces)
+
+    # verts columns are (z, y, x) in um (spacing order above); map explicitly
+    # so the depth axis is z, not whatever Plotly's default would assume.
+    mesh_traces = [go.Mesh3d(
+        x=verts[:, 2], y=verts[:, 1], z=verts[:, 0],
+        i=faces[:, 0], j=faces[:, 1], k=faces[:, 2],
+        color='mediumseagreen', opacity=1.0, name=f'cell {cid3d}', showlegend=True,
+        lighting=dict(ambient=0.5, diffuse=0.8, specular=0.3, roughness=0.5),
+        lightposition=dict(x=100, y=200, z=0),
+    )] + neighbor_traces
 
     fig = go.Figure(data=mesh_traces)
     title = f'3D cell {cid3d}  |  span={span} slices  |  vol={vol_um3:.0f} µm³'
     if args.show_neighbors:
         title += f'  |  {n_neighbors_rendered} neighboring cell(s) shown for context'
+    if args.contact_highlight and n_touching_neighbors:
+        title += f'  |  {n_touching_neighbors} touching (opaque patch)'
     fig.update_layout(
         title=title,
         scene=dict(

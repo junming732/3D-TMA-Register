@@ -36,6 +36,41 @@ REG_VARIANT = config["registration_variant"]
 REG_CFG     = config["registration"][REG_VARIANT]
 TAG         = REG_CFG.get("tag", REG_VARIANT)
 
+# Valis is always the base pipeline for cross-pipeline QC cell matching: any
+# time this Snakefile runs with registration_variant "valis", link_3d_cells.py
+# and render_3d_cells.py are told to (re)write the shared QC reference registry
+# from their own picks; every other variant just matches against whatever is
+# already there. This is fully automatic from config.yaml — nobody has to
+# remember to pass --set_qc_reference by hand.
+IS_REFERENCE_PIPELINE   = (REG_VARIANT == "valis")
+SET_QC_REFERENCE_FLAG   = "--set_qc_reference" if IS_REFERENCE_PIPELINE else ""
+
+# Raw-space coordinate correction for cross-pipeline QC cell matching (see
+# qc_reference.py / raw_space_transform.py): without this, comparing two
+# pipelines' cell centroids directly silently compares unrelated coordinate
+# spaces. Auto-derived from registration_variant, same as SET_QC_REFERENCE_FLAG
+# above — nobody has to pass --qc_pipeline_kind/--qc_transform_dir by hand.
+# Only wired up for valis/romav2 so far. For any other variant (e.g. bspline,
+# whose registration script isn't wired yet either), this is left empty and
+# both scripts fall back to the old direct-centroid-comparison behavior.
+QC_PIPELINE_KIND = REG_VARIANT if REG_VARIANT in ("valis", "romav2") else ""
+
+def get_qc_transform_dir(wildcards):
+    if REG_VARIANT == "valis":
+        # Requires export_valis_transform.py to have been run for this core —
+        # see that script's own docstring.
+        return f"{DATASPACE}/{REG_CFG['output_dir_name']}/{wildcards.core}/{wildcards.core}/point_transforms"
+    elif REG_VARIANT == "romav2":
+        # Same folder warp_cellpose_masks already reads — no extra export step.
+        return f"{DATASPACE}/{REG_CFG['output_dir_name']}/{wildcards.core}/deformation_maps"
+    else:
+        return ""
+
+def get_qc_flags(wildcards):
+    if QC_PIPELINE_KIND == "":
+        return ""
+    return f"--qc_pipeline_kind {QC_PIPELINE_KIND} --qc_transform_dir {get_qc_transform_dir(wildcards)}"
+
 # ── Logging Base Directory ───────────────────────────────────────────────────
 LOG_BASE = f"log/{TAG}"
 
@@ -267,6 +302,8 @@ rule link_3d_cells:
         input_dir_name    = CELLPOSE["warped_dir_name"],
         output_dir_name   = LINK3D["output_dir_name"],
         denoised_dir_name = DENOISE["output_dir_name"],
+        qc_ref_flag       = SET_QC_REFERENCE_FLAG,
+        qc_flags          = get_qc_flags,
     log:
         f"{LOG_BASE}/link_3d_cells/{{core}}.log"
     threads: 2
@@ -279,7 +316,8 @@ rule link_3d_cells:
         "--coloc_radius_um {params.L[coloc_radius_um]} "
         "--input_dir_name {params.input_dir_name} "
         "--output_dir_name {params.output_dir_name} "
-        "--denoised_dir_name {params.denoised_dir_name} --plot_qc > {log} 2>&1"
+        "--denoised_dir_name {params.denoised_dir_name} --plot_qc "
+        "{params.qc_ref_flag} {params.qc_flags} > {log} 2>&1"
 
 
 # =============================================================================
@@ -401,10 +439,13 @@ rule render_3d_cells:
         input_dir_name = LINK3D["output_dir_name"],
         min_confirmed  = RENDER3D["min_confirmed"],
         n_samples      = RENDER3D["n_samples"],
+        qc_ref_flag    = SET_QC_REFERENCE_FLAG,
+        qc_flags       = get_qc_flags,
     log:
         f"{LOG_BASE}/render_3d_cells/{{core}}.log"
     threads: 1
     shell:
         "{PYTHON} {params.script} --core_name {wildcards.core} "
         "--input_dir_name {params.input_dir_name} "
-        "--min_confirmed {params.min_confirmed} --n_samples {params.n_samples} > {log} 2>&1"
+        "--min_confirmed {params.min_confirmed} --n_samples {params.n_samples} "
+        "{params.qc_ref_flag} {params.qc_flags} > {log} 2>&1"
