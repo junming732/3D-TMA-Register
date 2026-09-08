@@ -127,6 +127,15 @@ TME       = _with_tag(config["tme_comparison"])
 AGG       = config["aggregate"]
 RENDER3D  = config["render_3d"]
 
+# contact_graph_3d.py (Tier 1 real 3D nucleus-adjacency, sibling to TME).
+# Not required in config.yaml — falls back to sensible defaults so this
+# stage works without editing config.yaml first. Add a "contact_graph:"
+# block there (contact_gap_um / min_cells) if you want it pipeline-configured
+# like everything else instead.
+CONTACT = config.get("contact_graph", {})
+CONTACT.setdefault("contact_gap_um", 2.0)
+CONTACT.setdefault("min_cells", TME.get("min_cells", 10))
+
 
 # =============================================================================
 # TARGET RULE
@@ -138,6 +147,14 @@ def all_targets():
     # 2. Render 3D QC plots (always enabled now)
     targets += [
         f"{DATASPACE}/{LINK3D['output_dir_name']}/{core}/qc/render_3d_qc/.done"
+        for core in CORES
+    ]
+
+    # 2b. Contact gallery renders (Stage 9b) — separate .done marker since
+    # this rule has different (heavier) dependencies than the plain QC render
+    # above; see rule render_3d_contact_gallery for why it's a separate rule.
+    targets += [
+        f"{DATASPACE}/{LINK3D['output_dir_name']}/{core}/qc/render_3d_qc/.contact_gallery.done"
         for core in CORES
     ]
         
@@ -378,6 +395,45 @@ rule assign_phenotypes:
 
 
 # =============================================================================
+# STAGE 6b — CONTACT GRAPH (Tier 1: real 3D nucleus-adjacency)
+#
+# Sibling to compare_2d_3d_tme's centroid-based nn_distances_3d.csv — reads
+# the same label volume + typed table as that stage's inputs and writes into
+# the same per-core TME folder, so aggregate_tme.py picks it up alongside
+# nn_distances_3d.csv without needing its own aggregate rule.
+# =============================================================================
+rule contact_graph_3d:
+    input:
+        labels     = f"{DATASPACE}/{LINK3D['output_dir_name']}/{{core}}/{{core}}_DAPI_3d_labels.tif",
+        typed_3d   = f"{DATASPACE}/{PHENO['output_dir_name']}/{{core}}/{{core}}_3d_typed.csv",
+        typed_2d   = f"{DATASPACE}/{PHENO['output_dir_name']}/{{core}}/{{core}}_phenotypes_typed.csv",
+        warped_dir = f"{DATASPACE}/{CELLPOSE['warped_dir_name']}/{{core}}",
+    output:
+        summary_3d = f"{DATASPACE}/{TME['output_dir_name']}/{{core}}/contact_summary_3d.csv",
+        pairs_3d   = f"{DATASPACE}/{TME['output_dir_name']}/{{core}}/contact_pairs_3d.csv",
+        summary_2d = f"{DATASPACE}/{TME['output_dir_name']}/{{core}}/contact_summary_2d.csv",
+        pairs_2d   = f"{DATASPACE}/{TME['output_dir_name']}/{{core}}/contact_pairs_2d.csv",
+    params:
+        script             = f"{SCRIPTS}/spatial_analysis/contact_graph_3d.py",
+        contact_gap_um     = CONTACT["contact_gap_um"],
+        min_cells          = CONTACT["min_cells"],
+        linking_dir_name   = LINK3D["output_dir_name"],
+        phenotype_dir_name = PHENO["output_dir_name"],
+        warped_dir_name    = CELLPOSE["warped_dir_name"],
+        output_dir_name    = TME["output_dir_name"],
+    log:
+        f"{LOG_BASE}/contact_graph_3d/{{core}}.log"
+    threads: 1
+    shell:
+        "{PYTHON} {params.script} --core_name {wildcards.core} "
+        "--contact_gap_um {params.contact_gap_um} --min_cells {params.min_cells} "
+        "--linking_dir_name {params.linking_dir_name} "
+        "--phenotype_dir_name {params.phenotype_dir_name} "
+        "--warped_mask_dir_name {params.warped_dir_name} "
+        "--output_dir_name {params.output_dir_name} > {log} 2>&1"
+
+
+# =============================================================================
 # STAGE 7 — 2D vs 3D TME COMPARISON
 # =============================================================================
 rule compare_2d_3d_tme:
@@ -407,8 +463,16 @@ rule compare_2d_3d_tme:
 # =============================================================================
 rule aggregate_tme:
     input:
-        expand(
+        summaries = expand(
             f"{DATASPACE}/{{tme_dir}}/{{core}}/summary_comparison.csv",
+            tme_dir=[TME["output_dir_name"]], core=CORES,
+        ),
+        contacts_3d = expand(
+            f"{DATASPACE}/{{tme_dir}}/{{core}}/contact_summary_3d.csv",
+            tme_dir=[TME["output_dir_name"]], core=CORES,
+        ),
+        contacts_2d = expand(
+            f"{DATASPACE}/{{tme_dir}}/{{core}}/contact_summary_2d.csv",
             tme_dir=[TME["output_dir_name"]], core=CORES,
         ),
     output:
@@ -449,3 +513,43 @@ rule render_3d_cells:
         "--input_dir_name {params.input_dir_name} "
         "--min_confirmed {params.min_confirmed} --n_samples {params.n_samples} "
         "{params.qc_ref_flag} {params.qc_flags} > {log} 2>&1"
+
+
+# =============================================================================
+# STAGE 9b — CONTACT GALLERY RENDER (--contact_gallery mode)
+#
+# Deliberately a SEPARATE rule from render_3d_cells, not a flag bolted onto
+# it, because it has real dependencies that rule doesn't: contact_pairs_3d.csv
+# (contact_graph_3d.py, Stage 6b) to know which pairs are verified touching,
+# and phenotypes.csv + denoised.ome.tif (Stage 5 phenotype_cells / Stage 3
+# denoise_volume) for the auto-selected marker isosurfaces. render_3d_cells
+# itself only ever needs Stage 4's label volume, so keeping these as two
+# rules lets the plain per-core QC render keep running as early as it always
+# has, without waiting on phenotyping just because this later stage needs to.
+# =============================================================================
+rule render_3d_contact_gallery:
+    input:
+        labels     = f"{DATASPACE}/{LINK3D['output_dir_name']}/{{core}}/{{core}}_DAPI_3d_labels.tif",
+        stats      = f"{DATASPACE}/{LINK3D['output_dir_name']}/{{core}}/{{core}}_DAPI_3d_stats.csv",
+        pairs      = f"{DATASPACE}/{TME['output_dir_name']}/{{core}}/contact_pairs_3d.csv",
+        phenotypes = f"{DATASPACE}/{PHENO['output_dir_name']}/{{core}}/{{core}}_phenotypes.csv",
+        denoised   = f"{DATASPACE}/{DENOISE['output_dir_name']}/{{core}}/{{core}}_denoised.ome.tif",
+    output:
+        done = touch(f"{DATASPACE}/{LINK3D['output_dir_name']}/{{core}}/qc/render_3d_qc/.contact_gallery.done"),
+    params:
+        script             = f"{SCRIPTS}/spatial_analysis/render_3d_cells.py",
+        input_dir_name     = LINK3D["output_dir_name"],
+        tme_dir_name       = TME["output_dir_name"],
+        phenotype_dir_name = PHENO["output_dir_name"],
+        denoised_dir_name  = DENOISE["output_dir_name"],
+        top_n_per_type_pair = RENDER3D.get("contact_gallery_top_n", 3),
+    log:
+        f"{LOG_BASE}/render_3d_contact_gallery/{{core}}.log"
+    threads: 1
+    shell:
+        "{PYTHON} {params.script} --core_name {wildcards.core} "
+        "--input_dir_name {params.input_dir_name} --contact_gallery "
+        "--tme_dir_name {params.tme_dir_name} "
+        "--phenotype_dir_name {params.phenotype_dir_name} "
+        "--denoised_dir_name {params.denoised_dir_name} "
+        "--top_n_per_type_pair {params.top_n_per_type_pair} > {log} 2>&1"

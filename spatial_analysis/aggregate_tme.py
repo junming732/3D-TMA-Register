@@ -6,9 +6,9 @@ across a predefined set of TMA cores and generate multi-core summary figures.
 
 Cores analysed
 --------------
-    Core_01, Core_02, Core_03, Core_04, Core_05, Core_07, Core_08, Core_09,
-    Core_10, Core_11, Core_12, Core_13, Core_14, Core_15, Core_18, Core_24,
-    Core_26
+    Controlled via CORE_START / CORE_END / EXCLUDED_CORES below (see "CORE
+    LIST" section) — defaults to all cores in [CORE_START, CORE_END] except
+    those listed in EXCLUDED_CORES.
 
 Input CSVs expected per core (under <tme_dir_name>/<CORE>/)
 ----------------------------------------------------------
@@ -18,6 +18,12 @@ Input CSVs expected per core (under <tme_dir_name>/<CORE>/)
     nn_distances_3d.csv        — mean NN distances per type-pair, 3D
     entropy_summary.csv        — per-cell-type mean H ± std + KS/MWU tests
     summary_comparison.csv     — nn_dist_2d/3d/delta per type-pair
+    contact_summary_3d.csv     — real 3D nucleus-adjacency per type-pair
+                                  (contact_graph_3d.py; optional — missing files
+                                  are skipped with a warning, not fatal)
+    contact_summary_2d.csv     — same metric, per-slice (2D), from the same
+                                  contact_graph_3d.py run (unless --skip_2d was
+                                  passed) — enables the 2D vs 3D comparison
 
 Outputs (under <tme_dir_name>/Aggregate/)
 ----------------------------------------
@@ -27,6 +33,9 @@ Outputs (under <tme_dir_name>/Aggregate/)
     aggregate_nn_3d.csv
     aggregate_entropy.csv
     aggregate_summary.csv
+    aggregate_contact_3d.csv            — mean ± std contact metrics per type-pair
+                                           across cores (from contact_summary_3d.csv)
+    aggregate_contact_2d.csv            — same, from contact_summary_2d.csv
     ambiguous_exclusion_summary.csv    — per-core Ambiguous cell counts/percentages
     ambiguous_exclusion_summary.txt    — human-readable version of the above
     figures/
@@ -37,6 +46,12 @@ Outputs (under <tme_dir_name>/Aggregate/)
                                                  distance, individual cores overlaid
         fig_3_entropy_delta_boxplot.png       — boxplot of relative entropy delta
                                                  (3D − 2D) / 2D per cell type
+        fig_4_contact_heatmap.png             — mean nucleus-contacts/cell, type x
+                                                 type, 2D and 3D side by side (same
+                                                 color scale) when both are available,
+                                                 else 3D only
+        fig_4b_contact_2d_vs_3d_homotypic.png — same-type contact rate, 2D vs 3D,
+                                                 grouped bars (only when both present)
 
 Usage
 -----
@@ -82,7 +97,13 @@ RADIUS_UM = args.radius_um
 # ─────────────────────────────────────────────────────────────────────────────
 # CORE LIST
 # ─────────────────────────────────────────────────────────────────────────────
-CORE_IDS = [1, 2, 3, 4, 5, 7, 8, 9, 10, 11, 12, 13, 14, 15, 18, 24, 26]
+CORE_START = 1          # First core number to run (inclusive)
+CORE_END = 30            # Last core number to run (inclusive)
+
+# Cores to exclude entirely (e.g. known-bad cores from analyse_unsuitable_cores.py)
+EXCLUDED_CORES = (17, 21, 23, 27)
+
+CORE_IDS = [c for c in range(CORE_START, CORE_END + 1) if c not in EXCLUDED_CORES]
 CORE_NAMES = [f'Core_{str(c).zfill(2)}' for c in CORE_IDS]
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -139,6 +160,8 @@ nn_2d_all        = []
 nn_3d_all        = []
 entropy_all      = []
 summary_all      = []
+contact_3d_all   = []
+contact_2d_all   = []
 
 for core in CORE_NAMES:
     d2  = load_csv(core, 'cell_density_2d.csv')
@@ -147,6 +170,8 @@ for core in CORE_NAMES:
     n3  = load_csv(core, 'nn_distances_3d.csv')
     ent = load_csv(core, 'entropy_summary.csv')
     sm  = load_csv(core, 'summary_comparison.csv')
+    ct3 = load_csv(core, 'contact_summary_3d.csv')  # optional — see docstring
+    ct2 = load_csv(core, 'contact_summary_2d.csv')  # optional — needs contact_graph_3d.py NOT run with --skip_2d
 
     if d2  is not None: density_2d_all.append(d2)
     if d3  is not None: density_3d_all.append(d3)
@@ -154,8 +179,11 @@ for core in CORE_NAMES:
     if n3  is not None: nn_3d_all.append(n3)
     if ent is not None: entropy_all.append(ent)
     if sm  is not None: summary_all.append(sm)
+    if ct3 is not None: contact_3d_all.append(ct3)
+    if ct2 is not None: contact_2d_all.append(ct2)
 
-    logger.info(f'  {core}: loaded {sum(x is not None for x in [d2,d3,n2,n3,ent,sm])}/6 files')
+    logger.info(f'  {core}: loaded '
+               f'{sum(x is not None for x in [d2,d3,n2,n3,ent,sm,ct3,ct2])}/8 files')
 
 df_density_2d = pd.concat(density_2d_all, ignore_index=True)
 df_density_3d = pd.concat(density_3d_all, ignore_index=True)
@@ -163,6 +191,8 @@ df_nn_2d      = pd.concat(nn_2d_all,      ignore_index=True)
 df_nn_3d      = pd.concat(nn_3d_all,      ignore_index=True)
 df_entropy    = pd.concat(entropy_all,    ignore_index=True)
 df_summary    = pd.concat(summary_all,    ignore_index=True)
+df_contact_3d = pd.concat(contact_3d_all, ignore_index=True) if contact_3d_all else None
+df_contact_2d = pd.concat(contact_2d_all, ignore_index=True) if contact_2d_all else None
 
 # Save aggregate CSVs
 df_density_2d.to_csv(os.path.join(OUT_DIR, 'aggregate_density_2d.csv'), index=False)
@@ -171,6 +201,18 @@ df_nn_2d.to_csv(     os.path.join(OUT_DIR, 'aggregate_nn_2d.csv'),      index=Fa
 df_nn_3d.to_csv(     os.path.join(OUT_DIR, 'aggregate_nn_3d.csv'),      index=False)
 df_entropy.to_csv(   os.path.join(OUT_DIR, 'aggregate_entropy.csv'),    index=False)
 df_summary.to_csv(   os.path.join(OUT_DIR, 'aggregate_summary.csv'),    index=False)
+if df_contact_3d is not None:
+    df_contact_3d.to_csv(os.path.join(OUT_DIR, 'aggregate_contact_3d.csv'), index=False)
+else:
+    logger.warning('  No contact_summary_3d.csv found for any core — skipping '
+                   'aggregate_contact_3d.csv and Figure 4. Run contact_graph_3d.py '
+                   'per core to enable this.')
+if df_contact_2d is not None:
+    df_contact_2d.to_csv(os.path.join(OUT_DIR, 'aggregate_contact_2d.csv'), index=False)
+else:
+    logger.warning('  No contact_summary_2d.csv found for any core — Figure 4 will show '
+                   '3D only. Run contact_graph_3d.py without --skip_2d to enable the '
+                   '2D vs 3D comparison panel.')
 logger.info('Aggregate CSVs saved.')
 
 
@@ -554,6 +596,163 @@ logger.info(f'  Figure 3 saved: {path3}')
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# FIGURE 4 — Nucleus-contact heatmap, 2D vs 3D, side by side, type x type
+#
+# mean_contacts_per_cell averaged across cores, per (src_type, tgt_type),
+# same shared color scale in both panels so they're directly comparable by
+# eye. This is the Tier 1 companion to Figure 2 (nn_distances): Figure 2
+# shows centroid-proximity in 2D vs 3D, this shows actual measured nucleus
+# adjacency in 2D vs 3D (see contact_graph_3d.py docstring for exactly what
+# "contact" means, and why the 2D pass is structurally blind to any contact
+# whose partner sits mostly in a neighboring slice). If 3D-only contacts are
+# common in this tissue, the 3D panel should read visibly "hotter" than the
+# 2D panel, especially on the diagonal (homotypic / same-type contact).
+#
+# Falls back to a single 3D-only panel (previous behavior) if
+# contact_summary_2d.csv wasn't produced for any core (contact_graph_3d.py
+# run with --skip_2d, or an older run predating the 2D pass).
+# ─────────────────────────────────────────────────────────────────────────────
+def _contact_matrix(df_contact, types):
+    agg = (
+        df_contact.groupby(['src_type', 'tgt_type'])
+        .agg(mean_contacts_per_cell=('mean_contacts_per_cell', 'mean'),
+             std_contacts_per_cell=('mean_contacts_per_cell', 'std'),
+             mean_pct_cells_with_contact=('pct_cells_with_contact', 'mean'),
+             n_cores=('mean_contacts_per_cell', 'count'))
+        .reset_index()
+    )
+    n_t = len(types)
+    mat = np.full((n_t, n_t), np.nan)
+    for i, st in enumerate(types):
+        for j, tt in enumerate(types):
+            row = agg[(agg['src_type'] == st) & (agg['tgt_type'] == tt)]
+            if len(row):
+                mat[i, j] = row['mean_contacts_per_cell'].iloc[0]
+    return mat, agg
+
+
+def _draw_contact_heatmap(ax, mat, types, vmax, title):
+    im = ax.imshow(mat, cmap='Reds', vmin=0, vmax=vmax, aspect='equal')
+    n_t = len(types)
+    for i in range(n_t):
+        for j in range(n_t):
+            val = mat[i, j]
+            if np.isnan(val):
+                continue
+            txt_color = 'white' if val > vmax * 0.55 else '#333'
+            ax.text(j, i, f'{val:.2f}', ha='center', va='center',
+                    fontsize=15, color=txt_color, fontweight='bold')
+    ax.set_xticks(range(n_t)); ax.set_yticks(range(n_t))
+    ax.set_xticklabels(types, rotation=35, ha='right', fontsize=14)
+    ax.set_yticklabels(types, fontsize=14)
+    ax.set_xlabel('Contacting (tgt) type', fontsize=15)
+    ax.set_ylabel('Source type', fontsize=15)
+    for spine in ax.spines.values():
+        spine.set_visible(False)
+    ax.set_title(title, fontsize=16, fontweight='bold', color='#1A1A2E', pad=10)
+    return im
+
+
+if df_contact_3d is None:
+    logger.info('Skipping Figure 4 (contact heatmap) — no 3D contact data loaded.')
+else:
+    logger.info('Generating Figure 4: contact heatmap ...')
+
+    types_contact = [t for t in _ALL_TYPES_SORTED if t in df_contact_3d['src_type'].values]
+    mat_3d, agg_3d = _contact_matrix(df_contact_3d, types_contact)
+    agg_3d.to_csv(os.path.join(OUT_DIR, 'aggregate_contact_3d.csv'), index=False)
+    n_cores_3d = int(agg_3d['n_cores'].max()) if len(agg_3d) else 0
+
+    if df_contact_2d is not None:
+        # Restrict to types present in the 3D table too, so both panels plot
+        # the same axes — a type that only clears --min_cells in one
+        # dimension would otherwise misalign the two heatmaps.
+        types_2d_only = [t for t in _ALL_TYPES_SORTED if t in df_contact_2d['src_type'].values]
+        types_contact = [t for t in types_contact if t in types_2d_only]
+        mat_3d, agg_3d = _contact_matrix(df_contact_3d, types_contact)
+        mat_2d, agg_2d = _contact_matrix(df_contact_2d, types_contact)
+        agg_2d.to_csv(os.path.join(OUT_DIR, 'aggregate_contact_2d.csv'), index=False)
+        n_cores_2d = int(agg_2d['n_cores'].max()) if len(agg_2d) else 0
+
+        vmax = np.nanmax([np.nanmax(mat_2d) if not np.all(np.isnan(mat_2d)) else 0,
+                          np.nanmax(mat_3d) if not np.all(np.isnan(mat_3d)) else 0]) or 1.0
+
+        n_ct = len(types_contact)
+        fig4, (ax4a, ax4b) = plt.subplots(
+            1, 2, figsize=(3.0 + 2.6 * n_ct, 1.8 + 1.15 * n_ct), facecolor=BG)
+        _draw_contact_heatmap(ax4a, mat_2d, types_contact, vmax,
+                              f'2D (per-slice, {n_cores_2d} cores)\nblind to contacts above/below the plane')
+        im = _draw_contact_heatmap(ax4b, mat_3d, types_contact, vmax,
+                                   f'3D (reconstructed, {n_cores_3d} cores)\nreal geometric adjacency')
+        fig4.suptitle('Mean nucleus-contacts per cell, type × type — 2D vs 3D\n',
+                      fontsize=18, fontweight='bold', color='#1A1A2E', y=1.06)
+        cbar = fig4.colorbar(im, ax=[ax4a, ax4b], shrink=0.85)
+        cbar.set_label('mean contacts / cell', fontsize=14)
+        cbar.ax.tick_params(labelsize=12)
+
+        path4 = os.path.join(FIG_DIR, 'fig_4_contact_heatmap.png')
+        fig4.savefig(path4, dpi=200, bbox_inches='tight', facecolor=BG)
+        plt.close(fig4)
+        logger.info(f'  Figure 4 saved: {path4}')
+
+        # ─────────────────────────────────────────────────────────────────
+        # FIGURE 4b — Homotypic (same-type) contact rate, 2D vs 3D, grouped
+        # bars. The single most direct version of the paper's claim: for
+        # each type, does the 3D bar read higher than the 2D bar?
+        # ─────────────────────────────────────────────────────────────────
+        logger.info('Generating Figure 4b: 2D vs 3D homotypic contact bars ...')
+        homo_rows = []
+        for t in types_contact:
+            v2 = mat_2d[types_contact.index(t), types_contact.index(t)]
+            v3 = mat_3d[types_contact.index(t), types_contact.index(t)]
+            homo_rows.append((t, v2, v3))
+
+        fig4b, ax4c = plt.subplots(figsize=(1.5 + 1.1 * len(homo_rows), 6), facecolor=BG)
+        x = np.arange(len(homo_rows))
+        w = 0.35
+        v2_vals = [r[1] for r in homo_rows]
+        v3_vals = [r[2] for r in homo_rows]
+        ax4c.bar(x - w/2, v2_vals, width=w, label='2D (per-slice)', color='#94A3B8')
+        ax4c.bar(x + w/2, v3_vals, width=w, label='3D (reconstructed)', color='#DC2626')
+        for xi, v2, v3 in zip(x, v2_vals, v3_vals):
+            if not np.isnan(v2):
+                ax4c.text(xi - w/2, v2, f'{v2:.2f}', ha='center', va='bottom', fontsize=11)
+            if not np.isnan(v3):
+                ax4c.text(xi + w/2, v3, f'{v3:.2f}', ha='center', va='bottom', fontsize=11)
+        ax4c.set_xticks(x)
+        ax4c.set_xticklabels([r[0] for r in homo_rows], rotation=30, ha='right', fontsize=13)
+        ax4c.set_ylabel('mean same-type contacts / cell', fontsize=14)
+        ax4c.set_title('Homotypic contact rate, 2D vs 3D\n',
+                       fontsize=15, fontweight='bold', color='#1A1A2E', pad=10)
+        ax4c.legend(fontsize=12, frameon=False)
+        _finish_ax(ax4c)
+
+        fig4b.tight_layout()
+        path4b = os.path.join(FIG_DIR, 'fig_4b_contact_2d_vs_3d_homotypic.png')
+        fig4b.savefig(path4b, dpi=200, bbox_inches='tight', facecolor=BG)
+        plt.close(fig4b)
+        logger.info(f'  Figure 4b saved: {path4b}')
+    else:
+        # Fallback: 3D-only single panel (previous behavior), when no core
+        # has contact_summary_2d.csv.
+        n_ct = len(types_contact)
+        vmax = np.nanmax(mat_3d) if not np.all(np.isnan(mat_3d)) else 1.0
+        fig4, ax4 = plt.subplots(figsize=(1.5 + 1.35 * n_ct, 1.5 + 1.15 * n_ct), facecolor=BG)
+        im = _draw_contact_heatmap(
+            ax4, mat_3d, types_contact, vmax,
+            f'Mean real 3D nucleus-contacts per cell, type × type\n'
+            f'Averaged across {n_cores_3d} cores (no 2D contact data available)')
+        cbar = fig4.colorbar(im, ax=ax4, shrink=0.85)
+        cbar.set_label('mean contacts / cell', fontsize=15)
+        cbar.ax.tick_params(labelsize=13)
+        fig4.tight_layout()
+        path4 = os.path.join(FIG_DIR, 'fig_4_contact_heatmap.png')
+        fig4.savefig(path4, dpi=200, bbox_inches='tight', facecolor=BG)
+        plt.close(fig4)
+        logger.info(f'  Figure 4 saved: {path4}  (3D only)')
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # FINAL LOG
 # ─────────────────────────────────────────────────────────────────────────────
 logger.info('=' * 60)
@@ -564,8 +763,16 @@ logger.info('    aggregate_density_2d/3d.csv')
 logger.info('    aggregate_nn_2d/3d.csv')
 logger.info('    aggregate_entropy.csv')
 logger.info('    aggregate_summary.csv')
+if df_contact_3d is not None:
+    logger.info('    aggregate_contact_3d.csv')
+if df_contact_2d is not None:
+    logger.info('    aggregate_contact_2d.csv')
 logger.info('  Figures:')
 logger.info('    fig_1_celltype_fraction_2d_vs_3d.png')
 logger.info('    fig_2_nn_distances.png')
 logger.info('    fig_3_entropy_delta_boxplot.png')
+if df_contact_3d is not None:
+    logger.info('    fig_4_contact_heatmap.png')
+if df_contact_2d is not None:
+    logger.info('    fig_4b_contact_2d_vs_3d_homotypic.png')
 logger.info('=' * 60)
