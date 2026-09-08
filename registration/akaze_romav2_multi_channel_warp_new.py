@@ -240,7 +240,7 @@ MASK_MIN_FRAC    = 0.05  # skip RoMaV2 if tissue covers < 5% of canvas
 CK_CHANNEL_IDX       = 6
 CHANNEL_NAMES        = ['DAPI', 'CD31', 'GAP43', 'NFP', 'CD3', 'CD163', 'CK', 'AF']
 PIXEL_SIZE_XY_UM     = 0.4961
-SECTION_THICKNESS_UM = 4.5
+SECTION_THICKNESS_UM = 4.0
 MIN_CK_NONZERO_FRAC  = 0.01
 
 
