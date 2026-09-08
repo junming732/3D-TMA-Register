@@ -147,7 +147,35 @@ N_TILE_SAMPLES  = 50     # number of 3D cells rendered as tile montages
 PATCH_SIZE_PX   = 80     # half-size of patch around each centroid in tiles
 
 PIXEL_SIZE_XY_UM     = 0.4961
-SECTION_THICKNESS_UM = 4.5
+SECTION_THICKNESS_UM = 4.0
+
+# ── Idealized equal-disk overlap model (for the "implied drift" QC metric) ──
+# Two identical circles of radius r, centers separated by distance d: the
+# fraction of one circle's area covered by the other, as a function of
+# x = d / (2r), has the closed form below. It's monotonically decreasing
+# from f(0)=1 (no drift) to f(1)=0 (circles just touch). Given a MEASURED
+# overlap_fraction, inverting this tells us: "under a perfect symmetric
+# disk model, how much centroid drift would be needed to produce this exact
+# overlap score?" — a perfect-case constant to compare the ACTUAL measured
+# drift against. Precomputed on a grid + interpolated (not solved per-row
+# with an optimizer) since this runs over every link in every core.
+_DISK_X_GRID = np.linspace(0.0, 1.0, 2001)
+_DISK_F_GRID = (2.0 / np.pi) * (
+    np.arccos(_DISK_X_GRID) - _DISK_X_GRID * np.sqrt(1.0 - _DISK_X_GRID**2)
+)
+# _DISK_F_GRID decreases monotonically from 1 -> 0; np.interp needs increasing
+# xp, so reverse both grids once at import time.
+_DISK_F_GRID_INC = _DISK_F_GRID[::-1]
+_DISK_X_GRID_INC = _DISK_X_GRID[::-1]
+
+
+def implied_x_from_overlap_fraction(frac):
+    """Vectorised inverse of the equal-disk overlap model: given
+    overlap_fraction (array-like, 0-1), returns x = d/(2r) — drift as a
+    fraction of the disk diameter — under the idealized model."""
+    frac_clipped = np.clip(np.asarray(frac, dtype=np.float64), 0.0, 1.0)
+    return np.interp(frac_clipped, _DISK_F_GRID_INC, _DISK_X_GRID_INC)
+
 
 TARGET_CORE = args.core_name
 CH_NAME     = 'DAPI'   # CellPose is only ever run on DAPI in this pipeline
@@ -549,23 +577,40 @@ for members in components:
     centroid_x_um  = round(centroid_x_px  * PIXEL_SIZE_XY_UM,     3)
     centroid_z_um  = round(centroid_z_idx * SECTION_THICKNESS_UM, 3)
 
+    # ── Per-cell shape metric ────────────────────────────────────────────────
+    # Summarises the WHOLE reconstructed cell (not a single slice-pair link),
+    # kept as a coarse sanity check: isotropy — real nuclei are roughly round
+    # in 3D, so z-extent should be comparable to the equivalent circular
+    # diameter of the XY cross-section. Note this is quantized by section
+    # thickness relative to nucleus size (few discrete "shelves", not a
+    # smooth value), so treat gross shifts in the median as signal, not
+    # small pipeline-to-pipeline differences.
+    n_members        = len(members)
+    mean_area_px     = total_px / n_members
+    mean_diameter_px = 2.0 * np.sqrt(mean_area_px / np.pi)
+    mean_diameter_um = mean_diameter_px * PIXEL_SIZE_XY_UM
+    z_extent_um      = z_span * SECTION_THICKNESS_UM
+    aspect_ratio     = round(z_extent_um / mean_diameter_um, 3) if mean_diameter_um > 0 else 0.0
+
     rows.append(dict(
-        cell_id_3d     = cell_id,
-        z_min          = z_min,
-        z_max          = z_max,
-        z_span_slices  = z_span,
-        slice_id_min   = slice_ids[z_min],
-        slice_id_max   = slice_ids[z_max],
-        n_2d_segments  = len(members),
-        volume_px      = total_px,
-        volume_um3     = vol_um3,
-        centroid_x_px  = centroid_x_px,
-        centroid_y_px  = centroid_y_px,
-        centroid_z_idx = centroid_z_idx,
-        centroid_x_um  = centroid_x_um,
-        centroid_y_um  = centroid_y_um,
-        centroid_z_um  = centroid_z_um,
-        slice_ids      = str(sorted(set(slice_ids[z] for z in z_indices))),
+        cell_id_3d          = cell_id,
+        z_min               = z_min,
+        z_max               = z_max,
+        z_span_slices       = z_span,
+        slice_id_min        = slice_ids[z_min],
+        slice_id_max        = slice_ids[z_max],
+        n_2d_segments       = len(members),
+        volume_px           = total_px,
+        volume_um3          = vol_um3,
+        centroid_x_px       = centroid_x_px,
+        centroid_y_px       = centroid_y_px,
+        centroid_z_idx      = centroid_z_idx,
+        centroid_x_um       = centroid_x_um,
+        centroid_y_um       = centroid_y_um,
+        centroid_z_um       = centroid_z_um,
+        slice_ids           = str(sorted(set(slice_ids[z] for z in z_indices))),
+        mean_diameter_um    = round(mean_diameter_um, 3),
+        aspect_ratio        = aspect_ratio,
     ))
 
 n_cells = cell_id
@@ -651,11 +696,33 @@ logger.info(f"Display volume saved -> {disp_path}")
 confirmed  = df_cells[df_cells['z_span_slices'] >= args.min_confirmed]
 singletons = df_cells[df_cells['z_span_slices'] <  args.min_confirmed]
 
+# ── Core-level summary metrics (always written, independent of --plot_qc) ──
+# One row per core/pipeline run. Concatenate these across cores and pipelines
+# for apples-to-apples comparison — this is the file meant for downstream
+# cross-pipeline statistical comparison, not just plotting.
+summary_metrics = {
+    'core_name':                        TARGET_CORE,
+    'channel':                          CH_NAME,
+    'input_dir_name':                   args.input_dir_name,
+    'n_3d_cells_total':                 len(df_cells),
+    'n_confirmed_multi_slice':          len(confirmed),
+    'n_singletons':                     len(singletons),
+    'singleton_rate':                   round(len(singletons) / max(len(df_cells), 1), 4),
+    'median_volume_um3':                round(float(df_cells['volume_um3'].median()), 2) if len(df_cells) else 0.0,
+    'iqr_volume_um3':                   round(float(df_cells['volume_um3'].quantile(0.75)
+                                                   - df_cells['volume_um3'].quantile(0.25)), 2) if len(df_cells) else 0.0,
+    'median_aspect_ratio':              round(float(df_cells['aspect_ratio'].median()), 3) if len(df_cells) else 0.0,
+}
+summary_csv_path = os.path.join(OUTPUT_FOLDER, f"{TARGET_CORE}_{CH_NAME}_core_summary_metrics.csv")
+pd.DataFrame([summary_metrics]).to_csv(summary_csv_path, index=False)
+logger.info(f"Core-level summary metrics CSV -> {summary_csv_path}")
+
 if args.plot_qc:
     import matplotlib
     matplotlib.use('Agg')
     import matplotlib.pyplot as plt
     from matplotlib.colors import ListedColormap
+    from skimage.segmentation import find_boundaries
 
     QC_DIR   = os.path.join(OUTPUT_FOLDER, 'qc')
     TILE_DIR = os.path.join(QC_DIR, 'visual_tile_qc')
@@ -897,10 +964,29 @@ if args.plot_qc:
             cy_a, cx_a = cell_centroids.get((z_a, id_a), (0, 0))
             cy_b, cx_b = cell_centroids.get((z_b, id_b), (0, 0))
             drift      = float(np.sqrt((cx_b - cx_a)**2 + (cy_b - cy_a)**2))
+            drift_um   = drift * PIXEL_SIZE_XY_UM
+
+            # 2b. Perfect-case constant + deviation multiplier — "how much
+            #     drift would a perfect symmetric-disk model imply for this
+            #     exact overlap_fraction, given these mask sizes, and how
+            #     many times more/less drift did we actually measure?"
+            #     r uses the SMALLER mask's equivalent-circle radius, matching
+            #     overlap_fraction's own denominator (min(area_a, area_b)).
+            r_px = float(np.sqrt(min(area_a, area_b) / np.pi))
+            implied_drift_px = float(implied_x_from_overlap_fraction(frac)) * 2.0 * r_px
+            implied_drift_um = implied_drift_px * PIXEL_SIZE_XY_UM
+            # Below this floor the idealized model is near-degenerate
+            # (overlap_fraction ~1 implies ~0 drift) and the ratio blows up
+            # without being meaningful — report NaN instead of a huge number.
+            MIN_IMPLIED_DRIFT_PX = 0.5
+            if implied_drift_px >= MIN_IMPLIED_DRIFT_PX:
+                drift_deviation_multiplier = round(drift / implied_drift_px, 3)
+            else:
+                drift_deviation_multiplier = float('nan')
             
             # 3. Area Ratio
             ratio = max(area_a, area_b) / min(area_a, area_b) if min(area_a, area_b) > 0 else 0.0
-            
+
             all_metrics.append({
                 'cell_id_3d': cid3d,
                 'z_a': z_a,
@@ -912,7 +998,10 @@ if args.plot_qc:
                 'area_b_px': area_b,
                 'overlap_fraction': round(frac, 3),
                 'centroid_drift_px': round(drift, 2),
-                'area_ratio': round(ratio, 2)
+                'centroid_drift_um': round(drift_um, 3),
+                'implied_drift_um': round(implied_drift_um, 3),
+                'drift_deviation_multiplier': drift_deviation_multiplier,
+                'area_ratio': round(ratio, 2),
             })
 
     if all_metrics:
@@ -1122,16 +1211,109 @@ if args.plot_qc:
 
         logger.info(f"  Tile montages -> {TILE_DIR}/")
 
+        # ── QC 5b: Combined "DAPI + full segmentation" tile montages ────────
+        # Same row-per-3D-cell, one-panel-per-Z-slice layout as QC 5 above,
+        # but the boundary overlay is built the way
+        # make_aligned_overlay_figure.py draws its "DAPI + segmentation
+        # outline" panel: EVERY CellPose 2D label touching the crop gets a
+        # boundary (find_boundaries, outer mode), not just the primary cell
+        # plus up to 4 hand-picked 3D neighbours. The reconstructed 3D
+        # cell's own boundary is additionally drawn in green (on top of the
+        # yellow) so it reads as "this one" at a glance, without covering
+        # the underlying DAPI signal. Any mismatch between the green
+        # outline and the yellow outline it should coincide with (e.g. the
+        # green boundary cutting across more than one yellow region) is a
+        # visible sign of a bad link or a CellPose segmentation change
+        # between slices.
+        # This is a separate, additional set of images — QC 5's montages
+        # above are unchanged and both are written every --plot_qc run.
+        logger.info(f"QC: generating combined DAPI+segmentation tile montages (n={len(sample_ids)})...")
+
+        ALIGNED_TILE_DIR = os.path.join(QC_DIR, 'visual_tile_qc_aligned')
+        os.makedirs(ALIGNED_TILE_DIR, exist_ok=True)
+
+        TARGET_CELL_COLOUR = np.array([0.15, 1.0, 0.15])  # solid green fill = the reconstructed cell
+        OUTLINE_COLOUR      = np.array([1.0, 1.0, 0.0])    # yellow = every CellPose boundary in the crop
+
+        def _stretch_patch(img: np.ndarray) -> np.ndarray:
+            fg = img[img > 0]
+            if fg.size > 10:
+                lo, hi = np.percentile(fg, (2, 98))
+            else:
+                lo, hi = 0.0, max(float(img.max()), 1e-6)
+            return np.clip((img.astype(np.float32) - lo) / max(hi - lo, 1e-6), 0, 1)
+
+        for cid3d in sample_ids:
+            members       = cell_members[cid3d]
+            n_slices_cell = len(members)
+
+            fig, axes = plt.subplots(1, n_slices_cell,
+                                     figsize=(n_slices_cell * 2.5, 3.0))
+            if n_slices_cell == 1:
+                axes = [axes]
+
+            row_stats = df_cells[df_cells['cell_id_3d'] == cid3d]
+            span = int(row_stats['z_span_slices'].values[0]) if len(row_stats) > 0 else '?'
+            vol  = float(row_stats['volume_um3'].values[0])  if len(row_stats) > 0 else 0.0
+            fig.suptitle(
+                f'3D cell {cid3d}  |  span={span} slices  |  vol={vol:.0f} \u00b5m\u00b3\n'
+                f'yellow = every CellPose outline in crop  |  green outline = this reconstructed cell',
+                fontsize=8, y=1.05,
+            )
+
+            for ax, (z, id_2d) in zip(axes, members):
+                cy, cx = cell_centroids.get((z, id_2d), (H // 2, W // 2))
+                y0 = max(0, int(cy) - PATCH);  y1 = min(H, int(cy) + PATCH)
+                x0 = max(0, int(cx) - PATCH);  x1 = min(W, int(cx) + PATCH)
+                pad_t = max(0, PATCH - int(cy));  pad_b = max(0, int(cy) + PATCH - H)
+                pad_l = max(0, PATCH - int(cx));  pad_r = max(0, int(cx) + PATCH - W)
+
+                mask_crop = masks_2d[z][y0:y1, x0:x1]
+                if dapi_vol is not None and z < dapi_vol.shape[0]:
+                    raw_crop = np.array(dapi_vol[z][y0:y1, x0:x1], dtype=np.float32)
+                    gray = _stretch_patch(raw_crop)
+                else:
+                    gray = (mask_crop > 0).astype(np.float32)
+
+                rgb = np.stack([gray, gray, gray], axis=-1)
+
+                # every CellPose segmentation boundary present in the crop
+                boundaries = find_boundaries(mask_crop, mode='outer')
+                rgb[boundaries] = OUTLINE_COLOUR
+
+                # reconstructed cell's own boundary — drawn in green, on top
+                # of the yellow, so it reads as "this one" without hiding
+                # the DAPI signal underneath its footprint
+                target_mask = (mask_crop == id_2d)
+                if target_mask.any():
+                    target_boundary = find_boundaries(target_mask, mode='outer')
+                    rgb[target_boundary] = TARGET_CELL_COLOUR
+
+                rgb = np.pad(rgb, ((pad_t, pad_b), (pad_l, pad_r), (0, 0)), mode='constant')
+
+                ax.imshow(rgb, interpolation='nearest')
+                area = cell_areas.get((z, id_2d), 0)
+                ax.set_title(f'Z{z} / s{slice_ids[z]}\narea={area}px', fontsize=6)
+                ax.axis('off')
+
+            plt.tight_layout()
+            plt.savefig(os.path.join(ALIGNED_TILE_DIR, f'cell_{cid3d:06d}_aligned.png'),
+                        dpi=100, bbox_inches='tight')
+            plt.close(fig)
+
+        logger.info(f"  Combined DAPI+segmentation montages -> {ALIGNED_TILE_DIR}/")
+
     # ── QC summary to log ─────────────────────────────────────────────────────
     logger.info('=' * 60)
     logger.info(f'QC SUMMARY  —  {TARGET_CORE} / {CH_NAME}')
     logger.info(f'  Total 3D cells          : {len(df_cells)}')
     logger.info(f'  Multi-slice (confirmed) : {len(confirmed)}')
-    logger.info(f'  Singletons              : {len(singletons)}')
+    logger.info(f'  Singletons              : {len(singletons)}  (singleton_rate={len(singletons)/max(len(df_cells),1):.3f})')
     logger.info(f'  Total linked pairs      : {n_pairs}')
     logger.info(f'  Weak links (<10% overlap): {n_weak}  ({100*frac_weak:.1f}%)')
     logger.info(f'  High centroid drift     : {len(flagged_drifts)}')
     logger.info(f'  High area ratio         : {len(flagged_area_ratios)}')
+    logger.info(f'  Median aspect ratio     : {df_cells["aspect_ratio"].median():.2f}  (sanity check only)')
     logger.info(f'  QC plots  -> {QC_DIR}/')
     logger.info('=' * 60)
 

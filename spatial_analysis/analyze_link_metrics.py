@@ -3,16 +3,11 @@ analyze_link_metrics.py
 ====================
 Aggregates a SINGLE registration pipeline's QC outputs from link_3d_cells.py
 across all of its cores:
-  - <core>/qc/all_link_metrics.csv           (per-link:  overlap_fraction,
-                                               centroid_drift_px, area_ratio,
-                                               out_degree_a, in_degree_b,
-                                               ambiguous_link)
+  - <core>/qc/all_link_metrics.csv (per-link: overlap_fraction,
+    centroid_drift_px/um, implied_drift_um, drift_deviation_multiplier,
+    area_ratio)
   - <core>/<core>_<channel>_core_summary_metrics.csv (per-core: singleton_rate,
-                                               median_volume_um3, frac_volume_
-                                               implausible, median_aspect_ratio,
-                                               frac_multimodal_area_profile,
-                                               frac_cells_with_z_gaps,
-                                               frac_ambiguous_links, ...)
+    median_volume_um3, iqr_volume_um3, median_aspect_ratio)
 
 and reports how each metric varies core-to-core WITHIN that one pipeline:
 per-core summaries, descriptive stats (median/mean/std/IQR/min/max across
@@ -42,9 +37,19 @@ Usage
     python analyze_link_metrics.py --pipeline CellPose_DAPI_3D_affine
     python analyze_link_metrics.py --pipeline /path/to/pipeline_dir
     python analyze_link_metrics.py --pipeline variant_1 --cores Core_09 Core_16
+    python analyze_link_metrics.py --pipeline variant_1 --core_start 1 --core_end 30 --excluded_cores 9 16 19
+
+Core discovery
+--------------
+Only folders whose name matches Core_<digits> exactly (e.g. Core_01, Core_09,
+Core_24) are ever treated as cores — this always applies, regardless of
+--cores/--core_start/--core_end. Anything else (backup copies like
+1_Core09, Core_09_old, Core_09_backup, ...) is silently skipped during
+discovery so backups never sneak into the aggregate.
 """
 
 import os
+import re
 import sys
 import argparse
 import logging
@@ -64,17 +69,27 @@ import config
 logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(levelname)s | %(message)s')
 logger = logging.getLogger(__name__)
 
+# Only folders named exactly "Core_<digits>" are treated as cores. This keeps
+# backup copies (e.g. "1_Core09", "Core_09_old", "Core_09_backup") out of the
+# aggregate even if they sit right next to the real core folders under the
+# pipeline directory and would otherwise be picked up by the glob below.
+CORE_NAME_RE = re.compile(r'^Core_\d+$')
+
 # Per-link metrics from all_link_metrics.csv. Continuous ones are summarized
 # per core with --agg (median/mean); rate ones (booleans) are always
-# summarized per core as a mean, i.e. a fraction.
-LINK_METRICS_CONTINUOUS = ['overlap_fraction', 'centroid_drift_px', 'area_ratio']
-LINK_METRICS_RATE       = ['ambiguous_link']
+# summarized per core as a mean, i.e. a fraction. (Currently no rate metrics
+# are exported by link_3d_cells.py — kept as an empty list, not removed, so
+# a future boolean/flag column can be added here without restructuring the
+# aggregation logic below.)
+LINK_METRICS_CONTINUOUS = ['overlap_fraction', 'centroid_drift_um', 'drift_deviation_multiplier']
+LINK_METRICS_RATE       = []
 
 LINK_METRIC_LABELS = {
-    'overlap_fraction':  'Overlap fraction (higher = better)',
-    'centroid_drift_px': 'Centroid drift (px, lower = better)',
-    'area_ratio':        'Area ratio (closer to 1 = better)',
-    'ambiguous_link':    'Fraction of links with ambiguous topology (lower = better)',
+    'overlap_fraction':           'Overlap fraction (higher = better)',
+    'centroid_drift_um':          'Centroid drift (um, lower = better; TRE-comparable units)',
+    'drift_deviation_multiplier': 'Measured drift / perfect-case implied drift (near 1 = as '
+                                   'expected from overlap_fraction alone; higher = extra '
+                                   'drift not explained by mask-size mismatch)',
 }
 
 # Per-core metrics already aggregated inside core_summary_metrics.csv by
@@ -82,21 +97,13 @@ LINK_METRIC_LABELS = {
 CORE_SUMMARY_METRICS = [
     'singleton_rate',
     'median_volume_um3',
-    'frac_volume_implausible',
     'median_aspect_ratio',
-    'frac_multimodal_area_profile',
-    'frac_cells_with_z_gaps',
-    'frac_ambiguous_links',
 ]
 
 CORE_SUMMARY_LABELS = {
-    'singleton_rate':               'Singleton rate (lower = better linking)',
-    'median_volume_um3':            'Median cell volume (um3)',
-    'frac_volume_implausible':      'Fraction volume outside plausible range',
-    'median_aspect_ratio':          'Median aspect ratio (closer to 1 = better)',
-    'frac_multimodal_area_profile': 'Fraction with multimodal area profile (lower = better)',
-    'frac_cells_with_z_gaps':       'Fraction with Z-gaps (lower = better)',
-    'frac_ambiguous_links':         'Fraction of ALL candidate links that were ambiguous',
+    'singleton_rate':      'Singleton rate (lower = better linking)',
+    'median_volume_um3':   'Median cell volume (um3)',
+    'median_aspect_ratio': 'Median aspect ratio (sanity check only, closer to 1 = better)',
 }
 
 
@@ -129,6 +136,9 @@ def load_pipeline_metrics(pipeline_dir, cores=None):
     core_summary_by_core = {}
     for csv_path in core_csv_paths:
         core = os.path.basename(os.path.dirname(csv_path))
+        if not CORE_NAME_RE.match(core):
+            logger.debug(f'  Skipping non-standard core folder name: {core}')
+            continue
         if cores is not None and core not in cores:
             continue
         try:
@@ -144,6 +154,9 @@ def load_pipeline_metrics(pipeline_dir, cores=None):
 
     for csv_path in link_csv_paths:
         core = os.path.basename(os.path.dirname(os.path.dirname(csv_path)))
+        if not CORE_NAME_RE.match(core):
+            logger.debug(f'  Skipping non-standard core folder name: {core}')
+            continue
         if cores is not None and core not in cores:
             continue
         try:
@@ -259,7 +272,18 @@ def main():
     parser.add_argument('--pipeline', type=str, required=True,
                         help='A single pipeline folder name (under --dataspace) or absolute path.')
     parser.add_argument('--cores', nargs='*', default=None,
-                        help='Restrict to these core names. Default: use every core found.')
+                        help='Restrict to these core names. Default: use every core found. '
+                             'Mutually exclusive with --core_start/--core_end.')
+    parser.add_argument('--core_start', type=int, default=None,
+                        help='First core number to include (inclusive). Must be used together '
+                             'with --core_end; builds the range Core_<core_start>..Core_<core_end> '
+                             '(zero-padded to 2 digits, e.g. Core_01). Mutually exclusive with --cores.')
+    parser.add_argument('--core_end', type=int, default=None,
+                        help='Last core number to include (inclusive). See --core_start.')
+    parser.add_argument('--excluded_cores', nargs='*', type=int, default=[],
+                        help='Core numbers to drop from the --core_start/--core_end range '
+                             '(e.g. known-bad cores from analyse_unsuitable_cores.py). '
+                             'Only used together with --core_start/--core_end.')
     parser.add_argument('--agg', type=str, default='median', choices=['median', 'mean'],
                         help='How to summarize each core down to one value for the continuous '
                              'per-link metrics before reporting descriptive stats (default: median).')
@@ -269,18 +293,29 @@ def main():
                              'pipeline folder itself).')
     args = parser.parse_args()
 
+    if args.cores is not None and (args.core_start is not None or args.core_end is not None):
+        parser.error('--cores cannot be combined with --core_start/--core_end; use one or the other.')
+    if (args.core_start is None) != (args.core_end is None):
+        parser.error('--core_start and --core_end must be given together.')
+
+    if args.core_start is not None:
+        cores = [f'Core_{str(c).zfill(2)}' for c in range(args.core_start, args.core_end + 1)
+                 if c not in args.excluded_cores]
+    else:
+        cores = args.cores  # None => every (validly named) core found
+
     pipeline_name, pipeline_dir = resolve_pipeline_dir(args.dataspace, args.pipeline)
     output_dir = args.output_dir or os.path.join(pipeline_dir, 'Link_Metrics_Analysis')
     os.makedirs(output_dir, exist_ok=True)
 
     logger.info(f'Dataspace     : {args.dataspace}')
     logger.info(f'Pipeline      : {pipeline_name}  ({pipeline_dir})')
-    logger.info(f'Cores         : {"ALL" if args.cores is None else args.cores}')
+    logger.info(f'Cores         : {"ALL (valid Core_<N> folders)" if cores is None else cores}')
     logger.info(f'Per-core agg  : {args.agg}')
     logger.info(f'Output        : {output_dir}')
     logger.info('=' * 70)
 
-    combined_link, combined_core, coverage_df = load_pipeline_metrics(pipeline_dir, cores=args.cores)
+    combined_link, combined_core, coverage_df = load_pipeline_metrics(pipeline_dir, cores=cores)
 
     coverage_path = os.path.join(output_dir, f'coverage_{pipeline_name}.csv')
     coverage_df.to_csv(coverage_path, index=False)
