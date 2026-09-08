@@ -85,9 +85,9 @@ SCRIPT_VALIS="${PROJECT_ROOT}/evaluation/valis_accuracy_landmarks.py"
 # Drives both the actual evaluation runs below (via --work_output_dir) and the
 # LaTeX table's path construction, so they can't drift out of sync with each
 # other. To point at a different experiment run, change these three only.
-BSPLINE_DIR_NAME="Filter_AKAZE_TissueMask_BSpline"
-ROMA_DIR_NAME="Filter_AKAZE_RoMaV2_Linear_Warp_map_multi_channel_color_lut"
-VALIS_DIR_NAME="VALIS_Filter_Eval"
+BSPLINE_DIR_NAME="${BSPLINE_DIR_NAME:-Filter_AKAZE_TissueMask_BSpline}"
+ROMA_DIR_NAME="${ROMA_DIR_NAME:-Filter_AKAZE_RoMaV2_Linear_Warp_map_multi_channel_ck_clahe}"
+VALIS_DIR_NAME="${VALIS_DIR_NAME:-VALIS_Filter_Eval}"
 
 ANNOTATION_DIR="${PROJECT_ROOT}/annotations"
 
