@@ -5,7 +5,7 @@ Run CellPose nuclear segmentation on original (unregistered) mIF slices
 using the DAPI channel only.
 
   DAPI (channel index 0) — nuclear segmentation
-       Model  : nuclei
+       Model  : cpsam (Cellpose-SAM, v4 default — same model as test_3d_cellpose.py)
        Input  : single channel (DAPI only); CellPose normalises internally
        Output : integer label masks, one per slice
 
@@ -14,8 +14,8 @@ Usage
     python cellpose_segmentation.py \\
         --core_name  <CORE_NAME>           \\
         [--diameter  25]                   \\
-        [--flow_threshold 0.4]             \\
-        [--cellprob_threshold -1.0]        \\
+        [--flow_threshold 0.6]             \\
+        [--cellprob_threshold 0.0]         \\
         [--use_gpu]                        \\
         [--batch_size 1]                   \\
         [--plot_qc]                        \\
@@ -83,19 +83,35 @@ logger = logging.getLogger(__name__)
 #
 DAPI_CONFIG = dict(
     idx                = 0,
-    model              = 'nuclei',
-    diameter           = 14,     # 0.4961 µm/px → 14 px ≈ 6.9 µm; tuned smaller than the
-                                 # nominal 10–15 µm nucleus range to catch tightly packed nuclei.
-                                 # Override with --diameter 20 for small nuclei or --diameter 30 for large
-    flow_threshold     = 0.8,    # permissive — tuned to reduce over-segmentation on this dataset;
-                                 # lower to 0.3-0.4 if under-segmenting instead
-    cellprob_threshold = -3.0,   # permissive to catch dim/peripheral nuclei;
-                                 # raise toward 0.0 if getting too much background
+    model              = 'cpsam',   # was 'nuclei'. Confirmed via smoke test: installed cellpose
+                                     # (v4.0.1+) ignores model_type entirely and always loads cpsam,
+                                     # logging "model_type argument is not used in v4.0.1+. Ignoring
+                                     # this argument..." regardless of what's passed here. So this
+                                     # value is documentation only, not functional — set to 'cpsam' so
+                                     # it states what's actually running rather than the stale 'nuclei'
+                                     # name, and matches test_3d_cellpose.py's cpsam model.
+    diameter           = None,   # was 14 px. Swept 10/12/14/18/22 px on this dataset and got no
+                                 # measurable difference in output masks - consistent with cpsam being
+                                 # largely diameter-agnostic (see test_3d_cellpose.py's own note on this).
+                                 # None (auto-estimate) also matches the 3D branch's default.
+                                 # Override with --diameter <px> if a future dataset/model shows sensitivity.
+    flow_threshold     = 0.6,    # unified with test_3d_cellpose.py for the 2D-vs-3D comparison run
+                                 # (config.yaml -> cellpose.flow_threshold). Previously 0.8, tuned to
+                                 # reduce over-segmentation on this dataset — revert to 0.8 for
+                                 # standalone/production runs outside the comparison, or pass
+                                 # --flow_threshold 0.8 explicitly.
+    cellprob_threshold = 0.0,    # unified with test_3d_cellpose.py for the 2D-vs-3D comparison run
+                                 # (config.yaml -> cellpose.cellprob_threshold). Previously -3.0,
+                                 # tuned permissive to catch dim/peripheral nuclei — revert to -3.0
+                                 # for standalone/production runs outside the comparison, or pass
+                                 # --cellprob_threshold -3.0 explicitly.
     notes = (
-        "Nuclear segmentation at 0.4961 µm/px. Uses the 'nuclei' model (single-channel). "
-        "diameter=14 px ≈ 6.9 µm — tuned smaller than nominal (10-15 µm) to catch tightly "
-        "packed nuclei. Run with --min_size 50 (default) to filter debris. "
-        "Tune: --diameter 20 (small nuclei) or --diameter 30 (large nuclei). "
+        "Nuclear segmentation at 0.4961 µm/px. Uses cpsam (Cellpose-SAM, the v4 default model) - "
+        "same model as test_3d_cellpose.py, so the 2D-vs-3D comparison isolates dimensionality "
+        "rather than also conflating a model change. diameter=None (auto-estimate): a sweep of "
+        "10/12/14/18/22 px showed no measurable difference in output masks on this dataset, "
+        "consistent with cpsam being largely diameter-agnostic. "
+        "Run with --min_size 50 (default) to filter debris. "
         "Lower cellprob_threshold toward -4.0 if missing dim nuclei; raise toward 0.0 to reduce background."
     ),
 )
@@ -111,11 +127,13 @@ parser = argparse.ArgumentParser(
 )
 parser.add_argument('--core_name',          type=str,   required=True)
 parser.add_argument('--diameter',           type=float, default=None,
-                    help="Override nucleus diameter (px). Default: 14 px ≈ 6.9 µm at 0.4961 µm/px.")
+                    help="Override nucleus diameter (px). Default: None (auto-estimate). "
+                         "A sweep of 10/12/14/18/22 px showed no measurable difference on this "
+                         "dataset with cpsam.")
 parser.add_argument('--flow_threshold',     type=float, default=None,
-                    help="Override flow_threshold. Default: 0.8")
+                    help="Override flow_threshold. Default: 0.6")
 parser.add_argument('--cellprob_threshold', type=float, default=None,
-                    help="Override cellprob_threshold. Default: -3.0")
+                    help="Override cellprob_threshold. Default: 0.0")
 parser.add_argument('--use_gpu',            action='store_true',
                     help="Use GPU if available.")
 parser.add_argument('--batch_size',         type=int,   default=1,
@@ -223,6 +241,8 @@ def extract_channel(arr: np.ndarray, ch_idx: int) -> np.ndarray:
 _cp_model = None
 
 def get_model(model_name: str, use_gpu: bool):
+    # model_name is unused (kept so call sites passing CFG['model'] don't need to change) -
+    # cellpose v4.0.1+ ignores model_type and always loads cpsam; see DAPI_CONFIG['model'] comment.
     global _cp_model
     if _cp_model is None:
         from cellpose import models
@@ -234,8 +254,10 @@ def get_model(model_name: str, use_gpu: bool):
                 gpu = False
         except ImportError:
             gpu = False
-        logger.info(f"Loading CellPose model '{model_name}' (gpu={gpu})...")
-        _cp_model = models.CellposeModel(model_type=model_name, gpu=gpu)
+        logger.info(f"Loading CellPose model (gpu={gpu})... "
+                    f"[note: model_type is ignored by cellpose v4.0.1+ and always loads cpsam, "
+                    f"so it's intentionally not passed here — see DAPI_CONFIG['model'] comment]")
+        _cp_model = models.CellposeModel(gpu=gpu)
         logger.info("CellPose model loaded.")
     return _cp_model
 
